@@ -1,0 +1,101 @@
+name: Cross-platform build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS 15 arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            artifact_name: axiomlens-macos-arm64
+            binary_path: target/aarch64-apple-darwin/release/AxiomLens
+          - platform: Windows Server 2022 x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            artifact_name: axiomlens-windows-x64
+            binary_path: target/x86_64-pc-windows-msvc/release/AxiomLens.exe
+          - platform: Ubuntu 24.04 x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: axiomlens-linux-x64
+            binary_path: target/x86_64-unknown-linux-gnu/release/AxiomLens
+    env:
+      TARGET: ${{ matrix.target }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ubuntu native build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang libfontconfig-dev libwayland-dev \
+            libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
+            libssl-dev libzstd-dev libasound2-dev \
+            vulkan-validationlayers libvulkan1
+
+      - name: Record runner and toolchain
+        shell: bash
+        run: |
+          printf 'commit=%s\nrun=%s/%s\nrunner=%s/%s\ntarget=%s\n' \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$RUNNER_OS" "$RUNNER_ARCH" "$TARGET"
+          uname -a
+          rustup show active-toolchain
+          rustc -vV
+          cargo --version
+          case "$RUNNER_OS" in
+            macOS)
+              xcode-select -p
+              xcodebuild -version
+              xcrun clang --version
+              ;;
+            Windows)
+              cmd.exe /c ver
+              cmake --version
+              ;;
+            Linux)
+              dpkg-query -W gcc g++ clang libfontconfig-dev libwayland-dev \
+                libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
+                libssl-dev libzstd-dev libasound2-dev \
+                vulkan-validationlayers libvulkan1
+              ;;
+          esac
+
+      - name: Record Windows native toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vsPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw 'Visual Studio C++ workload not found' }
+          & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
+          Get-ChildItem (Join-Path $vsPath 'VC/Tools/MSVC') -Directory | Select-Object -ExpandProperty Name
+          Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/Include' -Directory | Select-Object -ExpandProperty Name
+
+      - name: Build locked release artifact
+        shell: bash
+        run: |
+          rustup target add --toolchain 1.95.0 "$TARGET"
+          cargo +1.95.0 build --release --locked --target "$TARGET"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary_path }}
+          if-no-files-found: error
+          retention-days: 14
