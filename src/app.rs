@@ -1,10 +1,12 @@
-use gpui_kit::{AppContext, WindowOptions};
+use gpui_kit::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui_kit::component::{Theme, ThemeMode};
 
-use crate::{simulated_data, ui::AxiomLensPrototype};
+use crate::{simulated_data, ui::{self, AxiomLensPrototype}};
 
 pub fn run() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
+        Theme::change(ThemeMode::Dark, None, cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -13,8 +15,18 @@ pub fn run() {
         .detach();
 
         let snapshot = simulated_data::initial_snapshot();
-        gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
-            cx.new(|_| AxiomLensPrototype::new(snapshot))
+        let window_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(1440.0), px(900.0)),
+                cx,
+            ))),
+            window_min_size: Some(size(px(1280.0), px(800.0))),
+            ..WindowOptions::default()
+        };
+        gpui_kit::open_window(window_options, cx, |window, cx| {
+            let dock_area = ui::build_workbench(snapshot, window, cx);
+                cx.new(move |_| AxiomLensPrototype::new(dock_area, snapshot))
         })
         .expect("failed to open AxiomLens main window");
     });
