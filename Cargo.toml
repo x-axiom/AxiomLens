@@ -1,0 +1,11 @@
+[package]
+name = "AxiomLens"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[dependencies]
+gpui-kit = "=0.7.1"
+kube = { version = "=4.2.0", features = ["runtime"] }
+k8s-openapi = { version = "=0.28.0", features = ["latest"] }

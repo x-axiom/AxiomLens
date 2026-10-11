@@ -25,3 +25,7 @@ rustc-ice-*.txt
 
 # plan-docs
 plan-docs/*
+
+# Added by cargo
+
+/target
