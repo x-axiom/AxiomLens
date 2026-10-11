@@ -25,6 +25,7 @@ rustc-ice-*.txt
 
 # plan-docs
 axiomlens-plan-docs/*
+axiomlens-plan-docs
 
 # Added by cargo
 
