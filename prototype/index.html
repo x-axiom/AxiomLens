@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>KubeAgent IDE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --bg:#0B0E13;
+    --panel:#11151C;
+    --raised:#0E1218;
+    --elev:#161B23;
+    --border:#232A35;
+    --border-strong:#262D39;
+    --divider:#1B212B;
+    --t1:#E7EBF2;
+    --t2:#C7CEDA;
+    --t3:#9AA4B2;
+    --t4:#8B95A3;
+    --t5:#646E7E;
+    --accent:#4C8FD6;
+    --accent-soft:#16222F;
+    --accent-soft2:#18283A;
+    --ok:#3FB97E;
+    --warn:#E0A24E;
+    --danger:#E5564D;
+    --info:#5AA9E6;
+    --mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{
+    height:100%;
+    background:#05070A;
+    font-family:"Geist",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    color:var(--t1);
+    -webkit-font-smoothing:antialiased;
+  }
+  .stage{
+    min-height:100%;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:24px;
+  }
+  .app{
+    width:1440px;
+    height:900px;
+    background:var(--bg);
+    border-radius:12px;
+    overflow:hidden;
+    display:flex;
+    flex-direction:column;
+    box-shadow:0 30px 80px rgba(0,0,0,.55);
+    position:relative;
+  }
+
+  /* ---------- Top bar ---------- */
+  .topbar{
+    height:44px;
+    background:var(--panel);
+    display:flex;
+    align-items:center;
+    gap:14px;
+    padding:0 16px;
+    flex-shrink:0;
+  }
+  .brand{display:flex;align-items:center;gap:12px;}
+  .brand .logo{flex-shrink:0;}
+  .brand .name{font-size:15px;font-weight:600;color:var(--t1);}
+  .crumb{display:flex;align-items:center;gap:7px;}
+  .crumb .c-icon{flex-shrink:0;}
+  .crumb .c1{font-size:13px;font-weight:500;color:var(--t2);}
+  .crumb .csep{font-size:13px;color:var(--t5);}
+  .crumb .c2{font-size:13px;font-weight:500;color:var(--t4);}
+  .spacer{flex:1;}
+  .header-actions{display:flex;align-items:center;gap:10px;}
+  .search-box{
+    width:300px;height:30px;background:var(--raised);
+    border:1px solid var(--border);border-radius:7px;
+    display:flex;align-items:center;gap:8px;padding:0 10px;
+  }
+  .search-box .s-hint{font-size:12.5px;color:var(--t5);flex:1;}
+  .kbd{background:#181E27;border-radius:4px;padding:2px 6px;font-family:var(--mono);font-size:11px;color:var(--t3);}
+  .icon-btn{width:30px;height:30px;background:var(--elev);border-radius:7px;display:flex;align-items:center;justify-content:center;cursor:pointer;}
+  .icon-btn:hover{background:#1C222D;}
+  .avatar{width:28px;height:28px;background:#2A3340;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:var(--t1);}
+
+  /* ---------- Body ---------- */
+  .body{display:flex;flex:1;min-height:0;}
+  .div{width:1px;background:var(--divider);flex-shrink:0;}
+
+  /* ---------- Sidebar ---------- */
+  .sidebar{
+    width:248px;background:var(--panel);
+    display:flex;flex-direction:column;
+    padding:14px 12px;gap:14px;flex-shrink:0;overflow-y:auto;
+  }
+  .cluster-card{background:var(--elev);border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px;}
+  .cc-row1{display:flex;align-items:center;gap:8px;}
+  .status-dot{width:8px;height:8px;border-radius:4px;background:var(--ok);flex-shrink:0;}
+  .cc-name{font-size:13px;font-weight:600;color:var(--t1);flex:1;}
+  .cc-meta{font-size:11px;color:#6B7686;}
+  .ns-selector{display:flex;align-items:center;gap:8px;height:32px;background:var(--raised);border:1px solid var(--border);border-radius:8px;padding:0 10px;}
+  .ns-selector .ns-text{font-size:12.5px;color:var(--t2);flex:1;}
+  .ns-selector .ns-count{font-family:var(--mono);font-size:11px;color:var(--t5);}
+  .group-header{display:flex;align-items:center;gap:7px;height:26px;}
+  .group-header .g-title{font-size:11.5px;font-weight:600;color:var(--t4);letter-spacing:.5px;}
+  .nav-item{display:flex;align-items:center;gap:8px;height:30px;border-radius:6px;padding:0 10px;cursor:pointer;}
+  .nav-item .n-label{font-size:12.5px;color:var(--t4);flex:1;}
+  .nav-item .n-count{font-family:var(--mono);font-size:11px;color:var(--t5);}
+  .nav-item:hover{background:#16202E;}
+  .nav-item.active{background:var(--accent-soft);}
+  .nav-item.active .n-label{color:var(--t1);font-weight:500;}
+
+  /* ---------- Center ---------- */
+  .center{flex:1;display:flex;flex-direction:column;min-width:0;}
+  .res-tabs{height:40px;background:var(--raised);display:flex;align-items:center;padding:0 8px;gap:0;flex-shrink:0;}
+  .tab{display:flex;align-items:center;gap:8px;height:40px;padding:0 14px;cursor:pointer;}
+  .tab .t-label{font-size:12.5px;color:var(--t4);}
+  .tab.active{background:var(--bg);}
+  .tab.active .t-label{color:var(--t1);font-weight:500;}
+  .tab .t-close{display:flex;}
+  .new-tab{width:34px;height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;}
+  .res-area{flex:1;display:flex;min-height:0;}
+
+  /* list pane */
+  .list-pane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg);}
+  .list-toolbar{height:44px;background:var(--raised);display:flex;align-items:center;gap:12px;padding:0 14px;flex-shrink:0;}
+  .list-title{font-size:13px;font-weight:600;color:var(--t1);}
+  .list-count{background:var(--accent-soft2);border-radius:5px;padding:1px 7px;font-family:var(--mono);font-size:11px;color:#7FB4E6;}
+  .table{display:flex;flex-direction:column;flex:1;min-height:0;overflow-y:auto;}
+  .table-header{display:grid;grid-template-columns:1fr 70px 64px 60px;gap:12px;height:34px;background:var(--raised);padding:0 14px;align-items:center;flex-shrink:0;}
+  .table-header span{font-size:11px;font-weight:500;color:var(--t5);}
+  .row{display:grid;grid-template-columns:1fr 70px 64px 60px;gap:12px;height:38px;padding:0 14px;align-items:center;cursor:pointer;}
+  .row:hover{background:#0F131A;}
+  .row.active{background:var(--accent-soft);}
+  .row .r-name{font-size:12.5px;color:var(--t2);}
+  .row.active .r-name{color:var(--t1);font-weight:500;}
+  .row .r-status{font-size:12.5px;font-weight:500;}
+  .row .r-rep{font-family:var(--mono);font-size:12px;color:var(--t2);}
+  .row .r-age{font-family:var(--mono);font-size:12px;color:var(--t4);}
+  .s-ok{color:var(--ok);} .s-warn{color:var(--warn);} .s-danger{color:var(--danger);}
+  .list-footer{height:30px;background:var(--raised);display:flex;align-items:center;padding:0 14px;flex-shrink:0;}
+  .list-footer span{font-size:11.5px;color:var(--t5);}
+
+  /* detail pane */
+  .detail-pane{width:380px;background:var(--raised);display:flex;flex-direction:column;flex-shrink:0;}
+  .detail-header{background:var(--raised);padding:14px 16px;display:flex;flex-direction:column;gap:8px;flex-shrink:0;}
+  .dh-row{display:flex;align-items:center;gap:10px;}
+  .kind-badge{background:var(--accent-soft2);border-radius:5px;padding:3px 8px;font-size:11px;font-weight:500;color:#7FB4E6;}
+  .dh-name{font-size:15px;font-weight:600;color:var(--t1);}
+  .status-pill{display:flex;align-items:center;gap:6px;background:#14261C;border-radius:20px;padding:3px 10px;}
+  .status-pill .p-dot{width:6px;height:6px;border-radius:3px;background:var(--ok);}
+  .status-pill .p-text{font-size:11px;font-weight:500;color:var(--ok);}
+  .dh-meta{font-size:11px;color:var(--t5);}
+  .subtabs{height:36px;background:var(--bg);display:flex;align-items:center;padding:0 8px;gap:2px;flex-shrink:0;}
+  .subtab{display:flex;align-items:center;height:36px;padding:0 12px;border-radius:6px;font-size:12px;color:var(--t4);cursor:pointer;}
+  .subtab.active{background:var(--raised);color:var(--t1);font-weight:500;}
+  .detail-body{background:var(--bg);flex:1;padding:14px 16px;display:flex;flex-direction:column;gap:18px;overflow-y:auto;}
+  .sec-title{font-size:12px;font-weight:600;color:var(--t4);letter-spacing:.5px;}
+  .info-row{display:flex;justify-content:space-between;align-items:center;height:26px;}
+  .info-row .l{font-size:12px;color:var(--t5);}
+  .info-row .v{font-size:12px;color:var(--t2);font-family:var(--mono);}
+  .cont-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:10px;}
+  .cont-card .c-name-row{display:flex;justify-content:space-between;align-items:center;}
+  .cont-card .c-name{font-size:12.5px;font-weight:500;color:var(--t1);}
+  .cont-card .c-state{font-size:11px;font-weight:500;color:var(--ok);}
+  .cont-card .c-row{display:flex;align-items:center;gap:8px;}
+  .cont-card .c-row .c-l{font-size:11px;color:var(--t5);width:48px;flex-shrink:0;}
+  .cont-card .c-row .c-v{font-size:11.5px;color:var(--t4);font-family:var(--mono);flex:1;}
+
+  /* bottom dock */
+  .dock{height:220px;background:var(--raised);display:flex;flex-direction:column;flex-shrink:0;}
+  .dock-tabs{height:36px;background:var(--raised);display:flex;align-items:center;padding:0 8px;gap:2px;flex-shrink:0;}
+  .dock-tab{display:flex;align-items:center;height:36px;padding:0 12px;border-radius:6px;font-size:12px;color:var(--t4);cursor:pointer;}
+  .dock-tab.active{background:var(--bg);color:var(--t1);font-weight:500;}
+  .dock-body{background:var(--bg);flex:1;padding:10px 14px;display:flex;flex-direction:column;gap:5px;overflow-y:auto;font-family:var(--mono);font-size:11.5px;line-height:1.5;}
+  .log{white-space:pre;}
+  .log.i{color:var(--t4);} .log.w{color:var(--warn);} .log.e{color:var(--danger);} .log.n{color:var(--info);}
+
+  /* ---------- Agent panel ---------- */
+  .agent{width:372px;background:var(--panel);display:flex;flex-direction:column;flex-shrink:0;}
+  .agent-header{height:52px;background:var(--raised);display:flex;align-items:center;gap:10px;padding:0 14px;flex-shrink:0;}
+  .agent-title{font-size:14px;font-weight:600;color:var(--t1);}
+  .agent-mode{display:flex;align-items:center;gap:6px;background:var(--accent-soft);border-radius:20px;padding:3px 9px;}
+  .agent-mode .m-dot{width:6px;height:6px;border-radius:3px;background:var(--accent);}
+  .agent-mode .m-text{font-size:11px;font-weight:500;color:#7FB4E6;}
+  .context-section{background:var(--bg);padding:12px 14px;display:flex;flex-direction:column;gap:8px;flex-shrink:0;}
+  .ctx-label{font-size:11px;font-weight:500;color:var(--t5);letter-spacing:.3px;}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;}
+  .chip{background:var(--elev);border:1px solid var(--border);border-radius:6px;padding:4px 9px;font-size:11.5px;color:var(--t2);}
+  .conversation{background:var(--bg);flex:1;padding:14px;display:flex;flex-direction:column;gap:14px;overflow-y:auto;}
+  .user-msg{display:flex;justify-content:flex-end;}
+  .user-bubble{width:284px;background:var(--accent-soft);border-radius:10px;padding:10px;}
+  .user-bubble .u-text{font-size:12.5px;color:var(--t1);line-height:18px;}
+  .agent-label{font-size:11px;font-weight:500;color:var(--t3);letter-spacing:.2px;}
+  .diag-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px;}
+  .diag-title{font-size:12px;font-weight:600;color:var(--t1);}
+  .hyp{display:flex;align-items:center;gap:8px;}
+  .hyp .h-idx{width:22px;height:22px;border-radius:5px;background:#14261C;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;color:var(--ok);flex-shrink:0;}
+  .hyp .h-text{font-size:12px;color:var(--t2);flex:1;line-height:16px;}
+  .hyp .h-tag{background:#14261C;border-radius:20px;padding:2px 7px;font-size:10.5px;font-weight:500;color:var(--ok);flex-shrink:0;}
+  .hyp.amber .h-idx{background:#2A2415;color:var(--warn);}
+  .hyp.amber .h-tag{background:#2A2415;color:var(--warn);}
+  .tool-strip{background:var(--raised);border:1px solid var(--border);border-radius:8px;padding:8px 10px;display:flex;align-items:center;gap:8px;}
+  .tool-strip .t-text{font-family:var(--mono);font-size:10.5px;color:var(--t4);flex:1;}
+  .plan-btn{background:var(--accent);border-radius:8px;padding:11px 14px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;}
+  .plan-btn:hover{background:#5B9EE4;}
+  .plan-btn .p-text{font-size:13px;font-weight:600;color:#fff;}
+  .agent-input{height:46px;background:var(--raised);display:flex;align-items:center;gap:8px;padding:0 12px;flex-shrink:0;}
+  .agent-input .i-text{font-size:12.5px;color:var(--t5);flex:1;}
+  .send-btn{width:32px;height:32px;background:var(--accent);border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer;}
+
+  /* ---------- Overlays ---------- */
+  .overlay{position:absolute;inset:0;background:rgba(5,7,10,.62);display:flex;align-items:center;justify-content:center;z-index:20;}
+  .overlay.hidden{display:none;}
+  .modal{width:680px;background:var(--raised);border:1px solid var(--border-strong);border-radius:14px;display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.5);}
+  .modal-header{display:flex;align-items:center;gap:10px;padding:16px 18px;}
+  .modal-title-col{display:flex;flex-direction:column;gap:2px;}
+  .modal-title{font-size:15px;font-weight:600;color:var(--t1);}
+  .modal-sub{font-size:11.5px;color:var(--t5);}
+  .risk-badge{background:#2A2415;border-radius:20px;padding:3px 9px;font-size:11px;font-weight:500;color:var(--warn);}
+  .close-btn{width:28px;height:28px;background:var(--elev);border-radius:7px;display:flex;align-items:center;justify-content:center;cursor:pointer;}
+  .m-divider{width:100%;height:1px;background:var(--divider);}
+  .plan-section{display:flex;flex-direction:column;gap:8px;padding:14px 18px;}
+  .plan-label{font-size:11px;font-weight:500;color:var(--t5);letter-spacing:.3px;}
+  .plan-text{font-size:12.5px;color:var(--t2);line-height:19px;}
+  .steps-section{display:flex;flex-direction:column;gap:8px;padding:4px 18px 14px;}
+  .step{display:flex;align-items:center;gap:10px;}
+  .step .s-dot{width:8px;height:8px;border-radius:4px;flex-shrink:0;}
+  .step .s-text{font-size:12.5px;color:var(--t2);}
+  .diff-section{display:flex;flex-direction:column;gap:8px;padding:4px 18px 14px;}
+  .diff-box{background:#0A0D12;border:1px solid var(--border);border-radius:8px;padding:10px 12px;display:flex;flex-direction:column;gap:3px;font-family:var(--mono);font-size:11.5px;line-height:1.5;}
+  .diff-box .d-c{color:var(--t5);} .diff-box .d-del{color:var(--danger);} .diff-box .d-add{color:var(--ok);}
+  .modal-footer{display:flex;align-items:center;gap:10px;padding:14px 18px 16px;}
+  .audit-note{font-size:11px;color:var(--t5);flex:1;}
+  .reject-btn{background:var(--elev);border:1px solid #2A323E;border-radius:8px;padding:9px 14px;font-size:12.5px;font-weight:500;color:var(--t2);cursor:pointer;}
+  .approve-btn{background:var(--accent);border-radius:8px;padding:9px 16px;font-size:12.5px;font-weight:600;color:#fff;cursor:pointer;}
+
+  .palette{width:620px;background:var(--raised);border:1px solid var(--border-strong);border-radius:12px;display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.5);}
+  .p-search{display:flex;align-items:center;gap:10px;padding:14px 16px;}
+  .p-input{font-size:14px;color:var(--t1);flex:1;}
+  .p-input::placeholder{color:var(--t5);}
+  .p-cursor{width:1.5px;height:18px;background:var(--accent);}
+  .esc-kbd{background:#181E27;border-radius:4px;padding:2px 7px;font-family:var(--mono);font-size:11px;color:var(--t3);}
+  .p-divider{width:100%;height:1px;background:var(--divider);}
+  .p-results{display:flex;flex-direction:column;padding:8px 8px 10px;gap:2px;}
+  .group-label{display:flex;align-items:center;padding:8px 10px 6px;font-size:11px;font-weight:500;color:var(--t5);letter-spacing:.3px;}
+  .result{display:flex;align-items:center;gap:10px;height:36px;border-radius:7px;padding:0 10px;cursor:pointer;}
+  .result.active{background:var(--accent-soft);}
+  .result .r-name{font-size:12.5px;color:var(--t2);flex:1;}
+  .result.active .r-name{color:var(--t1);font-weight:500;}
+  .result .r-tag{font-size:11px;color:var(--t5);}
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="app" id="app">
+
+    <!-- ===== Top bar ===== -->
+    <div class="topbar">
+      <div class="brand">
+        <span class="logo">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none"><path d="M14 2.5L24 8.25V19.75L14 25.5L4 19.75V8.25L14 2.5Z" stroke="#4C8FD6" stroke-width="1.6" stroke-linejoin="round"/><circle cx="14" cy="14" r="3.3" fill="#4C8FD6"/><path d="M14 10.7V4.2M14 17.3V23.8M17.3 14H23.8M10.7 14H4.2M16.4 11.6L21 7M11.6 16.4L7 21M16.4 16.4L21 21M11.6 11.6L7 7" stroke="#4C8FD6" stroke-width="1.4" stroke-linecap="round"/></svg>
+        </span>
+        <span class="name">KubeAgent</span>
+        <div class="crumb">
+          <span class="c-icon"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="1.5" y="2" width="11" height="3.4" rx="1" stroke="#9AA4B2" stroke-width="1.2"/><rect x="1.5" y="8.6" width="11" height="3.4" rx="1" stroke="#9AA4B2" stroke-width="1.2"/><path d="M3.6 3.7h.01M3.6 10.3h.01" stroke="#9AA4B2" stroke-width="1.4" stroke-linecap="round"/></svg></span>
+          <span class="c1">prod-us-east-1</span>
+          <span class="csep">/</span>
+          <span class="c2">payment-platform</span>
+          <span><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M4 5.5L7 8.5L10 5.5" stroke="#646E7E" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        </div>
+      </div>
+      <div class="spacer"></div>
+      <div class="header-actions">
+        <div class="search-box" id="openPalette">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="6" cy="6" r="4" stroke="#646E7E" stroke-width="1.4"/><path d="M9.2 9.2L12 12" stroke="#646E7E" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <span class="s-hint">搜索资源、集群或命令…</span>
+          <span class="kbd">⌘K</span>
+        </div>
+        <div class="icon-btn"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13 9.2A5.2 5.2 0 0 1 6.8 3 5.2 5.2 0 1 0 13 9.2Z" stroke="#9AA4B2" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+        <div class="icon-btn"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 7a4 4 0 0 1 8 0c0 3 1 4 1 4H3s1-1 1-4Z" stroke="#9AA4B2" stroke-width="1.3" stroke-linejoin="round"/><path d="M6.6 12.5a1.8 1.8 0 0 0 2.8 0" stroke="#9AA4B2" stroke-width="1.3" stroke-linecap="round"/></svg></div>
+        <div class="icon-btn"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.2" stroke="#9AA4B2" stroke-width="1.3"/><path d="M8 1.6v1.6M8 12.8v1.6M14.4 8h-1.6M3.2 8H1.6M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1M12.6 12.6l-1.1-1.1M4.5 4.5 3.4 3.4" stroke="#9AA4B2" stroke-width="1.3" stroke-linecap="round"/></svg></div>
+        <div class="avatar">PL</div>
+      </div>
+    </div>
+
+    <!-- ===== Body ===== -->
+    <div class="body">
+      <!-- Sidebar -->
+      <div class="sidebar">
+        <div class="cluster-card">
+          <div class="cc-row1">
+            <span class="status-dot"></span>
+            <span class="cc-name">prod-us-east-1</span>
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M4 5.5L7 8.5L10 5.5" stroke="#646E7E" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="cc-meta">us-east-1 · v1.29.4 · 18 节点</div>
+        </div>
+        <div class="ns-selector">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 2L12 4.6L7 7.2L2 4.6L7 2Z" stroke="#9AA4B2" stroke-width="1.2" stroke-linejoin="round"/><path d="M2.4 7.1L7 9.7L11.6 7.1M2.4 9.8L7 12.4L11.6 9.8" stroke="#9AA4B2" stroke-width="1.2" stroke-linejoin="round"/></svg>
+          <span class="ns-text">payment-platform</span>
+          <span class="ns-count">42</span>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M4 5.5L7 8.5L10 5.5" stroke="#646E7E" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+
+        <div class="group-header">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1.8L12.2 4.6V9.4L7 12.2L1.8 9.4V4.6L7 1.8Z" stroke="#8B95A3" stroke-width="1.2" stroke-linejoin="round"/><path d="M7 1.8V7L12.2 4.6M7 7V12.2M7 7L1.8 4.6" stroke="#8B95A3" stroke-width="1.2" stroke-linejoin="round"/></svg>
+          <span class="g-title">工作负载</span>
+        </div>
+        <div class="nav-item active"><span class="n-label">Deployments</span><span class="n-count">12</span></div>
+        <div class="nav-item"><span class="n-label">StatefulSets</span><span class="n-count">4</span></div>
+        <div class="nav-item"><span class="n-label">DaemonSets</span><span class="n-count">3</span></div>
+        <div class="nav-item"><span class="n-label">Pods</span><span class="n-count">148</span></div>
+
+        <div class="group-header">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5" stroke="#8B95A3" stroke-width="1.2"/><path d="M2 7h10M7 2c1.6 1.4 1.6 8.6 0 10M7 2c-1.6 1.4-1.6 8.6 0 10" stroke="#8B95A3" stroke-width="1.2"/></svg>
+          <span class="g-title">网络</span>
+        </div>
+        <div class="nav-item"><span class="n-label">Services</span><span class="n-count">37</span></div>
+        <div class="nav-item"><span class="n-label">Ingresses</span><span class="n-count">11</span></div>
+
+        <div class="group-header">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 4h7M11 4h1M2 10h1M5 10h7" stroke="#8B95A3" stroke-width="1.2" stroke-linecap="round"/><circle cx="9.5" cy="4" r="1.6" stroke="#8B95A3" stroke-width="1.2"/><circle cx="3.5" cy="10" r="1.6" stroke="#8B95A3" stroke-width="1.2"/></svg>
+          <span class="g-title">配置</span>
+        </div>
+        <div class="nav-item"><span class="n-label">ConfigMaps</span><span class="n-count">63</span></div>
+        <div class="nav-item"><span class="n-label">Secrets</span><span class="n-count">28</span></div>
+
+        <div class="group-header">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="2" y="2.5" width="10" height="3" rx="1" stroke="#8B95A3" stroke-width="1.2"/><rect x="2" y="8.5" width="10" height="3" rx="1" stroke="#8B95A3" stroke-width="1.2"/><path d="M4 4h.01M4 10h.01" stroke="#8B95A3" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <span class="g-title">集群</span>
+        </div>
+        <div class="nav-item"><span class="n-label">Nodes</span><span class="n-count">18</span></div>
+        <div class="nav-item"><span class="n-label">事件</span><span class="n-count">128</span></div>
+      </div>
+
+      <div class="div"></div>
+
+      <!-- Center -->
+      <div class="center">
+        <div class="res-tabs">
+          <div class="tab active">
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 1.8L11 4.3V8.7L6.5 11.2L2 8.7V4.3L6.5 1.8Z" stroke="#9AA4B2" stroke-width="1.1" stroke-linejoin="round"/></svg>
+            <span class="t-label">Deployments</span>
+            <span class="t-close"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 3L9 9M9 3L3 9" stroke="#646E7E" stroke-width="1.3" stroke-linecap="round"/></svg></span>
+          </div>
+          <div class="tab">
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 1.8L11 4.3V8.7L6.5 11.2L2 8.7V4.3L6.5 1.8Z" stroke="#646E7E" stroke-width="1.1" stroke-linejoin="round"/></svg>
+            <span class="t-label">payment-api</span>
+            <span class="t-close"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 3L9 9M9 3L3 9" stroke="#646E7E" stroke-width="1.3" stroke-linecap="round"/></svg></span>
+          </div>
+          <div class="new-tab"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 2.5V11.5M2.5 7H11.5" stroke="#646E7E" stroke-width="1.4" stroke-linecap="round"/></svg></div>
+        </div>
+
+        <div class="res-area">
+          <!-- List pane -->
+          <div class="list-pane">
+            <div class="list-toolbar">
+              <span class="list-title">Deployments</span>
+              <span class="list-count">12</span>
+              <div class="spacer"></div>
+              <div class="icon-btn"><svg width="15" height="15" viewBox="0 0 15 15" fill="none"><path d="M12.3 7.5a4.8 4.8 0 1 1-1.4-3.4" stroke="#9AA4B2" stroke-width="1.3" stroke-linecap="round"/><path d="M12.3 2.2V4.6H9.9" stroke="#9AA4B2" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+            </div>
+            <div class="table">
+              <div class="table-header"><span>名称</span><span>状态</span><span>副本</span><span>年龄</span></div>
+              <div class="row active"><span class="r-name">payment-api</span><span class="r-status s-ok">就绪</span><span class="r-rep">6 / 6</span><span class="r-age">164d</span></div>
+              <div class="row"><span class="r-name">checkout-svc</span><span class="r-status s-ok">就绪</span><span class="r-rep">4 / 4</span><span class="r-age">42d</span></div>
+              <div class="row"><span class="r-name">catalog-api</span><span class="r-status s-warn">降级</span><span class="r-rep">2 / 3</span><span class="r-age">87d</span></div>
+              <div class="row"><span class="r-name">cart-worker</span><span class="r-status s-ok">就绪</span><span class="r-rep">3 / 3</span><span class="r-age">12d</span></div>
+              <div class="row"><span class="r-name">recommend-engine</span><span class="r-status s-danger">异常</span><span class="r-rep">0 / 2</span><span class="r-age">5d</span></div>
+            </div>
+            <div class="list-footer"><span>共 12 项资源 · 已选择 1（payment-api）</span></div>
+          </div>
+
+          <div class="div"></div>
+
+          <!-- Detail pane -->
+          <div class="detail-pane">
+            <div class="detail-header">
+              <div class="dh-row">
+                <span class="kind-badge">Deployment</span>
+                <span class="dh-name">payment-api</span>
+                <div class="spacer"></div>
+                <div class="status-pill"><span class="p-dot"></span><span class="p-text">就绪</span></div>
+              </div>
+              <div class="dh-meta">payment-platform · 创建于 2026-05-01 09:12 · 策略 RollingUpdate</div>
+            </div>
+            <div class="subtabs">
+              <div class="subtab active">概览</div>
+              <div class="subtab">YAML</div>
+              <div class="subtab">事件</div>
+              <div class="subtab">日志</div>
+              <div class="subtab">关系</div>
+            </div>
+            <div class="detail-body">
+              <div class="sec-title">基本信息</div>
+              <div class="info-row"><span class="l">命名空间</span><span class="v">payment-platform</span></div>
+              <div class="info-row"><span class="l">副本</span><span class="v">6 / 6</span></div>
+              <div class="info-row"><span class="l">更新策略</span><span class="v">RollingUpdate</span></div>
+              <div class="info-row"><span class="l">镜像</span><span class="v">nginx:1.25-alpine</span></div>
+              <div class="info-row"><span class="l">创建时间</span><span class="v">2026-05-01 09:12</span></div>
+              <div class="sec-title">状态条件</div>
+              <div class="info-row"><span class="l">Available</span><span class="v" style="color:var(--ok)">正常</span></div>
+              <div class="info-row"><span class="l">Progressing</span><span class="v" style="color:var(--ok)">正常</span></div>
+              <div class="sec-title">容器 (1)</div>
+              <div class="cont-card">
+                <div class="c-name-row"><span class="c-name">payment-api</span><span class="c-state">运行中</span></div>
+                <div class="c-row"><span class="c-l">镜像</span><span class="c-v">nginx:1.25-alpine</span></div>
+                <div class="c-row"><span class="c-l">端口</span><span class="c-v">8080/TCP · 8443/TCP</span></div>
+                <div class="c-row"><span class="c-l">资源</span><span class="c-v">cpu 100m · mem 128Mi</span></div>
+                <div class="c-row"><span class="c-l">重启</span><span class="c-v">0</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Bottom dock -->
+        <div class="dock">
+          <div class="dock-tabs">
+            <div class="dock-tab active">日志</div>
+            <div class="dock-tab">终端</div>
+            <div class="dock-tab">事件</div>
+            <div class="spacer"></div>
+            <div class="dock-tab">清除</div>
+          </div>
+          <div class="dock-body">
+            <div class="log i">14:22:01  INFO   server listening on :8080</div>
+            <div class="log i">14:22:02  INFO   db pool established → postgres://db.internal:5432</div>
+            <div class="log w">14:22:05  WARN   upstream payment-gateway p99 latency 312ms</div>
+            <div class="log e">14:22:18  ERROR  GET /v1/charge → 503 upstream connect error</div>
+            <div class="log w">14:22:19  WARN   retry 1/3 for /v1/charge</div>
+            <div class="log e">14:22:20  ERROR  GET /v1/charge → 503 upstream connect error</div>
+            <div class="log i">14:22:21  INFO   circuit breaker opened for payment-gateway</div>
+            <div class="log w">14:22:24  WARN   EndpointSlice payment-api has 0 ready endpoints</div>
+            <div class="log n">14:22:30  INFO   Agent: attached 3 events, 2 pods as context</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="div"></div>
+
+      <!-- Agent panel -->
+      <div class="agent">
+        <div class="agent-header">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M9 1.8l1.5 4.2 4.2 1.5-4.2 1.5L9 13.2 7.5 8.9 3.3 7.5l4.2-1.5L9 1.8z" stroke="#4C8FD6" stroke-width="1.2" stroke-linejoin="round"/><path d="M14.2 12.5l.7 1.9 1.9.7-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7.7-1.9z" stroke="#4C8FD6" stroke-width="1" stroke-linejoin="round"/></svg>
+          <span class="agent-title">AI Agent</span>
+          <div class="spacer"></div>
+          <div class="agent-mode"><span class="m-dot"></span><span class="m-text">只读模式</span></div>
+          <div class="icon-btn"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.2" stroke="#9AA4B2" stroke-width="1.3"/><path d="M8 1.6v1.6M8 12.8v1.6M14.4 8h-1.6M3.2 8H1.6M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1M12.6 12.6l-1.1-1.1M4.5 4.5 3.4 3.4" stroke="#9AA4B2" stroke-width="1.3" stroke-linecap="round"/></svg></div>
+        </div>
+        <div class="context-section">
+          <div class="ctx-label">上下文 · 4 项</div>
+          <div class="chips">
+            <span class="chip">payment-api · Deployment</span>
+            <span class="chip">payment-platform · ns</span>
+            <span class="chip">2 Pods</span>
+            <span class="chip">3 Events</span>
+          </div>
+        </div>
+        <div class="conversation">
+          <div class="user-msg">
+            <div class="user-bubble"><div class="u-text">为什么 payment-api 最近频繁出现 503？请找出最可能的原因，并给出安全的修复方案。</div></div>
+          </div>
+          <div class="agent-label">Agent · 基于集群事实的诊断</div>
+          <div class="diag-card">
+            <div class="diag-title">诊断结论（按证据排序）</div>
+            <div class="hyp">
+              <span class="h-idx">H1</span>
+              <span class="h-text">EndpointSlice payment-api 无就绪后端，请求被拒绝 → 503</span>
+              <span class="h-tag">已验证</span>
+            </div>
+            <div class="hyp">
+              <span class="h-idx">H2</span>
+              <span class="h-text">payment-gateway 上游 p99 延迟 312ms，熔断已打开</span>
+              <span class="h-tag">已验证</span>
+            </div>
+            <div class="hyp amber">
+              <span class="h-idx">H3</span>
+              <span class="h-text">readiness 探针阈值偏严，副本数不足以吸收抖动</span>
+              <span class="h-tag">待验证</span>
+            </div>
+          </div>
+          <div class="tool-strip">
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M8.5 2.2a2.6 2.6 0 0 0-3.3 3.3L2.4 8.3a1.3 1.3 0 0 0 1.8 1.8l2.8-2.8A2.6 2.6 0 0 0 9.3 4.7l-1.6 1.6-1.2-1.2 1.6-1.6z" stroke="#646E7E" stroke-width="1.1" stroke-linejoin="round"/></svg>
+            <span class="t-text">read-only 工具已调用：list_resources · get_events · get_pod_logs</span>
+          </div>
+          <div class="plan-btn" id="openModal">
+            <span class="p-text">生成修复计划（受控变更）</span>
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1.6l4.4 1.6v3.2c0 2.8-1.9 4.7-4.4 5.8C4.5 11.1 2.6 9.2 2.6 6.4V3.2L7 1.6z" stroke="#FFFFFF" stroke-width="1.2" stroke-linejoin="round"/><path d="M5.2 6.8L6.4 8l2.4-2.4" stroke="#FFFFFF" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+        </div>
+        <div class="agent-input">
+          <span class="i-text">向 Agent 提问，或描述一次故障…</span>
+          <div class="send-btn"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 11.5V2.5M3.5 6L7 2.5L10.5 6" stroke="#FFFFFF" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Approval Modal ===== -->
+    <div class="overlay hidden" id="modalOverlay">
+      <div class="modal">
+        <div class="modal-header">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M9 2l5.6 2v4.1c0 3.6-2.4 6-5.6 7.4C5.8 14.1 3.4 11.7 3.4 8.1V4L9 2z" stroke="#4C8FD6" stroke-width="1.3" stroke-linejoin="round"/><path d="M6.6 8.6l1.6 1.6 3-3" stroke="#4C8FD6" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div class="modal-title-col">
+            <span class="modal-title">变更审批</span>
+            <span class="modal-sub">payment-api · Deployment · prod-us-east-1 / payment-platform</span>
+          </div>
+          <div class="spacer"></div>
+          <span class="risk-badge">中风险</span>
+          <div class="close-btn" data-close="modal"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 3L9 9M9 3L3 9" stroke="#646E7E" stroke-width="1.3" stroke-linecap="round"/></svg></div>
+        </div>
+        <div class="m-divider"></div>
+        <div class="plan-section">
+          <div class="plan-label">计划摘要</div>
+          <div class="plan-text">将副本数 6 → 8，并将 readiness 探针 initialDelaySeconds 0 → 10，缓解启动期误判导致的 503。</div>
+        </div>
+        <div class="steps-section">
+          <div class="step"><span class="s-dot" style="background:var(--ok)"></span><span class="s-text">服务端 Dry Run · 已通过</span></div>
+          <div class="step"><span class="s-dot" style="background:var(--accent)"></span><span class="s-text">YAML 差异审查 · 2 处变更</span></div>
+          <div class="step"><span class="s-dot" style="background:#3A4351"></span><span class="s-text">执行 RollingUpdate · 等待审批</span></div>
+          <div class="step"><span class="s-dot" style="background:#3A4351"></span><span class="s-text">验证 rollout 与 EndpointSlice · 等待审批</span></div>
+        </div>
+        <div class="diff-section">
+          <div class="plan-label">YAML 差异</div>
+          <div class="diff-box">
+            <div class="d-c">  spec:</div>
+            <div class="d-del">-   replicas: 6</div>
+            <div class="d-add">+   replicas: 8</div>
+            <div class="d-c">    readinessProbe:</div>
+            <div class="d-del">-     initialDelaySeconds: 0</div>
+            <div class="d-add">+     initialDelaySeconds: 10</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <span class="audit-note">批准仅对本计划生效 · 审批人 PL · 2026-10-11 14:26</span>
+          <div class="reject-btn" data-close="modal">拒绝</div>
+          <div class="approve-btn" data-close="modal">批准并执行</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Command Palette ===== -->
+    <div class="overlay hidden" id="paletteOverlay">
+      <div class="palette">
+        <div class="p-search">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4.4" stroke="#9AA4B2" stroke-width="1.4"/><path d="M10.4 10.4L14 14" stroke="#9AA4B2" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <span class="p-input" contenteditable="true" spellcheck="false">payment…</span>
+          <span class="p-cursor"></span>
+          <span class="esc-kbd">ESC</span>
+        </div>
+        <div class="p-divider"></div>
+        <div class="p-results">
+          <div class="group-label">资源</div>
+          <div class="result active">
+            <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><path d="M7.5 1.8L13 4.7V9.8L7.5 12.7L2 9.8V4.7L7.5 1.8Z" stroke="#7FB4E6" stroke-width="1.2" stroke-linejoin="round"/></svg>
+            <span class="r-name">payment-api</span><span class="r-tag">Deployment · payment-platform</span>
+          </div>
+          <div class="result">
+            <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><rect x="2" y="2" width="11" height="11" rx="2.5" stroke="#8B95A3" stroke-width="1.2"/><circle cx="7.5" cy="7.5" r="2.4" stroke="#8B95A3" stroke-width="1.2"/></svg>
+            <span class="r-name">payment-api-7d9f6c8b4-xkq2p</span><span class="r-tag">Pod · payment-platform</span>
+          </div>
+          <div class="group-label">命令</div>
+          <div class="result">
+            <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><rect x="2" y="2.5" width="11" height="3.4" rx="1" stroke="#8B95A3" stroke-width="1.2"/><rect x="2" y="9.1" width="11" height="3.4" rx="1" stroke="#8B95A3" stroke-width="1.2"/><path d="M4.2 4.2h.01M4.2 10.8h.01" stroke="#8B95A3" stroke-width="1.4" stroke-linecap="round"/></svg>
+            <span class="r-name">切换集群</span><span class="r-tag">命令</span>
+          </div>
+          <div class="result">
+            <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><path d="M12.8 7.5a5.3 5.3 0 1 1-1.5-3.7" stroke="#8B95A3" stroke-width="1.3" stroke-linecap="round"/><path d="M12.8 2.4V5H10.2" stroke="#8B95A3" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="r-name">滚动重启 Deployment</span><span class="r-tag">命令</span>
+          </div>
+          <div class="result">
+            <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><rect x="1.8" y="2.5" width="11.4" height="10" rx="1.5" stroke="#8B95A3" stroke-width="1.2"/><path d="M4.2 5.8l2 2-2 2M7.4 9.8h3" stroke="#8B95A3" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="r-name">打开终端</span><span class="r-tag">命令</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+  const modalOverlay = document.getElementById('modalOverlay');
+  const paletteOverlay = document.getElementById('paletteOverlay');
+
+  function show(el){ el.classList.remove('hidden'); }
+  function hide(el){ el.classList.add('hidden'); }
+
+  document.getElementById('openModal').addEventListener('click', () => show(modalOverlay));
+  document.getElementById('openPalette').addEventListener('click', () => show(paletteOverlay));
+
+  modalOverlay.querySelectorAll('[data-close="modal"]').forEach(b => b.addEventListener('click', () => hide(modalOverlay)));
+  paletteOverlay.addEventListener('click', (e) => { if (e.target === paletteOverlay) hide(paletteOverlay); });
+
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); show(paletteOverlay); }
+    if (e.key === 'Escape') { hide(modalOverlay); hide(paletteOverlay); }
+  });
+
+  // palette result navigation
+  const results = Array.from(paletteOverlay.querySelectorAll('.result'));
+  results.forEach(r => r.addEventListener('click', () => hide(paletteOverlay)));
+  paletteOverlay.addEventListener('keydown', (e) => {
+    const cur = results.findIndex(r => r.classList.contains('active'));
+    if (e.key === 'ArrowDown') { e.preventDefault(); results[cur]?.classList.remove('active'); results[(cur+1)%results.length]?.classList.add('active'); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); results[cur]?.classList.remove('active'); results[(cur-1+results.length)%results.length]?.classList.add('active'); }
+    if (e.key === 'Enter') { results[cur]?.classList.add('active'); hide(paletteOverlay); }
+  });
+
+  // resource tab / subtab / dock-tab visual toggle (no data swap, faithful static prototype)
+  document.querySelectorAll('.res-tabs .tab, .subtabs .subtab, .dock-tabs .dock-tab').forEach(t => {
+    t.addEventListener('click', () => {
+      const sibs = t.parentElement.querySelectorAll(':scope > *');
+      sibs.forEach(s => s.classList && s.classList.remove('active'));
+      t.classList.add('active');
+    });
+  });
+</script>
+</body>
+</html>
