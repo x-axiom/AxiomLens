@@ -1,7 +1,7 @@
 use gpui_kit::{
     App, AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, SharedString,
-    Styled as _, Subscription, Task, Window, div, px, rgb, size,
+    KeyDownEvent, Modifiers, Styled as _, Subscription, Task, Window, div, hsla, px, rgb, size,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{
@@ -37,20 +37,31 @@ pub(crate) struct Workbench {
     dock_area: Entity<DockArea>,
     navigation: Entity<ResourceNavigation>,
     search_input: Entity<InputState>,
+    palette_input: Entity<InputState>,
+    panel_focus_handles: Vec<(PanelKind, FocusHandle)>,
 }
 
 pub struct AxiomLensPrototype {
     dock_area: Entity<DockArea>,
     navigation: Entity<ResourceNavigation>,
     search_input: Entity<InputState>,
+    palette_input: Entity<InputState>,
+    panel_focus_handles: Vec<(PanelKind, FocusHandle)>,
+    focus_handle: FocusHandle,
+    palette_open: bool,
+    palette_query: String,
+    selected_palette_result: usize,
+    previous_focus: Option<FocusHandle>,
     _navigation_subscription: Subscription,
     _search_subscription: Subscription,
+    _palette_subscription: Subscription,
 }
 
 impl AxiomLensPrototype {
     pub(crate) fn new(workbench: Workbench, cx: &mut Context<Self>) -> Self {
         let navigation = workbench.navigation;
         let search_input = workbench.search_input;
+        let palette_input = workbench.palette_input;
         let search_navigation = navigation.clone();
         let navigation_subscription = cx.observe(&navigation, |_, _, cx| cx.notify());
         let search_subscription = cx.observe(&search_input, move |_, input, cx| {
@@ -60,14 +71,408 @@ impl AxiomLensPrototype {
                 cx.notify();
             });
         });
+        let palette_subscription = cx.observe(&palette_input, |app, input, cx| {
+            app.palette_query = input.read(cx).value().to_string();
+            app.selected_palette_result = 0;
+            cx.notify();
+        });
 
         Self {
             dock_area: workbench.dock_area,
             navigation,
             search_input,
+            palette_input,
+            panel_focus_handles: workbench.panel_focus_handles,
+            focus_handle: cx.focus_handle(),
+            palette_open: false,
+            palette_query: String::new(),
+            selected_palette_result: 0,
+            previous_focus: None,
             _navigation_subscription: navigation_subscription,
             _search_subscription: search_subscription,
+            _palette_subscription: palette_subscription,
         }
+    }
+
+    fn command_items(&self, cx: &App) -> Vec<PaletteItem> {
+        let navigation = self.navigation.read(cx);
+        let dock_area = self.dock_area.read(cx);
+        build_palette_items(
+            &navigation,
+            &self.palette_query,
+            [
+                dock_area.is_dock_open(DockPlacement::Left),
+                dock_area.is_dock_open(DockPlacement::Right),
+                dock_area.is_dock_open(DockPlacement::Bottom),
+            ],
+        )
+    }
+
+    fn panel_is_visible(&self, panel: PanelKind, cx: &App) -> bool {
+        let dock_area = self.dock_area.read(cx);
+        match panel {
+            PanelKind::Sidebar => dock_area.is_dock_open(DockPlacement::Left),
+            PanelKind::Agent => dock_area.is_dock_open(DockPlacement::Right),
+            PanelKind::Activity => dock_area.is_dock_open(DockPlacement::Bottom),
+            PanelKind::Resources | PanelKind::Details => true,
+        }
+    }
+
+    fn panel_focus_handle(&self, panel: PanelKind) -> Option<FocusHandle> {
+        self.panel_focus_handles
+            .iter()
+            .find(|(candidate, _)| *candidate == panel)
+            .map(|(_, handle)| handle.clone())
+    }
+
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            return;
+        }
+        self.previous_focus = window.focused(cx);
+        self.palette_open = true;
+        self.palette_query.clear();
+        self.selected_palette_result = 0;
+        self.palette_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        cx.on_next_frame(window, |app, window, cx| {
+            if app.palette_open {
+                app.palette_input.update(cx, |input, cx| input.focus(window, cx));
+            }
+        });
+        cx.notify();
+    }
+
+    fn close_command_palette(
+        &mut self,
+        focus_target: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.palette_open = false;
+        let focus_handle = focus_target
+            .or_else(|| self.previous_focus.take())
+            .unwrap_or_else(|| self.focus_handle.clone());
+        self.previous_focus = None;
+        window.focus(&focus_handle, cx);
+        cx.notify();
+    }
+
+    fn focus_next_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible_panels = self
+            .panel_focus_handles
+            .iter()
+            .filter(|(panel, _)| self.panel_is_visible(*panel, cx))
+            .collect::<Vec<_>>();
+        if visible_panels.is_empty() {
+            return;
+        }
+        let current_index = visible_panels
+            .iter()
+            .position(|(_, handle)| handle.is_focused(window));
+        let next_index = current_index.map_or(0, |index| (index + 1) % visible_panels.len());
+        window.focus(&visible_panels[next_index].1, cx);
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(action) = palette_key_action(
+            &event.keystroke.key,
+            event.keystroke.modifiers,
+            self.palette_open,
+        ) else {
+            return;
+        };
+        window.prevent_default();
+        cx.stop_propagation();
+
+        match action {
+            PaletteKeyAction::Open => self.open_command_palette(window, cx),
+            PaletteKeyAction::Close => self.close_command_palette(None, window, cx),
+            PaletteKeyAction::MoveNext | PaletteKeyAction::MovePrevious => {
+                let enabled = self
+                    .command_items(cx)
+                    .iter()
+                    .map(|item| item.enabled)
+                    .collect::<Vec<_>>();
+                let direction = if action == PaletteKeyAction::MoveNext {
+                    1
+                } else {
+                    -1
+                };
+                if let Some(index) =
+                    move_to_enabled_result(&enabled, self.selected_palette_result, direction)
+                {
+                    self.selected_palette_result = index;
+                    cx.notify();
+                }
+            }
+            PaletteKeyAction::Activate => {
+                let selected = self
+                    .command_items(cx)
+                    .get(self.selected_palette_result)
+                    .filter(|item| item.enabled)
+                    .map(|item| item.action);
+                if let Some(action) = selected {
+                    self.execute_palette_action(action, window, cx);
+                }
+            }
+            PaletteKeyAction::FocusNextPanel => self.focus_next_panel(window, cx),
+        }
+    }
+
+    fn execute_palette_action(
+        &mut self,
+        action: PaletteAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_target = match action {
+            PaletteAction::OpenResource(tab) => {
+                self.navigation.update(cx, |navigation, cx| {
+                    navigation.switch_context_to(tab.context_index);
+                    navigation.open_resource(tab.resource_index);
+                    cx.notify();
+                });
+                self.panel_focus_handle(PanelKind::Details)
+            }
+            PaletteAction::SelectTab(tab) => {
+                self.navigation.update(cx, |navigation, cx| {
+                    navigation.select_tab(tab);
+                    cx.notify();
+                });
+                self.panel_focus_handle(PanelKind::Details)
+            }
+            PaletteAction::SwitchContext(context_index) => {
+                self.navigation.update(cx, |navigation, cx| {
+                    navigation.switch_context_to(context_index);
+                    cx.notify();
+                });
+                self.panel_focus_handle(PanelKind::Resources)
+            }
+            PaletteAction::CloseActiveTab => {
+                if let Some(tab) = self.navigation.read(cx).active_tab {
+                    self.navigation.update(cx, |navigation, cx| {
+                        navigation.close_tab(tab);
+                        cx.notify();
+                    });
+                }
+                self.panel_focus_handle(PanelKind::Details)
+            }
+            PaletteAction::FocusPanel(panel) => self.panel_focus_handle(panel),
+            PaletteAction::ToggleDock(target) => {
+                let placement = target.placement();
+                self.dock_area.update(cx, |area, cx| {
+                    area.toggle_dock(placement, window, cx);
+                });
+                if self.dock_area.read(cx).is_dock_open(placement) {
+                    self.panel_focus_handle(target.panel())
+                } else {
+                    Some(self.focus_handle.clone())
+                }
+            }
+        };
+        self.close_command_palette(focus_target, window, cx);
+    }
+
+    fn render_command_palette(&self, cx: &mut Context<Self>) -> Div {
+        let items = self.command_items(cx);
+        let mut previous_group = None;
+        let rows = items
+            .iter()
+            .enumerate()
+            .flat_map(|(index, item)| {
+                let mut rows = Vec::with_capacity(2);
+                if previous_group != Some(item.group) {
+                    previous_group = Some(item.group);
+                    rows.push(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .text_color(rgb(TEXT_5))
+                            .child(item.group),
+                    );
+                }
+
+                let selected = index == self.selected_palette_result && item.enabled;
+                let detail = if item.enabled {
+                    item.detail.clone()
+                } else {
+                    format!("DISABLED - {}", item.detail)
+                };
+                let row = div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(36.0))
+                    .px_3()
+                    .bg(rgb(if selected { ACCENT_SOFT } else { RAISED }));
+                if item.enabled {
+                    let action = item.action;
+                    let label = if selected {
+                        format!("> {}", item.label)
+                    } else {
+                        item.label.clone()
+                    };
+                    rows.push(
+                        row.child(
+                            Button::new(format!("palette-result-{index}"))
+                                .label(label)
+                                .compact()
+                                .ghost()
+                                .on_click(cx.listener(move |app, _, window, cx| {
+                                    app.execute_palette_action(action, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_4))
+                                .child(detail),
+                        ),
+                    );
+                } else {
+                    rows.push(
+                        row.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(TEXT_5))
+                                .child(item.label.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_5))
+                                .child(detail),
+                        ),
+                    );
+                }
+                rows
+            })
+            .collect::<Vec<_>>();
+        let result_list = if rows.is_empty() {
+            div()
+                .h(px(360.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT_4))
+                        .child("No navigation results. Try a resource name or type."),
+                )
+        } else {
+            div()
+                .h(px(360.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .children(rows)
+                        .overflow_y_scrollbar(),
+                )
+        };
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(70.0))
+            .bg(hsla(0.0, 0.0, 0.0, 0.58))
+            .child(
+                div()
+                    .w(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(TEXT_1))
+                                    .child("Command Palette"),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family("Menlo")
+                                    .text_color(rgb(TEXT_5))
+                                    .child("ESC"),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .h(px(46.0))
+                            .child(div().text_xs().text_color(rgb(ACCENT)).child("SEARCH"))
+                            .child(
+                                Input::new(&self.palette_input)
+                                    .id("command-palette-input")
+                                    .aria_label("Search local navigation commands and simulated resources")
+                                    .cleanable(true)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .focus_bordered(false)
+                                    .flex_1(),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(result_list)
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_3()
+                            .py_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_5))
+                                    .child("UP / DOWN  MOVE    ENTER  SELECT    ESC  CLOSE"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family("Menlo")
+                                    .text_color(rgb(TEXT_5))
+                                    .child("LOCAL ONLY"),
+                            ),
+                    ),
+            )
+    }
+
+}
+
+impl Focusable for AxiomLensPrototype {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -85,23 +490,71 @@ impl Render for AxiomLensPrototype {
                 });
             }));
 
-        div()
+        let commands_button = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("open-command-palette")
+                    .label("Commands")
+                    .compact()
+                    .ghost()
+                    .on_click(cx.listener(|app, _, window, cx| {
+                        app.open_command_palette(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_family("Menlo")
+                    .text_color(rgb(TEXT_5))
+                    .child("CMD/CTRL+K"),
+            );
+
+        let workspace = div()
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(BG))
-            .child(topbar(snapshot, &self.search_input, context_control))
-            .child(div().flex_1().child(self.dock_area.clone()))
+            .track_focus(&self.focus_handle)
+            .capture_key_down(cx.listener(|app, event, window, cx| {
+                app.handle_key_down(event, window, cx);
+            }))
+            .child(topbar(
+                snapshot,
+                &self.search_input,
+                context_control,
+                commands_button,
+            ))
+            .child(div().flex_1().child(self.dock_area.clone()));
+
+        if self.palette_open {
+            workspace.child(self.render_command_palette(cx))
+        } else {
+            workspace
+        }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PanelKind {
     Sidebar,
     Resources,
     Details,
     Activity,
     Agent,
+}
+
+impl PanelKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sidebar => "Navigation",
+            Self::Resources => "Resources",
+            Self::Details => "Details",
+            Self::Activity => "Activity",
+            Self::Agent => "Agent panel",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -115,6 +568,183 @@ enum DetailView {
 struct ResourceTab {
     context_index: usize,
     resource_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockTarget {
+    Sidebar,
+    Agent,
+    Activity,
+}
+
+impl DockTarget {
+    fn placement(self) -> DockPlacement {
+        match self {
+            Self::Sidebar => DockPlacement::Left,
+            Self::Agent => DockPlacement::Right,
+            Self::Activity => DockPlacement::Bottom,
+        }
+    }
+
+    fn panel(self) -> PanelKind {
+        match self {
+            Self::Sidebar => PanelKind::Sidebar,
+            Self::Agent => PanelKind::Agent,
+            Self::Activity => PanelKind::Activity,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteAction {
+    OpenResource(ResourceTab),
+    SelectTab(ResourceTab),
+    SwitchContext(usize),
+    CloseActiveTab,
+    FocusPanel(PanelKind),
+    ToggleDock(DockTarget),
+}
+
+struct PaletteItem {
+    group: &'static str,
+    label: String,
+    detail: String,
+    action: PaletteAction,
+    enabled: bool,
+}
+
+fn build_palette_items(
+    navigation: &ResourceNavigation,
+    query: &str,
+    dock_open: [bool; 3],
+) -> Vec<PaletteItem> {
+    let query = query.trim().to_lowercase();
+    let mut items = Vec::new();
+
+    if !query.is_empty() {
+        let scope = &navigation.scopes[navigation.active_context];
+        let mut resource_matches = 0;
+        for (resource_index, resource) in scope.resources.iter().enumerate() {
+            let matches = resource.name.to_string().to_lowercase().contains(&query)
+                || resource.kind.to_lowercase().contains(&query);
+            if !matches {
+                continue;
+            }
+            if resource_matches == 12 {
+                break;
+            }
+            items.push(PaletteItem {
+                group: "RESOURCES",
+                label: format!("Open {} ({})", resource.name, resource.kind),
+                detail: format!(
+                    "{} / {} / {} / SIMULATED",
+                    scope.snapshot.target, scope.snapshot.context, scope.snapshot.namespace
+                ),
+                action: PaletteAction::OpenResource(ResourceTab {
+                    context_index: navigation.active_context,
+                    resource_index,
+                }),
+                enabled: true,
+            });
+            resource_matches += 1;
+        }
+    }
+
+    for tab in navigation
+        .tabs
+        .iter()
+        .filter(|tab| Some(**tab) != navigation.active_tab)
+        .take(8)
+    {
+        if let Some(resource) = navigation.resource_for_tab(*tab) {
+            let snapshot = navigation.scopes[tab.context_index].snapshot;
+            items.push(PaletteItem {
+                group: "TABS",
+                label: format!("Switch to {}", resource.name),
+                detail: format!(
+                    "{} / {} / {} / {} / SIMULATED",
+                    resource.kind, snapshot.target, snapshot.context, snapshot.namespace
+                ),
+                action: PaletteAction::SelectTab(*tab),
+                enabled: true,
+            });
+        }
+    }
+
+    for (context_index, scope) in navigation.scopes.iter().enumerate() {
+        if context_index != navigation.active_context {
+            items.push(PaletteItem {
+                group: "CONTEXTS",
+                label: format!("Switch to {}", scope.snapshot.context),
+                detail: format!("{} / {} / SIMULATED", scope.snapshot.target, scope.snapshot.namespace),
+                action: PaletteAction::SwitchContext(context_index),
+                enabled: true,
+            });
+        }
+    }
+
+    items.push(PaletteItem {
+        group: "TABS",
+        label: "Close active resource tab".to_owned(),
+        detail: if navigation.active_tab.is_some() {
+            "Close selected tab; no cluster data is changed.".to_owned()
+        } else {
+            "No resource tab is open.".to_owned()
+        },
+        action: PaletteAction::CloseActiveTab,
+        enabled: navigation.active_tab.is_some(),
+    });
+
+    for panel in [
+        PanelKind::Sidebar,
+        PanelKind::Resources,
+        PanelKind::Details,
+        PanelKind::Agent,
+        PanelKind::Activity,
+    ] {
+        let enabled = match panel {
+            PanelKind::Sidebar => dock_open[0],
+            PanelKind::Agent => dock_open[1],
+            PanelKind::Activity => dock_open[2],
+            PanelKind::Resources | PanelKind::Details => true,
+        };
+        items.push(PaletteItem {
+            group: "PANELS",
+            label: format!("Focus {} panel", panel.label()),
+            detail: if enabled {
+                "Move keyboard focus to panel.".to_owned()
+            } else {
+                "Show this panel first.".to_owned()
+            },
+            action: PaletteAction::FocusPanel(panel),
+            enabled,
+        });
+    }
+    for target in [DockTarget::Sidebar, DockTarget::Agent, DockTarget::Activity] {
+        let is_open = match target {
+            DockTarget::Sidebar => dock_open[0],
+            DockTarget::Agent => dock_open[1],
+            DockTarget::Activity => dock_open[2],
+        };
+        let panel_label = target.panel().label();
+        items.push(PaletteItem {
+            group: "PANELS",
+            label: format!("{} {} panel", if is_open { "Hide" } else { "Show" }, panel_label),
+            detail: "Toggle local workbench panel.".to_owned(),
+            action: PaletteAction::ToggleDock(target),
+            enabled: true,
+        });
+    }
+
+    if !query.is_empty() {
+        items.retain(|item| {
+            item.label.to_lowercase().contains(&query)
+                || item.detail.to_lowercase().contains(&query)
+                || item.group.to_lowercase().contains(&query)
+        });
+    }
+
+    items
 }
 
 struct ResourceScope {
@@ -902,13 +1532,14 @@ impl Focusable for WorkspacePanel {
 impl Render for WorkspacePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.navigation.read(cx).active_snapshot();
-        match self.kind {
+        let panel = match self.kind {
             PanelKind::Sidebar => render_sidebar(snapshot),
             PanelKind::Resources => self.render_resources(cx),
             PanelKind::Details => self.render_details(window, cx),
             PanelKind::Activity => self.render_activity(cx),
             PanelKind::Agent => render_agent(snapshot),
-        }
+        };
+        panel.track_focus(&self.focus_handle)
     }
 }
 
@@ -916,6 +1547,7 @@ fn topbar(
     snapshot: SimulatedSnapshot,
     search_input: &Entity<InputState>,
     context_control: impl IntoElement,
+    commands_button: impl IntoElement,
 ) -> Div {
     div()
         .flex()
@@ -967,6 +1599,7 @@ fn topbar(
                         .flex_1(),
                 )
         )
+            .child(commands_button)
         .child(pill("OFFLINE / SIMULATED", TEXT_3, ACCENT_SOFT))
 }
 
@@ -1685,6 +2318,7 @@ pub(crate) fn build_workbench(
     let (dock_area, _skin) = DockSkin::dock_area("axiomlens-workspace", Some(1), window, cx);
     let navigation = cx.new(|_| ResourceNavigation::new(snapshot));
     let search_input = cx.new(|cx| InputState::new(window, cx));
+    let palette_input = cx.new(|cx| InputState::new(window, cx));
 
     let sidebar = WorkspacePanel::new(
         "SidebarPanel",
@@ -1726,6 +2360,13 @@ pub(crate) fn build_workbench(
         window,
         cx,
     );
+    let panel_focus_handles = vec![
+        (PanelKind::Sidebar, sidebar.read(cx).focus_handle.clone()),
+        (PanelKind::Resources, resources.read(cx).focus_handle.clone()),
+        (PanelKind::Details, details.read(cx).focus_handle.clone()),
+        (PanelKind::Agent, agent.read(cx).focus_handle.clone()),
+        (PanelKind::Activity, activity.read(cx).focus_handle.clone()),
+    ];
 
     dock_area.update(cx, |area, cx| {
         area.set_center(
@@ -1768,12 +2409,310 @@ pub(crate) fn build_workbench(
         dock_area,
         navigation,
         search_input,
+        palette_input,
+        panel_focus_handles,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteKeyAction {
+    Open,
+    Close,
+    MoveNext,
+    MovePrevious,
+    Activate,
+    FocusNextPanel,
+}
+
+fn palette_key_action(
+    key: &str,
+    modifiers: Modifiers,
+    palette_open: bool,
+) -> Option<PaletteKeyAction> {
+    if key.eq_ignore_ascii_case("k")
+        && modifiers.secondary()
+        && modifiers.number_of_modifiers() == 1
+    {
+        return Some(PaletteKeyAction::Open);
+    }
+
+    if palette_open && !modifiers.modified() {
+        return match key.to_ascii_lowercase().as_str() {
+            "escape" => Some(PaletteKeyAction::Close),
+            "down" | "arrowdown" => Some(PaletteKeyAction::MoveNext),
+            "up" | "arrowup" => Some(PaletteKeyAction::MovePrevious),
+            "enter" => Some(PaletteKeyAction::Activate),
+            _ => None,
+        };
+    }
+
+    if !palette_open && key.eq_ignore_ascii_case("f6") && !modifiers.modified() {
+        return Some(PaletteKeyAction::FocusNextPanel);
+    }
+
+    None
+}
+
+fn move_to_enabled_result(enabled: &[bool], current: usize, direction: isize) -> Option<usize> {
+    if enabled.is_empty() || direction == 0 {
+        return None;
+    }
+
+    let length = enabled.len() as isize;
+    (1..=enabled.len())
+        .map(|step| (current as isize + direction * step as isize).rem_euclid(length) as usize)
+        .find(|index| enabled[*index])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::{TestAppContext, test::TestWindowExt};
+
+    fn open_test_workbench(
+        cx: &mut TestAppContext,
+    ) -> (gpui_kit::AnyWindowHandle, Entity<AxiomLensPrototype>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(
+                gpui_kit::WindowOptions::default(),
+                cx,
+                |window, cx| {
+                    let workbench =
+                        build_workbench(crate::simulated_data::initial_snapshot(), window, cx);
+                    cx.new(|cx| AxiomLensPrototype::new(workbench, cx))
+                },
+            )
+            .unwrap()
+        })
+    }
+
+    fn primary_modifier() -> Modifiers {
+        if cfg!(target_os = "macos") {
+            Modifiers {
+                platform: true,
+                ..Modifiers::default()
+            }
+        } else {
+            Modifiers {
+                control: true,
+                ..Modifiers::default()
+            }
+        }
+    }
+
+    #[test]
+    fn command_palette_shortcuts_are_contextual_and_unmodified() {
+        assert_eq!(
+            palette_key_action("k", primary_modifier(), false),
+            Some(PaletteKeyAction::Open)
+        );
+        assert_eq!(
+            palette_key_action("escape", Modifiers::default(), true),
+            Some(PaletteKeyAction::Close)
+        );
+        assert_eq!(
+            palette_key_action("arrowdown", Modifiers::default(), true),
+            Some(PaletteKeyAction::MoveNext)
+        );
+        assert_eq!(
+            palette_key_action("enter", Modifiers::default(), false),
+            None
+        );
+        assert_eq!(
+            palette_key_action(
+                "k",
+                Modifiers {
+                    alt: true,
+                    ..primary_modifier()
+                },
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            palette_key_action("f6", Modifiers::default(), false),
+            Some(PaletteKeyAction::FocusNextPanel)
+        );
+    }
+
+    #[test]
+    fn result_navigation_wraps_and_skips_disabled_entries() {
+        let enabled = [true, false, true, true];
+        assert_eq!(move_to_enabled_result(&enabled, 0, 1), Some(2));
+        assert_eq!(move_to_enabled_result(&enabled, 2, 1), Some(3));
+        assert_eq!(move_to_enabled_result(&enabled, 0, -1), Some(3));
+        assert_eq!(move_to_enabled_result(&[false, false], 0, 1), None);
+    }
+
+    #[gpui_kit::test]
+    fn command_palette_shortcut_and_escape_restore_focus(cx: &mut TestAppContext) {
+        let (window_handle, app) = open_test_workbench(cx);
+        cx.update_window(window_handle, |_, window, cx| {
+            window.render_frame(cx);
+            let root_focus = app.read(cx).focus_handle.clone();
+            window.focus(&root_focus, cx);
+            window.press("secondary-k", cx);
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+
+            assert!(app.read(cx).palette_open);
+            let palette_focus = app.read(cx).palette_input.read(cx).focus_handle(cx);
+            assert!(palette_focus.is_focused(window));
+
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(!app.read(cx).palette_open);
+            assert!(root_focus.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn command_palette_enter_opens_a_local_resource_result(cx: &mut TestAppContext) {
+        let (window_handle, app) = open_test_workbench(cx);
+        cx.update_window(window_handle, |_, window, cx| {
+            window.render_frame(cx);
+            let root_focus = app.read(cx).focus_handle.clone();
+            window.focus(&root_focus, cx);
+            window.press("secondary-k", cx);
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        for character in "checkout".chars() {
+            cx.update_window(window_handle, |_, window, cx| {
+                window.press(&character.to_string(), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+
+        cx.update_window(window_handle, |_, _, cx| {
+            let input_value = app.read(cx).palette_input.read(cx).value().to_string();
+            let query = app.read(cx).palette_query.clone();
+            assert_eq!(input_value, "checkout");
+            assert_eq!(query, "checkout");
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(window_handle, |_, window, cx| {
+            window.press("enter", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(window_handle, |_, _, cx| {
+            assert!(!app.read(cx).palette_open);
+            let selected_name = app
+                .read(cx)
+                .navigation
+                .read(cx)
+                .active_resource()
+                .map(|resource| resource.name.to_string());
+            assert_eq!(selected_name.as_deref(), Some("checkout-svc"));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn f6_cycles_visible_panels_and_skips_collapsed_docks(cx: &mut TestAppContext) {
+        let (window_handle, app) = open_test_workbench(cx);
+        cx.update_window(window_handle, |_, window, cx| {
+            window.render_frame(cx);
+            let dock_area = app.read(cx).dock_area.clone();
+            dock_area.update(cx, |area, cx| {
+                area.toggle_dock(DockPlacement::Bottom, window, cx);
+            });
+            let root_focus = app.read(cx).focus_handle.clone();
+            window.focus(&root_focus, cx);
+            window.press("f6", cx);
+            assert!(app.read(cx).panel_focus_handle(PanelKind::Sidebar).unwrap().is_focused(window));
+            window.press("f6", cx);
+            assert!(app.read(cx).panel_focus_handle(PanelKind::Resources).unwrap().is_focused(window));
+            window.press("f6", cx);
+            assert!(app.read(cx).panel_focus_handle(PanelKind::Details).unwrap().is_focused(window));
+            window.press("f6", cx);
+            assert!(app.read(cx).panel_focus_handle(PanelKind::Agent).unwrap().is_focused(window));
+            window.press("f6", cx);
+            assert!(app.read(cx).panel_focus_handle(PanelKind::Sidebar).unwrap().is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn palette_registry_only_opens_current_context_resources_and_safe_navigation() {
+        let navigation = ResourceNavigation::new(crate::simulated_data::initial_snapshot());
+        let items = build_palette_items(&navigation, "PAYMENT-API", [true; 3]);
+        let resources = items
+            .iter()
+            .filter_map(|item| match item.action {
+                PaletteAction::OpenResource(tab) => Some(tab),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].context_index, navigation.active_context);
+        let registered_items = build_palette_items(&navigation, "", [true; 3]);
+        for item in &registered_items {
+            let text = format!("{} {} {}", item.group, item.label, item.detail).to_lowercase();
+            for forbidden in ["write", "shell", "terminal", "restart", "execute"] {
+                assert!(!text.contains(forbidden));
+            }
+        }
+    }
+
+    #[test]
+    fn palette_reports_no_results_and_disables_close_without_open_tabs() {
+        let mut navigation = ResourceNavigation::new(crate::simulated_data::initial_snapshot());
+        assert!(build_palette_items(&navigation, "no-such-command", [true; 3]).is_empty());
+
+        while let Some(tab) = navigation.active_tab {
+            navigation.close_tab(tab);
+        }
+        let close_item = build_palette_items(&navigation, "close active resource tab", [true; 3])
+            .into_iter()
+            .find(|item| item.action == PaletteAction::CloseActiveTab)
+            .unwrap();
+        assert!(!close_item.enabled);
+    }
+
+    #[test]
+    fn palette_lists_inactive_resource_tabs_and_contexts() {
+        let mut navigation = ResourceNavigation::new(crate::simulated_data::initial_snapshot());
+        navigation.open_resource(1);
+        navigation.switch_context();
+        let items = build_palette_items(&navigation, "", [true; 3]);
+
+        let tab = items
+            .iter()
+            .find_map(|item| match item.action {
+                PaletteAction::SelectTab(tab)
+                    if tab.context_index == 0 && tab.resource_index == 1 =>
+                {
+                    Some(tab)
+                }
+                _ => None,
+            })
+            .expect("palette lists inactive resource tab");
+        let context_index = items.iter().find_map(|item| match item.action {
+            PaletteAction::SwitchContext(index) if index == 0 => Some(index),
+            _ => None,
+        });
+
+        navigation.select_tab(tab);
+        assert_eq!(navigation.active_context, 0);
+        assert_eq!(
+            navigation.active_resource().unwrap().name.to_string(),
+            "checkout-svc"
+        );
+        assert_eq!(context_index, Some(0));
+    }
 
     #[test]
     fn same_named_resources_remain_scoped_to_their_context() {
