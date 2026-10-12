@@ -1,4 +1,5 @@
 mod app;
+pub mod diagnostics;
 mod simulated_data;
 mod simulation;
 pub mod settings;

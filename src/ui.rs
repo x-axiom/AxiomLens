@@ -22,6 +22,7 @@ use std::{
 
 use crate::{simulated_data::SimulatedSnapshot, simulation::{self, SimulatedTaskMessage, SimulatedTaskMode}};
 use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
+use crate::diagnostics::{DiagnosticEvent, Diagnostics, next_correlation_id};
 
 const BG: u32 = 0x0b0e13;
 const PANEL: u32 = 0x11151c;
@@ -97,6 +98,8 @@ pub(crate) struct Workbench {
     settings_store: Option<SettingsStore>,
     settings: SettingsDocument,
     settings_notice: Option<String>,
+    diagnostics: Option<Diagnostics>,
+    diagnostics_notice: Option<String>,
 }
 
 struct SettingsSession {
@@ -131,6 +134,8 @@ pub struct AxiomLensPrototype {
     settings: SettingsDocument,
     settings_notice: Option<SharedString>,
     settings_write_generation: u64,
+    diagnostics: Option<Diagnostics>,
+    diagnostics_notice: Option<SharedString>,
     _navigation_subscription: Subscription,
     _search_subscription: Subscription,
     _palette_subscription: Subscription,
@@ -148,6 +153,8 @@ impl AxiomLensPrototype {
             settings_store,
             settings,
             settings_notice,
+            diagnostics,
+            diagnostics_notice,
         } = workbench;
         let theme_mode = theme_mode_for_appearance(settings.preferences.appearance);
         initialize_theme_palette(theme_mode);
@@ -191,6 +198,8 @@ impl AxiomLensPrototype {
             settings,
             settings_notice: settings_notice.map(SharedString::from),
             settings_write_generation: 0,
+            diagnostics,
+            diagnostics_notice: diagnostics_notice.map(SharedString::from),
             _navigation_subscription: navigation_subscription,
             _search_subscription: search_subscription,
             _palette_subscription: palette_subscription,
@@ -207,6 +216,15 @@ impl AxiomLensPrototype {
                 self.persist_settings(settings, cx);
             }
             Err(error) => {
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.record(
+                        DiagnosticEvent::SettingsSaveFailed,
+                        "settings",
+                        None,
+                        Some("layout_serialization"),
+                        None,
+                    );
+                }
                 self.settings_notice = Some(SharedString::from(format!(
                     "Layout could not be saved: {error}"
                 )));
@@ -220,6 +238,15 @@ impl AxiomLensPrototype {
         self.settings_write_generation = self.settings_write_generation.wrapping_add(1);
         let generation = self.settings_write_generation;
         let Some(store) = self.settings_store.clone() else {
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.record(
+                    DiagnosticEvent::SettingsSaveFailed,
+                    "settings",
+                    None,
+                    Some("store_unavailable"),
+                    None,
+                );
+            }
             self.settings_notice = Some(SharedString::from(
                 "Settings are session-only; configuration storage is unavailable.",
             ));
@@ -232,6 +259,7 @@ impl AxiomLensPrototype {
         let executor = cx.background_executor().clone();
         let debounce = executor.timer(Duration::from_millis(250));
         let app = cx.weak_entity();
+        let diagnostics = self.diagnostics.clone();
         cx.spawn(async move |_, cx| {
             debounce.await;
             let is_current = app
@@ -242,6 +270,15 @@ impl AxiomLensPrototype {
             }
 
             let result = executor.spawn(async move { store.save(&settings) }).await;
+            if let (Some(diagnostics), Err(error)) = (&diagnostics, &result) {
+                diagnostics.record(
+                    DiagnosticEvent::SettingsSaveFailed,
+                    "settings",
+                    None,
+                    Some(error.diagnostic_code()),
+                    None,
+                );
+            }
             app.update(cx, |app, cx| {
                 if app.settings_write_generation == generation {
                     app.settings_notice = result.err().map(|error| {
@@ -710,7 +747,17 @@ impl Render for AxiomLensPrototype {
                 commands_button,
                 theme_button,
             ));
-        let workspace = if let Some(notice) = &self.settings_notice {
+        let notice = self
+            .settings_notice
+            .clone()
+            .or_else(|| self.diagnostics_notice.clone())
+            .or_else(|| {
+                self.diagnostics
+                    .as_ref()
+                    .and_then(Diagnostics::health_notice)
+                    .map(SharedString::from)
+            });
+        let workspace = if let Some(notice) = notice {
             workspace.child(
                 div()
                     .id("settings-notice")
@@ -1101,6 +1148,7 @@ struct WorkspacePanel {
     title: &'static str,
     kind: PanelKind,
     navigation: Entity<ResourceNavigation>,
+    diagnostics: Option<Diagnostics>,
     focus_handle: FocusHandle,
     detail_view: DetailView,
     yaml_editor: Option<Entity<EditorState>>,
@@ -1111,6 +1159,7 @@ struct WorkspacePanel {
     activity_running: bool,
     cancellation: Option<Arc<AtomicBool>>,
     run_id: u64,
+    activity_correlation_id: Option<u64>,
     worker_task: Option<Task<()>>,
     consumer_task: Option<Task<()>>,
 }
@@ -1121,6 +1170,7 @@ impl WorkspacePanel {
         title: &'static str,
         kind: PanelKind,
         navigation: Entity<ResourceNavigation>,
+        diagnostics: Option<Diagnostics>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -1133,6 +1183,7 @@ impl WorkspacePanel {
             title,
             kind,
             navigation,
+            diagnostics,
             focus_handle: cx.focus_handle(),
             detail_view: DetailView::Overview,
             yaml_editor,
@@ -1143,6 +1194,7 @@ impl WorkspacePanel {
             activity_running: false,
             cancellation: None,
             run_id: 0,
+            activity_correlation_id: None,
             worker_task: None,
             consumer_task: None,
         });
@@ -1161,12 +1213,23 @@ impl WorkspacePanel {
 
         self.run_id += 1;
         let run_id = self.run_id;
+        let correlation_id = next_correlation_id();
         let cancellation = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = async_channel::bounded(simulation::CHANNEL_CAPACITY);
         self.activity_events.clear();
         self.activity_status = SharedString::from(format!("RUNNING / {}", mode.label()));
         self.activity_running = true;
         self.cancellation = Some(cancellation.clone());
+        self.activity_correlation_id = Some(correlation_id);
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.record(
+                DiagnosticEvent::SimulatedTaskStarted,
+                "simulation",
+                Some(correlation_id),
+                None,
+                None,
+            );
+        }
 
         self.worker_task = Some(simulation::spawn(
             cx.background_executor().clone(),
@@ -1175,6 +1238,7 @@ impl WorkspacePanel {
             mode,
         ));
 
+        let diagnostics = self.diagnostics.clone();
         self.consumer_task = Some(cx.spawn(async move |panel, cx| {
             while let Ok(first) = receiver.recv().await {
                 let mut batch = Vec::with_capacity(simulation::UI_BATCH_LIMIT);
@@ -1187,7 +1251,30 @@ impl WorkspacePanel {
                 }
 
                 let terminal_status = batch.iter().rev().find_map(task_terminal_status);
+                let terminal_event = batch.iter().rev().find_map(|message| match message {
+                    SimulatedTaskMessage::Finished { dropped } => {
+                        Some((DiagnosticEvent::SimulatedTaskFinished, *dropped))
+                    }
+                    SimulatedTaskMessage::Failed { dropped } => {
+                        Some((DiagnosticEvent::SimulatedTaskFailed, *dropped))
+                    }
+                    SimulatedTaskMessage::Cancelled { dropped } => {
+                        Some((DiagnosticEvent::SimulatedTaskCancelled, *dropped))
+                    }
+                    SimulatedTaskMessage::Output { .. } => None,
+                });
                 let is_terminal = batch.iter().any(SimulatedTaskMessage::is_terminal);
+                if let (Some(diagnostics), Some((event, dropped))) =
+                    (&diagnostics, terminal_event)
+                {
+                    diagnostics.record(
+                        event,
+                        "simulation",
+                        Some(correlation_id),
+                        None,
+                        Some(dropped),
+                    );
+                }
                 let update = panel.update(cx, move |panel, cx| {
                     if panel.run_id != run_id {
                         return;
@@ -1203,6 +1290,7 @@ impl WorkspacePanel {
                         panel.activity_running = false;
                         panel.cancellation = None;
                         panel.worker_task = None;
+                        panel.activity_correlation_id = None;
                     }
                     cx.notify();
                 });
@@ -1218,6 +1306,17 @@ impl WorkspacePanel {
     fn cancel_simulated_task(&mut self, cx: &mut Context<Self>) {
         if let Some(cancellation) = &self.cancellation {
             cancellation.store(true, Ordering::Release);
+            if let (Some(diagnostics), Some(correlation_id)) =
+                (&self.diagnostics, self.activity_correlation_id)
+            {
+                diagnostics.record(
+                    DiagnosticEvent::SimulatedTaskCancelRequested,
+                    "simulation",
+                    Some(correlation_id),
+                    None,
+                    None,
+                );
+            }
             self.activity_status = SharedString::from("CANCELLING / waiting for mock task");
             cx.notify();
         }
@@ -2517,16 +2616,34 @@ fn render_agent(snapshot: SimulatedSnapshot) -> Div {
 
 pub(crate) fn build_workbench(
     snapshot: SimulatedSnapshot,
+    diagnostics: Option<Diagnostics>,
+    diagnostics_notice: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) -> Workbench {
-    build_workbench_with_settings(snapshot, load_settings_session(), window, cx)
+    build_workbench_with_settings(
+        snapshot,
+        load_settings_session(diagnostics.as_ref()),
+        diagnostics,
+        diagnostics_notice,
+        window,
+        cx,
+    )
 }
 
-fn load_settings_session() -> SettingsSession {
+fn load_settings_session(diagnostics: Option<&Diagnostics>) -> SettingsSession {
     let store = match SettingsStore::for_current_user() {
         Ok(store) => store,
         Err(error) => {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.record(
+                    DiagnosticEvent::SettingsLoadFailed,
+                    "settings",
+                    None,
+                    Some(error.diagnostic_code()),
+                    None,
+                );
+            }
             return SettingsSession {
                 store: None,
                 settings: SettingsDocument::default(),
@@ -2541,17 +2658,30 @@ fn load_settings_session() -> SettingsSession {
             settings,
             notice: None,
         },
-        Err(error) => SettingsSession {
-            store: None,
-            settings: SettingsDocument::default(),
-            notice: Some(format!("Settings could not be loaded; using defaults: {error}")),
-        },
+        Err(error) => {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.record(
+                    DiagnosticEvent::SettingsLoadFailed,
+                    "settings",
+                    None,
+                    Some(error.diagnostic_code()),
+                    None,
+                );
+            }
+            SettingsSession {
+                store: None,
+                settings: SettingsDocument::default(),
+                notice: Some(format!("Settings could not be loaded; using defaults: {error}")),
+            }
+        }
     }
 }
 
 fn build_workbench_with_settings(
     snapshot: SimulatedSnapshot,
     session: SettingsSession,
+    diagnostics: Option<Diagnostics>,
+    diagnostics_notice: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) -> Workbench {
@@ -2574,6 +2704,7 @@ fn build_workbench_with_settings(
         "Sidebar",
         PanelKind::Sidebar,
         navigation.clone(),
+        diagnostics.clone(),
         window,
         cx,
     );
@@ -2582,6 +2713,7 @@ fn build_workbench_with_settings(
         "Resources",
         PanelKind::Resources,
         navigation.clone(),
+        diagnostics.clone(),
         window,
         cx,
     );
@@ -2590,6 +2722,7 @@ fn build_workbench_with_settings(
         "Resource details",
         PanelKind::Details,
         navigation.clone(),
+        diagnostics.clone(),
         window,
         cx,
     );
@@ -2598,6 +2731,7 @@ fn build_workbench_with_settings(
         "Agent",
         PanelKind::Agent,
         navigation.clone(),
+        diagnostics.clone(),
         window,
         cx,
     );
@@ -2606,6 +2740,7 @@ fn build_workbench_with_settings(
         "Activity",
         PanelKind::Activity,
         navigation.clone(),
+        diagnostics.clone(),
         window,
         cx,
     );
@@ -2683,6 +2818,8 @@ fn build_workbench_with_settings(
         settings_store,
         settings,
         settings_notice,
+        diagnostics,
+        diagnostics_notice,
     }
 }
 
@@ -2860,6 +2997,8 @@ mod tests {
                     let workbench = build_workbench_with_settings(
                         crate::simulated_data::initial_snapshot(),
                         SettingsSession::default(),
+                        None,
+                        None,
                         window,
                         cx,
                     );
@@ -2888,6 +3027,33 @@ mod tests {
                             settings,
                             notice: None,
                         },
+                        None,
+                        None,
+                        window,
+                        cx,
+                    );
+                    cx.new(|cx| AxiomLensPrototype::new(workbench, cx))
+                },
+            )
+            .unwrap()
+        })
+    }
+
+    fn open_test_workbench_with_diagnostics(
+        cx: &mut TestAppContext,
+        diagnostics: Diagnostics,
+    ) -> (gpui_kit::AnyWindowHandle, Entity<AxiomLensPrototype>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(
+                gpui_kit::WindowOptions::default(),
+                cx,
+                move |window, cx| {
+                    let workbench = build_workbench_with_settings(
+                        crate::simulated_data::initial_snapshot(),
+                        SettingsSession::default(),
+                        Some(diagnostics),
+                        None,
                         window,
                         cx,
                     );
@@ -3001,6 +3167,89 @@ mod tests {
             assert!(root_focus.is_focused(window));
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn simulated_task_logs_correlated_failure_without_output_bodies(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::in_directory(directory.path()).unwrap();
+        let (window_handle, _) =
+            open_test_workbench_with_diagnostics(cx, diagnostics.clone());
+
+        cx.update_window(window_handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("simulate-failure", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        for _ in 0..12 {
+            cx.executor().advance_clock(Duration::from_millis(120));
+            cx.run_until_parked();
+        }
+        diagnostics.flush().unwrap();
+
+        let contents = std::fs::read_to_string(directory.path().join("axiomlens.jsonl")).unwrap();
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let started = records
+            .iter()
+            .find(|record| record["event"] == "simulated_task_started")
+            .unwrap();
+        let failed = records
+            .iter()
+            .find(|record| record["event"] == "simulated_task_failed")
+            .unwrap();
+        assert_eq!(started["module"], "simulation");
+        assert_eq!(failed["module"], "simulation");
+        assert_eq!(started["correlation_id"], failed["correlation_id"]);
+        assert_eq!(failed["level"], "ERROR");
+        assert!(!contents.contains("sample response chunk"));
+        assert!(!contents.contains("sample retry"));
+    }
+
+    #[gpui_kit::test]
+    fn simulated_task_logs_correlated_cancellation(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::in_directory(directory.path()).unwrap();
+        let (window_handle, _) = open_test_workbench_with_diagnostics(cx, diagnostics.clone());
+
+        cx.update_window(window_handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("simulate-success", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        cx.update_window(window_handle, |_, window, cx| {
+            window.click("simulate-cancel", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        diagnostics.flush().unwrap();
+
+        let contents = std::fs::read_to_string(directory.path().join("axiomlens.jsonl")).unwrap();
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let correlation_for = |event| {
+            records
+                .iter()
+                .find(|record| record["event"] == event)
+                .unwrap()["correlation_id"]
+                .clone()
+        };
+        let started = correlation_for("simulated_task_started");
+        assert_eq!(started, correlation_for("simulated_task_cancel_requested"));
+        assert_eq!(started, correlation_for("simulated_task_cancelled"));
+        assert!(!records
+            .iter()
+            .any(|record| record["event"] == "simulated_task_finished"));
     }
 
     #[gpui_kit::test]

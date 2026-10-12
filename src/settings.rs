@@ -87,6 +87,20 @@ pub enum SettingsError {
     FileTooLarge,
 }
 
+impl SettingsError {
+    pub fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::Json(_) => "invalid_json",
+            Self::ConfigDirectoryUnavailable => "config_directory_unavailable",
+            Self::MissingSchemaVersion => "missing_schema_version",
+            Self::UnsupportedSchemaVersion(_) => "unsupported_schema_version",
+            Self::InvalidSettings(_) => "invalid_settings",
+            Self::FileTooLarge => "file_too_large",
+        }
+    }
+}
+
 impl fmt::Display for SettingsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

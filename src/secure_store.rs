@@ -300,14 +300,39 @@ mod tests {
     }
 
     #[test]
-    fn secure_references_do_not_serialize_secret_bodies() {
+    fn test_secret_stays_out_of_settings_and_diagnostics() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = crate::diagnostics::Diagnostics::in_directory(
+            directory.path().join("diagnostics"),
+        )
+        .unwrap();
+        let store = OsCredentialStore {
+            backend: Arc::new(FakeBackend::default()),
+        };
+        let credential_reference = reference("item-4");
+        let test_secret = "TEST_ONLY_CREDENTIAL_BODY_81ac";
+        store.store(&credential_reference, test_secret).unwrap();
+
         let settings = crate::settings::SettingsDocument {
-            credential_refs: BTreeMap::from([("target".to_owned(), reference("item-4"))]),
+            credential_refs: BTreeMap::from([("target".to_owned(), credential_reference.clone())]),
             ..crate::settings::SettingsDocument::default()
         };
         let serialized = serde_json::to_string(&settings).unwrap();
+        diagnostics.record(
+            crate::diagnostics::DiagnosticEvent::SettingsSaveFailed,
+            "settings",
+            Some(7),
+            Some("permission_denied"),
+            None,
+        );
+        diagnostics.flush().unwrap();
+        let log = std::fs::read_to_string(directory.path().join("diagnostics/axiomlens.jsonl"))
+            .unwrap();
+
         assert!(serialized.contains("item-4"));
-        assert!(!serialized.contains("test-only-secret-body"));
+        assert!(!serialized.contains(test_secret));
+        assert!(!log.contains(test_secret));
+        assert_eq!(store.retrieve(&credential_reference).unwrap(), test_secret);
     }
 
     #[cfg(target_os = "macos")]
