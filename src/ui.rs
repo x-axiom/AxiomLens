@@ -1,8 +1,10 @@
 use gpui_kit::{
     App, AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, SharedString,
-    KeyDownEvent, Modifiers, Styled as _, Subscription, Task, Window, div, hsla, px, rgb, size,
+    KeyDownEvent, Modifiers, Styled as _, Subscription, Task, Window, div, hsla, px,
+    rgb as gpui_rgb, size,
 };
+use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{
     BasePanel, DockArea, DockLayout, DockPlacement, DockSkin, Panel as DockPanel, PanelEvent,
@@ -33,6 +35,43 @@ const OK: u32 = 0x3fb97e;
 const WARN: u32 = 0xe0a24e;
 const DANGER: u32 = 0xe5564d;
 const INFO: u32 = 0x5aa9e6;
+static LIGHT_THEME_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn rgb(color: u32) -> gpui_kit::Rgba {
+    let color = if LIGHT_THEME_ACTIVE.load(Ordering::Acquire) {
+        light_theme_color(color)
+    } else {
+        color
+    };
+    gpui_rgb(color)
+}
+
+fn light_theme_color(color: u32) -> u32 {
+    match color {
+        BG => 0xf7f9fc,
+        PANEL => 0xffffff,
+        RAISED => 0xf0f3f7,
+        ELEVATED => 0xe8edf3,
+        BORDER => 0xd2dae4,
+        TEXT_1 => 0x17212f,
+        TEXT_2 => 0x344052,
+        TEXT_3 => 0x4c5a6c,
+        TEXT_4 => 0x586779,
+        TEXT_5 => 0x626e7c,
+        ACCENT => 0x28659b,
+        ACCENT_SOFT => 0xe8f1fa,
+        ACCENT_SOFT_2 => 0xe2edf8,
+        OK => 0x236b49,
+        WARN => 0x875400,
+        DANGER => 0xb42318,
+        INFO => 0x28659b,
+        0x7fb4e6 => 0x28659b,
+        0x14261c => 0xe6f4eb,
+        0x251617 => 0xfcebea,
+        _ => color,
+    }
+}
+
 pub(crate) struct Workbench {
     dock_area: Entity<DockArea>,
     navigation: Entity<ResourceNavigation>,
@@ -52,6 +91,7 @@ pub struct AxiomLensPrototype {
     palette_query: String,
     selected_palette_result: usize,
     previous_focus: Option<FocusHandle>,
+    theme_mode: ThemeMode,
     _navigation_subscription: Subscription,
     _search_subscription: Subscription,
     _palette_subscription: Subscription,
@@ -88,6 +128,7 @@ impl AxiomLensPrototype {
             palette_query: String::new(),
             selected_palette_result: 0,
             previous_focus: None,
+            theme_mode: ThemeMode::Dark,
             _navigation_subscription: navigation_subscription,
             _search_subscription: search_subscription,
             _palette_subscription: palette_subscription,
@@ -510,6 +551,20 @@ impl Render for AxiomLensPrototype {
                     .text_color(rgb(TEXT_5))
                     .child("CMD/CTRL+K"),
             );
+        let theme_button = Button::new("toggle-theme")
+            .label(if self.theme_mode.is_dark() { "Light" } else { "Dark" })
+            .compact()
+            .ghost()
+            .on_click(cx.listener(|app, _, _, cx| {
+                app.theme_mode = if app.theme_mode.is_dark() {
+                    ThemeMode::Light
+                } else {
+                    ThemeMode::Dark
+                };
+                LIGHT_THEME_ACTIVE.store(!app.theme_mode.is_dark(), Ordering::Release);
+                Theme::change(app.theme_mode, None, cx);
+                cx.notify();
+            }));
 
         let workspace = div()
             .size_full()
@@ -525,6 +580,7 @@ impl Render for AxiomLensPrototype {
                 &self.search_input,
                 context_control,
                 commands_button,
+                theme_button,
             ))
             .child(div().flex_1().child(self.dock_area.clone()));
 
@@ -1548,11 +1604,12 @@ fn topbar(
     search_input: &Entity<InputState>,
     context_control: impl IntoElement,
     commands_button: impl IntoElement,
-) -> Div {
+    theme_button: impl IntoElement,
+) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .gap_3()
+        .gap_2()
         .px_3()
         .py_2()
         .bg(rgb(PANEL))
@@ -1577,7 +1634,7 @@ fn topbar(
         .child(div().flex_1())
         .child(
             div()
-                    .w(px(300.0))
+                    .w(px(240.0))
                 .h(px(30.0))
                 .flex()
                 .items_center()
@@ -1600,7 +1657,13 @@ fn topbar(
                 )
         )
             .child(commands_button)
-        .child(pill("OFFLINE / SIMULATED", TEXT_3, ACCENT_SOFT))
+        .child(theme_button)
+        .child(
+            div()
+                .id("connection-state")
+                .child(pill("OFFLINE / SIMULATED", TEXT_3, ACCENT_SOFT)),
+        )
+        .id("workbench-topbar")
 }
 
 fn pill(label: impl Into<SharedString>, foreground: u32, background: u32) -> Div {
@@ -2469,6 +2532,25 @@ mod tests {
     use super::*;
     use gpui_kit::{TestAppContext, test::TestWindowExt};
 
+    fn relative_luminance(color: u32) -> f64 {
+        let [_, red, green, blue] = color.to_be_bytes();
+        let linear = |channel: u8| {
+            let channel = f64::from(channel) / 255.0;
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
+
+    fn contrast_ratio(foreground: u32, background: u32) -> f64 {
+        let foreground = relative_luminance(foreground);
+        let background = relative_luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
     fn open_test_workbench(
         cx: &mut TestAppContext,
     ) -> (gpui_kit::AnyWindowHandle, Entity<AxiomLensPrototype>) {
@@ -2499,6 +2581,30 @@ mod tests {
                 ..Modifiers::default()
             }
         }
+    }
+
+    #[test]
+    fn light_palette_keeps_text_and_status_contrast() {
+        let pairs = [
+            (TEXT_1, BG),
+            (TEXT_4, PANEL),
+            (TEXT_5, PANEL),
+            (ACCENT, PANEL),
+            (TEXT_1, ACCENT_SOFT),
+            (OK, 0x14261c),
+            (WARN, ELEVATED),
+            (DANGER, 0x251617),
+        ];
+
+        for (foreground, background) in pairs {
+            let ratio = contrast_ratio(
+                light_theme_color(foreground),
+                light_theme_color(background),
+            );
+            assert!(ratio >= 4.5, "contrast ratio {ratio:.2} for {foreground:#08x}");
+        }
+        assert_ne!(light_theme_color(BG), light_theme_color(PANEL));
+        assert_ne!(light_theme_color(PANEL), light_theme_color(RAISED));
     }
 
     #[test]
@@ -2615,6 +2721,57 @@ mod tests {
                 .active_resource()
                 .map(|resource| resource.name.to_string());
             assert_eq!(selected_name.as_deref(), Some("checkout-svc"));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn theme_toggle_preserves_resource_and_layout_state(cx: &mut TestAppContext) {
+        let (window_handle, app) = open_test_workbench(cx);
+        cx.simulate_window_resize(window_handle, size(px(1280.0), px(800.0)));
+        cx.update_window(window_handle, |_, window, cx| {
+            window.render_frame(cx);
+            let navigation = app.read(cx).navigation.clone();
+            let dock_area = app.read(cx).dock_area.clone();
+            let initial_tab = navigation.read(cx).active_tab;
+            let initial_context = navigation.read(cx).active_context;
+            let initial_tabs = navigation.read(cx).tabs.clone();
+            let dock_area_id = dock_area.entity_id();
+            let viewport_width = window.viewport_size().width;
+            let assert_topbar_controls_fit = |window: &Window| {
+                for id in [
+                    "resource-search",
+                    "open-command-palette",
+                    "toggle-theme",
+                ] {
+                    let bounds = window.find(id).bounds();
+                    assert!(bounds.origin.x >= px(0.0), "{id} begins outside window");
+                    assert!(
+                        bounds.origin.x + bounds.size.width <= viewport_width,
+                        "{id} is clipped at 1280px reference width"
+                    );
+                }
+            };
+            assert_topbar_controls_fit(window);
+
+            window.click("toggle-theme", cx);
+            assert_eq!(app.read(cx).theme_mode, ThemeMode::Light);
+            assert_eq!(Theme::global(cx).mode, ThemeMode::Light);
+            assert!(LIGHT_THEME_ACTIVE.load(Ordering::Acquire));
+            assert_eq!(navigation.read(cx).active_tab, initial_tab);
+            assert_eq!(navigation.read(cx).active_context, initial_context);
+            assert_eq!(navigation.read(cx).tabs, initial_tabs);
+            assert_eq!(dock_area.entity_id(), dock_area_id);
+            window.render_frame(cx);
+            assert_topbar_controls_fit(window);
+
+            window.click("toggle-theme", cx);
+            assert_eq!(app.read(cx).theme_mode, ThemeMode::Dark);
+            assert_eq!(Theme::global(cx).mode, ThemeMode::Dark);
+            assert!(!LIGHT_THEME_ACTIVE.load(Ordering::Acquire));
+            assert_eq!(navigation.read(cx).active_tab, initial_tab);
+            assert_eq!(navigation.read(cx).active_context, initial_context);
+            assert_eq!(navigation.read(cx).tabs, initial_tabs);
         })
         .unwrap();
     }
