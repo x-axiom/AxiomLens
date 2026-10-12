@@ -32,6 +32,9 @@ pub enum DiagnosticEvent {
     SimulatedTaskFinished,
     SimulatedTaskFailed,
     SimulatedTaskCancelled,
+    KubernetesConnectionStarted,
+    KubernetesConnectionSucceeded,
+    KubernetesConnectionFailed,
 }
 
 impl DiagnosticEvent {
@@ -46,20 +49,27 @@ impl DiagnosticEvent {
             Self::SimulatedTaskFinished => "simulated_task_finished",
             Self::SimulatedTaskFailed => "simulated_task_failed",
             Self::SimulatedTaskCancelled => "simulated_task_cancelled",
+            Self::KubernetesConnectionStarted => "kubernetes_connection_started",
+            Self::KubernetesConnectionSucceeded => "kubernetes_connection_succeeded",
+            Self::KubernetesConnectionFailed => "kubernetes_connection_failed",
         }
     }
 
     fn level(self) -> &'static str {
         match self {
-            Self::ApplicationStarted | Self::SimulatedTaskStarted | Self::SimulatedTaskFinished => {
+            Self::ApplicationStarted
+            | Self::SimulatedTaskStarted
+            | Self::SimulatedTaskFinished
+            | Self::KubernetesConnectionSucceeded => {
                 "INFO"
             }
-            Self::SimulatedTaskCancelRequested => "WARN",
+            Self::SimulatedTaskCancelRequested | Self::KubernetesConnectionStarted => "WARN",
             Self::ApplicationWindowFailed
             | Self::SettingsLoadFailed
             | Self::SettingsSaveFailed
             | Self::SimulatedTaskFailed
-            | Self::SimulatedTaskCancelled => "ERROR",
+            | Self::SimulatedTaskCancelled
+            | Self::KubernetesConnectionFailed => "ERROR",
         }
     }
 }

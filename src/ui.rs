@@ -22,6 +22,7 @@ use std::{
 };
 
 use crate::{simulated_data::SimulatedSnapshot, simulation::{self, SimulatedTaskMessage, SimulatedTaskMode}};
+use crate::connection::{self, ActiveConnection, ConnectionFailure, ConnectionPolicy};
 use crate::kubeconfig::{ImportedKubeconfig, KubeconfigImportError};
 use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
 use crate::target::{ContextName, SessionRegistry};
@@ -111,6 +112,43 @@ enum KubeconfigImportSource {
     Environment,
 }
 
+#[derive(Clone, Copy)]
+enum ConnectionViewState {
+    Disconnected,
+    Connecting,
+    Connected { attempts: u8 },
+    Failed(ConnectionFailure),
+}
+
+impl ConnectionViewState {
+    fn label(self, has_target: bool) -> String {
+        match self {
+            Self::Disconnected if has_target => "TARGET SELECTED / DISCONNECTED".to_string(),
+            Self::Disconnected => "OFFLINE / SIMULATED".to_owned(),
+            Self::Connecting => "CONNECTING".to_owned(),
+            Self::Connected { attempts } => format!("CONNECTED / {attempts} ATTEMPT(S)"),
+            Self::Failed(_) => "CONNECTION FAILED".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionPolicyField {
+    ConnectTimeout,
+    RequestTimeout,
+    RetryLimit,
+}
+
+impl ConnectionPolicyField {
+    fn id(self) -> &'static str {
+        match self {
+            Self::ConnectTimeout => "connect-timeout",
+            Self::RequestTimeout => "request-timeout",
+            Self::RetryLimit => "retry-limit",
+        }
+    }
+}
+
 struct SettingsSession {
     store: Option<SettingsStore>,
     settings: SettingsDocument,
@@ -145,6 +183,8 @@ pub struct AxiomLensPrototype {
     imported_kubeconfig: Option<ImportedKubeconfig>,
     selected_context_name: Option<ContextName>,
     session_registry: SessionRegistry,
+    connection_view_state: ConnectionViewState,
+    _active_connection: Option<ActiveConnection>,
     previous_focus: Option<FocusHandle>,
     theme_mode: ThemeMode,
     settings_store: Option<SettingsStore>,
@@ -218,6 +258,8 @@ impl AxiomLensPrototype {
             imported_kubeconfig: None,
             selected_context_name: None,
             session_registry: SessionRegistry::default(),
+            connection_view_state: ConnectionViewState::Disconnected,
+            _active_connection: None,
             previous_focus: None,
             theme_mode,
             settings_store,
@@ -412,6 +454,8 @@ impl AxiomLensPrototype {
                 match result {
                     Ok(imported) => {
                         app.session_registry.end_session();
+                        app._active_connection = None;
+                        app.connection_view_state = ConnectionViewState::Disconnected;
                         app.imported_kubeconfig = Some(imported);
                         app.selected_context_name = None;
                         app.kubeconfig_import_error = None;
@@ -429,33 +473,123 @@ impl AxiomLensPrototype {
     }
 
     fn select_kubeconfig_context(&mut self, name: String, cx: &mut Context<Self>) {
-        let selected_name = self.imported_kubeconfig.as_ref().and_then(|imported| {
-            imported
-                .contexts()
-                .iter()
-                .find(|context| context.name().as_str() == name)
-                .map(|context| context.name().clone())
-        });
-        let result = match &self.imported_kubeconfig {
-            Some(imported) => imported.select_context(&name, &mut self.session_registry),
-            None => Err(KubeconfigImportError::UnknownContext),
+        let Some(imported) = self.imported_kubeconfig.clone() else {
+            self.kubeconfig_import_error = Some(SharedString::from(
+                KubeconfigImportError::UnknownContext.to_string(),
+            ));
+            cx.notify();
+            return;
         };
-        match (result, selected_name) {
-            (Ok(_target), Some(context_name)) => {
-                self.selected_context_name = Some(context_name);
+        match imported.select_context(&name, &mut self.session_registry) {
+            Ok(target) => {
+                self.selected_context_name = Some(target.context_name().clone());
                 self.kubeconfig_selection_open = false;
                 self.kubeconfig_import_error = None;
+                self.begin_kubeconfig_connection(imported, target, cx);
             }
-            (Err(error), _) => {
+            Err(error) => {
                 self.kubeconfig_import_error = Some(SharedString::from(error.to_string()));
-            }
-            (Ok(_), None) => {
-                self.kubeconfig_import_error = Some(SharedString::from(
-                    KubeconfigImportError::UnknownContext.to_string(),
-                ));
             }
         }
         cx.notify();
+    }
+
+    fn begin_kubeconfig_connection(
+        &mut self,
+        imported: ImportedKubeconfig,
+        target: crate::target::TargetBinding,
+        cx: &mut Context<Self>,
+    ) {
+        self._active_connection = None;
+        self.connection_view_state = ConnectionViewState::Connecting;
+        let preferences = &self.settings.preferences;
+        let policy = ConnectionPolicy::from_seconds(
+            preferences.connect_timeout_seconds,
+            preferences.request_timeout_seconds,
+            preferences.connection_retry_limit,
+        )
+        .unwrap_or_default();
+        let correlation_id = next_correlation_id();
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.record(
+                DiagnosticEvent::KubernetesConnectionStarted,
+                "connection",
+                Some(correlation_id),
+                None,
+                None,
+            );
+        }
+
+        let target_for_completion = target.clone();
+        let diagnostics = self.diagnostics.clone();
+        let executor = cx.background_executor().clone();
+        let app = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let result = executor
+                .spawn(async move { connection::connect(imported, target, policy).await })
+                .await;
+            if let (Some(diagnostics), Err(error)) = (&diagnostics, &result) {
+                diagnostics.record(
+                    DiagnosticEvent::KubernetesConnectionFailed,
+                    "connection",
+                    Some(correlation_id),
+                    Some(error.error_code()),
+                    None,
+                );
+            }
+            if let (Some(diagnostics), Ok(connection)) = (&diagnostics, &result) {
+                diagnostics.record(
+                    DiagnosticEvent::KubernetesConnectionSucceeded,
+                    "connection",
+                    Some(correlation_id),
+                    None,
+                    None,
+                );
+                let _ = connection.attempts();
+            }
+            let _ = app.update(cx, |app, cx| {
+                if !app.session_registry.is_current(&target_for_completion) {
+                    return;
+                }
+                match result {
+                    Ok(connection) => {
+                        app.connection_view_state = ConnectionViewState::Connected {
+                            attempts: connection.attempts(),
+                        };
+                        app._active_connection = Some(connection);
+                    }
+                    Err(error) => {
+                        app.connection_view_state = ConnectionViewState::Failed(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn adjust_connection_policy(
+        &mut self,
+        field: ConnectionPolicyField,
+        delta: i32,
+        cx: &mut Context<Self>,
+    ) {
+        let mut settings = self.settings.clone();
+        match field {
+            ConnectionPolicyField::ConnectTimeout => {
+                let value = i32::from(settings.preferences.connect_timeout_seconds);
+                settings.preferences.connect_timeout_seconds = (value + delta).clamp(1, 60) as u16;
+            }
+            ConnectionPolicyField::RequestTimeout => {
+                let value = i32::from(settings.preferences.request_timeout_seconds);
+                settings.preferences.request_timeout_seconds = (value + delta).clamp(1, 120) as u16;
+            }
+            ConnectionPolicyField::RetryLimit => {
+                let value = i32::from(settings.preferences.connection_retry_limit);
+                settings.preferences.connection_retry_limit = (value + delta).clamp(0, 3) as u8;
+            }
+        }
+        self.persist_settings(settings, cx);
     }
 
     fn close_command_palette(
@@ -727,6 +861,77 @@ impl AxiomLensPrototype {
             )
     }
 
+    fn render_connection_policy_control(
+        &self,
+        label: &'static str,
+        value: String,
+        field: ConnectionPolicyField,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let decrease = field;
+        let increase = field;
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(div().text_xs().text_color(rgb(TEXT_4)).child(label))
+            .child(
+                Button::new(format!("{}-decrease", field.id()))
+                    .label("-")
+                    .compact()
+                    .ghost()
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        app.adjust_connection_policy(decrease, -1, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .w(px(32.0))
+                    .text_center()
+                    .font_family("Menlo")
+                    .text_xs()
+                    .text_color(rgb(TEXT_2))
+                    .child(value),
+            )
+            .child(
+                Button::new(format!("{}-increase", field.id()))
+                    .label("+")
+                    .compact()
+                    .ghost()
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        app.adjust_connection_policy(increase, 1, cx);
+                    })),
+            )
+    }
+
+    fn render_connection_policy_controls(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .child(self.render_connection_policy_control(
+                "CONNECT",
+                format!("{}s", self.settings.preferences.connect_timeout_seconds),
+                ConnectionPolicyField::ConnectTimeout,
+                cx,
+            ))
+            .child(self.render_connection_policy_control(
+                "REQUEST",
+                format!("{}s", self.settings.preferences.request_timeout_seconds),
+                ConnectionPolicyField::RequestTimeout,
+                cx,
+            ))
+            .child(self.render_connection_policy_control(
+                "RETRIES",
+                self.settings.preferences.connection_retry_limit.to_string(),
+                ConnectionPolicyField::RetryLimit,
+                cx,
+            ))
+    }
+
     fn render_kubeconfig_contexts(&self, cx: &mut Context<Self>) -> Div {
         let rows = self
             .imported_kubeconfig
@@ -762,7 +967,7 @@ impl AxiomLensPrototype {
                             )
                             .child(
                                 Button::new(format!("select-kubeconfig-context-{index}"))
-                                    .label("Select")
+                                    .label("Connect")
                                     .compact()
                                     .ghost()
                                     .on_click(cx.listener(move |app, _, _, cx| {
@@ -780,6 +985,7 @@ impl AxiomLensPrototype {
             .map(|context| format!("Current: {}", context.as_str()))
             .unwrap_or_else(|| "No current Context".to_owned());
         let error = self.kubeconfig_import_error.clone();
+        let connection_status = self.connection_view_state.label(self.selected_context_name.is_some());
 
         div()
             .absolute()
@@ -820,6 +1026,8 @@ impl AxiomLensPrototype {
                             ),
                     )
                     .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(self.render_connection_policy_controls(cx))
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
                     .child(div().h(px(320.0)).overflow_y_scrollbar().children(rows))
                     .child(if let Some(error) = error {
                         div()
@@ -841,7 +1049,7 @@ impl AxiomLensPrototype {
                                 div()
                                     .text_xs()
                                     .text_color(rgb(TEXT_5))
-                                    .child("Disconnected · sample data only"),
+                                    .child(format!("{connection_status} · sample data only")),
                             )
                             .child(
                                 Button::new("import-another-kubeconfig")
@@ -1063,6 +1271,7 @@ impl Render for AxiomLensPrototype {
         let context_label = selected_context
             .map(|context| context.name().as_str())
             .unwrap_or("Choose Context");
+        let connection_status = self.connection_view_state.label(selected_context.is_some());
         let context_control = Button::new("kubeconfig-context-selector")
             .label(format!("{context_label} v"))
             .compact()
@@ -1134,6 +1343,7 @@ impl Render for AxiomLensPrototype {
                 selected_context.map(|context| {
                     (context.cluster_name(), context.default_namespace().as_str())
                 }),
+                connection_status.clone(),
                 &self.search_input,
                 context_control,
                 commands_button,
@@ -1177,11 +1387,50 @@ impl Render for AxiomLensPrototype {
                             .text_xs()
                             .text_color(rgb(INFO))
                             .child(format!(
-                                "Target selected: {} / {} / {} · Disconnected; resource panes remain simulated",
+                                "Target selected: {} / {} / {} · {}; resource panes remain simulated",
                                 context.cluster_name(),
                                 context.name().as_str(),
-                                context.default_namespace().as_str()
+                                context.default_namespace().as_str(),
+                                connection_status
                             )),
+                    ),
+            )
+        } else {
+            workspace
+        };
+        let workspace = if let ConnectionViewState::Failed(failure) = self.connection_view_state {
+            let retry_context = self
+                .selected_context_name
+                .as_ref()
+                .map(|context| context.as_str().to_owned());
+            workspace.child(
+                div()
+                    .id("connection-failure-notice")
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .child(div().text_xs().text_color(rgb(DANGER)).child(failure.summary()))
+                            .child(div().text_xs().text_color(rgb(TEXT_4)).child(failure.next_step())),
+                    )
+                    .child(
+                        Button::new("retry-kubeconfig-connection")
+                            .label("Retry")
+                            .compact()
+                            .ghost()
+                            .on_click(cx.listener(move |app, _, _, cx| {
+                                if let Some(context) = retry_context.clone() {
+                                    app.select_kubeconfig_context(context, cx);
+                                }
+                            })),
                     ),
             )
         } else {
@@ -2264,19 +2513,14 @@ impl Render for WorkspacePanel {
 fn topbar(
     snapshot: SimulatedSnapshot,
     selected_scope: Option<(&str, &str)>,
+    connection_status: String,
     search_input: &Entity<InputState>,
     context_control: impl IntoElement,
     commands_button: impl IntoElement,
     theme_button: impl IntoElement,
 ) -> impl IntoElement {
-    let has_selected_target = selected_scope.is_some();
     let (target_name, namespace_name) =
         selected_scope.unwrap_or((snapshot.target, snapshot.namespace));
-    let connection_status = if has_selected_target {
-        "TARGET SELECTED / DISCONNECTED"
-    } else {
-        "OFFLINE / SIMULATED"
-    };
     div()
         .flex()
         .items_center()

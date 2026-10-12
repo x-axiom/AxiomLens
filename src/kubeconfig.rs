@@ -64,6 +64,7 @@ pub enum KubeconfigImportError {
     InvalidCertificateAuthorityData,
     IncompleteClientCertificatePair,
     UnknownContext,
+    ConfigChangedSinceImport,
     InvalidTargetIdentity,
 }
 
@@ -121,6 +122,9 @@ impl fmt::Display for KubeconfigImportError {
                 formatter.write_str("client certificate and client key must be configured together")
             }
             Self::UnknownContext => formatter.write_str("selected context does not exist"),
+            Self::ConfigChangedSinceImport => {
+                formatter.write_str("kubeconfig target changed since import; import and select again")
+            }
             Self::InvalidTargetIdentity => formatter.write_str("selected target identity is invalid"),
         }
     }
@@ -153,6 +157,10 @@ impl ImportedContext {
     /// Returns configured Namespace, or Kubernetes' `default` when omitted.
     pub fn default_namespace(&self) -> &NamespaceName {
         &self.default_namespace
+    }
+
+    pub(crate) fn connection_identity(&self) -> &ConnectionIdentity {
+        &self.connection
     }
 }
 
@@ -217,6 +225,41 @@ impl ImportedKubeconfig {
             context.name.clone(),
             scope,
         ))
+    }
+
+    pub(crate) fn load_raw_for_connection(
+        &self,
+        context_name: &str,
+    ) -> Result<Kubeconfig, KubeconfigImportError> {
+        let selected_context = self
+            .contexts
+            .iter()
+            .find(|context| context.name.as_str() == context_name)
+            .ok_or(KubeconfigImportError::UnknownContext)?;
+        let metadata = fs::metadata(&self.source_path).map_err(map_io_error)?;
+        if !metadata.is_file() {
+            return Err(KubeconfigImportError::ConfigFileNotRegular);
+        }
+        if metadata.len() > MAX_KUBECONFIG_BYTES {
+            return Err(KubeconfigImportError::ConfigFileTooLarge);
+        }
+
+        let kubeconfig = Kubeconfig::read_from(&self.source_path).map_err(map_kube_library_error)?;
+        let refreshed = Self::from_parsed(self.source_path.clone(), kubeconfig.clone())?;
+        let refreshed_context = refreshed
+            .contexts
+            .iter()
+            .find(|context| context.name == selected_context.name)
+            .ok_or(KubeconfigImportError::ConfigChangedSinceImport)?;
+        if selected_context.cluster_name != refreshed_context.cluster_name
+            || selected_context.api_server != refreshed_context.api_server
+            || selected_context.default_namespace != refreshed_context.default_namespace
+            || selected_context.connection.fingerprint()
+                != refreshed_context.connection.fingerprint()
+        {
+            return Err(KubeconfigImportError::ConfigChangedSinceImport);
+        }
+        Ok(kubeconfig)
     }
 
     fn from_parsed(
@@ -564,6 +607,20 @@ mod tests {
             .select_context("production", &mut sessions)
             .unwrap();
         assert_ne!(selected_again.session_id(), previous_session);
+    }
+
+    #[test]
+    fn connection_rejects_target_changes_after_import() {
+        let directory = TempDir::new().unwrap();
+        let path = write_config(&directory, &kubeconfig_yaml());
+        let imported = ImportedKubeconfig::import_path(&path).unwrap();
+        let changed = kubeconfig_yaml().replace("prod.example", "other.example");
+        fs::write(&path, changed).unwrap();
+
+        assert!(matches!(
+            imported.load_raw_for_connection("production"),
+            Err(KubeconfigImportError::ConfigChangedSinceImport)
+        ));
     }
 
     #[test]

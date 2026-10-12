@@ -1,4 +1,5 @@
 mod app;
+pub mod connection;
 pub mod diagnostics;
 pub mod kubeconfig;
 mod simulated_data;

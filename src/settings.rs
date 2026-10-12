@@ -15,6 +15,9 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_CREDENTIAL_REFERENCES: usize = 128;
 const MAX_WORKSPACE_LAYOUT_BYTES: usize = 512 * 1024;
+const DEFAULT_CONNECT_TIMEOUT_SECONDS: u16 = 10;
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u16 = 20;
+const DEFAULT_CONNECTION_RETRY_LIMIT: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +51,12 @@ pub struct SettingsPreferences {
     pub appearance: AppearancePreference,
     #[serde(default)]
     pub default_namespace: Option<String>,
+    #[serde(default = "default_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u16,
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u16,
+    #[serde(default = "default_connection_retry_limit")]
+    pub connection_retry_limit: u8,
 }
 
 impl Default for SettingsPreferences {
@@ -55,8 +64,23 @@ impl Default for SettingsPreferences {
         Self {
             appearance: AppearancePreference::System,
             default_namespace: None,
+            connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            request_timeout_seconds: DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            connection_retry_limit: DEFAULT_CONNECTION_RETRY_LIMIT,
         }
     }
+}
+
+fn default_connect_timeout_seconds() -> u16 {
+    DEFAULT_CONNECT_TIMEOUT_SECONDS
+}
+
+fn default_request_timeout_seconds() -> u16 {
+    DEFAULT_REQUEST_TIMEOUT_SECONDS
+}
+
+fn default_connection_retry_limit() -> u8 {
+    DEFAULT_CONNECTION_RETRY_LIMIT
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -235,6 +259,12 @@ impl SettingsDocument {
         {
             return Err(SettingsError::InvalidSettings("default_namespace"));
         }
+        if !(1..=60).contains(&self.preferences.connect_timeout_seconds)
+            || !(1..=120).contains(&self.preferences.request_timeout_seconds)
+            || self.preferences.connection_retry_limit > 3
+        {
+            return Err(SettingsError::InvalidSettings("connection_policy"));
+        }
 
         for (target, reference) in &self.credential_refs {
             if !is_safe_identifier(target, 128)
@@ -298,6 +328,7 @@ fn decode_settings(bytes: &[u8]) -> Result<(SettingsDocument, bool), SettingsErr
                 preferences: SettingsPreferences {
                     appearance: legacy.theme,
                     default_namespace: legacy.default_namespace,
+                    ..SettingsPreferences::default()
                 },
                 credential_refs,
                 workspace_layout: None,
@@ -500,6 +531,7 @@ mod tests {
             preferences: SettingsPreferences {
                 appearance: AppearancePreference::Light,
                 default_namespace: None,
+                ..SettingsPreferences::default()
             },
             credential_refs: BTreeMap::new(),
             workspace_layout: None,
