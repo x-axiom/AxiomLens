@@ -4,6 +4,7 @@ mod simulated_data;
 mod simulation;
 pub mod settings;
 pub mod secure_store;
+pub mod target;
 mod ui;
 
 fn main() {
