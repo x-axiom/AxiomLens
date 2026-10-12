@@ -1,14 +1,14 @@
 use gpui_kit::{
     App, AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, SharedString,
-    Size, Styled as _, Task, Window, div, px, rgb, size,
+    Styled as _, Subscription, Task, Window, div, px, rgb, size,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{
     BasePanel, DockArea, DockLayout, DockPlacement, DockSkin, Panel as DockPanel, PanelEvent,
     panel_handle,
 };
-use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::v_virtual_list;
 use std::rc::Rc;
@@ -33,30 +33,64 @@ const OK: u32 = 0x3fb97e;
 const WARN: u32 = 0xe0a24e;
 const DANGER: u32 = 0xe5564d;
 const INFO: u32 = 0x5aa9e6;
-const SAMPLE_YAML: &str = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: payment-api\n  namespace: payment-platform\nspec:\n  replicas: 6\n  strategy:\n    type: RollingUpdate\n  template:\n    spec:\n      containers:\n        - name: payment-api\n          image: nginx:1.25-alpine\n          ports:\n            - containerPort: 8080\n";
+pub(crate) struct Workbench {
+    dock_area: Entity<DockArea>,
+    navigation: Entity<ResourceNavigation>,
+    search_input: Entity<InputState>,
+}
 
 pub struct AxiomLensPrototype {
     dock_area: Entity<DockArea>,
-    snapshot: SimulatedSnapshot,
+    navigation: Entity<ResourceNavigation>,
+    search_input: Entity<InputState>,
+    _navigation_subscription: Subscription,
+    _search_subscription: Subscription,
 }
 
 impl AxiomLensPrototype {
-    pub fn new(dock_area: Entity<DockArea>, snapshot: SimulatedSnapshot) -> Self {
+    pub(crate) fn new(workbench: Workbench, cx: &mut Context<Self>) -> Self {
+        let navigation = workbench.navigation;
+        let search_input = workbench.search_input;
+        let search_navigation = navigation.clone();
+        let navigation_subscription = cx.observe(&navigation, |_, _, cx| cx.notify());
+        let search_subscription = cx.observe(&search_input, move |_, input, cx| {
+            let query = input.read(cx).value().to_string();
+            search_navigation.update(cx, |navigation, cx| {
+                navigation.set_search_query(query);
+                cx.notify();
+            });
+        });
+
         Self {
-            dock_area,
-            snapshot,
+            dock_area: workbench.dock_area,
+            navigation,
+            search_input,
+            _navigation_subscription: navigation_subscription,
+            _search_subscription: search_subscription,
         }
     }
 }
 
 impl Render for AxiomLensPrototype {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = self.navigation.read(cx).active_snapshot();
+        let context_control = Button::new("switch-simulated-context")
+            .label(format!("{} v", snapshot.context))
+            .compact()
+            .ghost()
+            .on_click(cx.listener(|app, _, _, cx| {
+                app.navigation.update(cx, |navigation, cx| {
+                    navigation.switch_context();
+                    cx.notify();
+                });
+            }));
+
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(BG))
-            .child(topbar(self.snapshot))
+            .child(topbar(snapshot, &self.search_input, context_control))
             .child(div().flex_1().child(self.dock_area.clone()))
     }
 }
@@ -77,17 +111,173 @@ enum DetailView {
     Diff,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResourceTab {
+    context_index: usize,
+    resource_index: usize,
+}
+
+struct ResourceScope {
+    snapshot: SimulatedSnapshot,
+    resources: Rc<Vec<ResourceEntry>>,
+}
+
+struct ResourceNavigation {
+    scopes: Vec<ResourceScope>,
+    active_context: usize,
+    tabs: Vec<ResourceTab>,
+    active_tab: Option<ResourceTab>,
+    search_query: String,
+    filtered_resources: Vec<usize>,
+}
+
+impl ResourceNavigation {
+    fn new(snapshot: SimulatedSnapshot) -> Self {
+        let staging_snapshot = SimulatedSnapshot {
+            target: "local-staging-demo",
+            connection_status: "Disconnected",
+            context: "staging-context",
+            namespace: "checkout-staging",
+            resource_summary: "5,000 sample resources",
+        };
+        let scopes = vec![
+            ResourceScope {
+                snapshot,
+                resources: resource_entries(0),
+            },
+            ResourceScope {
+                snapshot: staging_snapshot,
+                resources: resource_entries(1),
+            },
+        ];
+        let initial_tab = ResourceTab {
+            context_index: 0,
+            resource_index: 0,
+        };
+        let mut navigation = Self {
+            scopes,
+            active_context: 0,
+            tabs: vec![initial_tab],
+            active_tab: Some(initial_tab),
+            search_query: String::new(),
+            filtered_resources: Vec::new(),
+        };
+        navigation.refresh_filter();
+        navigation
+    }
+
+    fn active_snapshot(&self) -> SimulatedSnapshot {
+        self.scopes[self.active_context].snapshot
+    }
+
+    fn active_resource(&self) -> Option<&ResourceEntry> {
+        self.active_tab.and_then(|tab| self.resource_for_tab(tab))
+    }
+
+    fn resource_for_tab(&self, tab: ResourceTab) -> Option<&ResourceEntry> {
+        self.scopes
+            .get(tab.context_index)?
+            .resources
+            .get(tab.resource_index)
+    }
+
+    fn open_resource(&mut self, resource_index: usize) {
+        let tab = ResourceTab {
+            context_index: self.active_context,
+            resource_index,
+        };
+        if self.resource_for_tab(tab).is_none() {
+            return;
+        }
+        if !self.tabs.contains(&tab) {
+            self.tabs.push(tab);
+        }
+        self.active_tab = Some(tab);
+    }
+
+    fn select_tab(&mut self, tab: ResourceTab) {
+        if !self.tabs.contains(&tab) {
+            return;
+        }
+        self.active_context = tab.context_index;
+        self.active_tab = Some(tab);
+        self.refresh_filter();
+    }
+
+    fn close_tab(&mut self, tab: ResourceTab) {
+        let Some(index) = self.tabs.iter().position(|candidate| *candidate == tab) else {
+            return;
+        };
+        self.tabs.remove(index);
+        if self.active_tab == Some(tab) {
+            self.active_tab = self.tabs.get(index.min(self.tabs.len().saturating_sub(1))).copied();
+            if let Some(active_tab) = self.active_tab {
+                self.active_context = active_tab.context_index;
+            }
+        }
+        self.refresh_filter();
+    }
+
+    fn switch_context(&mut self) {
+        self.switch_context_to((self.active_context + 1) % self.scopes.len());
+    }
+
+    fn switch_context_to(&mut self, context_index: usize) {
+        if context_index >= self.scopes.len() {
+            return;
+        }
+        self.active_context = context_index;
+        let tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.context_index == context_index)
+            .copied();
+        let tab = match tab {
+            Some(tab) => tab,
+            None => {
+                let tab = ResourceTab {
+                    context_index,
+                    resource_index: 0,
+                };
+                self.tabs.push(tab);
+                tab
+            }
+        };
+        self.active_tab = Some(tab);
+        self.refresh_filter();
+    }
+
+    fn set_search_query(&mut self, query: String) {
+        self.search_query = query;
+        self.refresh_filter();
+    }
+
+    fn refresh_filter(&mut self) {
+        let query = self.search_query.trim().to_lowercase();
+        self.filtered_resources = self.scopes[self.active_context]
+            .resources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, resource)| {
+                let matches = query.is_empty()
+                    || resource.name.to_string().to_lowercase().contains(&query)
+                    || resource.kind.to_lowercase().contains(&query);
+                matches.then_some(index)
+            })
+            .collect();
+    }
+}
+
 struct WorkspacePanel {
     panel_id: &'static str,
     title: &'static str,
     kind: PanelKind,
-    snapshot: SimulatedSnapshot,
+    navigation: Entity<ResourceNavigation>,
     focus_handle: FocusHandle,
-    resource_rows: Option<Rc<Vec<ResourceEntry>>>,
-    resource_row_sizes: Option<Rc<Vec<Size<gpui_kit::Pixels>>>>,
-    selected_resource: usize,
     detail_view: DetailView,
     yaml_editor: Option<Entity<EditorState>>,
+    yaml_tab: Option<ResourceTab>,
+    _navigation_subscription: Option<Subscription>,
     activity_events: VecDeque<SimulatedTaskMessage>,
     activity_status: SharedString,
     activity_running: bool,
@@ -102,26 +292,24 @@ impl WorkspacePanel {
         panel_id: &'static str,
         title: &'static str,
         kind: PanelKind,
-        snapshot: SimulatedSnapshot,
+        navigation: Entity<ResourceNavigation>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         let yaml_editor = matches!(kind, PanelKind::Details).then(|| {
-            cx.new(|cx| EditorState::new(window, cx).default_value(SAMPLE_YAML).language("yaml"))
+            cx.new(|cx| EditorState::new(window, cx).default_value("").language("yaml"))
         });
-        cx.new(|cx| Self {
+        let observed_navigation = navigation.clone();
+        let panel = cx.new(|cx| Self {
             panel_id,
             title,
             kind,
-            snapshot,
+            navigation,
             focus_handle: cx.focus_handle(),
-            resource_rows: matches!(kind, PanelKind::Resources).then(resource_entries),
-            resource_row_sizes: matches!(kind, PanelKind::Resources).then(|| {
-                Rc::new(vec![size(px(1.0), px(38.0)); RESOURCE_COUNT])
-            }),
-            selected_resource: 0,
             detail_view: DetailView::Overview,
             yaml_editor,
+            yaml_tab: None,
+            _navigation_subscription: None,
             activity_events: VecDeque::new(),
             activity_status: SharedString::from("IDLE / LOCAL FAKE TASK"),
             activity_running: false,
@@ -129,7 +317,13 @@ impl WorkspacePanel {
             run_id: 0,
             worker_task: None,
             consumer_task: None,
-        })
+        });
+        panel.update(cx, |panel, cx| {
+            panel._navigation_subscription = Some(cx.observe(&observed_navigation, |_, _, cx| {
+                cx.notify();
+            }));
+        });
+        panel
     }
 
     fn start_simulated_task(&mut self, mode: SimulatedTaskMode, cx: &mut Context<Self>) {
@@ -304,46 +498,65 @@ impl WorkspacePanel {
     }
 
     fn render_resources(&mut self, cx: &mut Context<Self>) -> Div {
-        let item_sizes = self
-            .resource_row_sizes
-            .as_ref()
-            .expect("resource panel has virtual row sizes")
-            .clone();
-        let rows = v_virtual_list(
-            cx.entity(),
-            "simulated-resources",
-            item_sizes,
-            |panel, visible_range, _, cx| {
-                visible_range
-                    .map(|index| panel.render_resource_row(index, cx))
-                    .collect::<Vec<_>>()
-            },
-        );
+        let (
+            context_index,
+            total_count,
+            filtered_resources,
+            query,
+            selected_name,
+            context_name,
+            resource_summary,
+        ) = {
+            let navigation = self.navigation.read(cx);
+            let scope = &navigation.scopes[navigation.active_context];
+            (
+                navigation.active_context,
+                scope.resources.len(),
+                navigation.filtered_resources.clone(),
+                navigation.search_query.clone(),
+                navigation
+                    .active_resource()
+                    .map(|resource| resource.name.clone()),
+                scope.snapshot.context,
+                scope.snapshot.resource_summary,
+            )
+        };
+        let filtered_count = filtered_resources.len();
+        let list = if filtered_resources.is_empty() {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgb(BG))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT_4))
+                        .child(format!("No simulated resources match \"{query}\".")),
+                )
+        } else {
+            let row_indices = Rc::new(filtered_resources);
+            let item_sizes = Rc::new(vec![size(px(1.0), px(38.0)); row_indices.len()]);
+            let rows = v_virtual_list(
+                cx.entity(),
+                "simulated-resources",
+                item_sizes,
+                move |panel, visible_range, _, cx| {
+                    visible_range
+                        .map(|index| panel.render_resource_row(context_index, row_indices[index], cx))
+                        .collect::<Vec<_>>()
+                },
+            );
+            div().flex_1().child(rows)
+        };
 
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(BG))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .bg(rgb(RAISED))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(BG))
-                            .child(div().w(px(12.0)).h(px(12.0)).rounded_md().border_1().border_color(rgb(TEXT_4)))
-                            .child(div().text_sm().text_color(rgb(TEXT_1)).child("Deployments")),
-                    ),
-            )
+            .child(self.render_resource_tabs(cx))
             .child(
                 div()
                     .flex()
@@ -352,18 +565,23 @@ impl WorkspacePanel {
                     .px_3()
                     .py_2()
                     .bg(rgb(RAISED))
-                    .child(div().text_sm().text_color(rgb(TEXT_1)).child("Deployments"))
-                    .child(pill("5,000", 0x7fb4e6, ACCENT_SOFT_2))
+                    .child(div().text_sm().text_color(rgb(TEXT_1)).child("Resources"))
+                    .child(pill(
+                        format!("{filtered_count} / {total_count}"),
+                        0x7fb4e6,
+                        ACCENT_SOFT_2,
+                    ))
                     .child(div().flex_1())
                     .child(div().text_xs().text_color(rgb(TEXT_5)).child("SIMULATED")),
             )
             .child(render_resource_header())
-            .child(div().flex_1().child(rows))
+            .child(list)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .px_3()
                     .py_2()
                     .bg(rgb(RAISED))
@@ -371,25 +589,117 @@ impl WorkspacePanel {
                         div()
                             .text_xs()
                             .text_color(rgb(TEXT_5))
-                            .child(self.snapshot.resource_summary),
+                            .child(format!("SIMULATED / {context_name} / {resource_summary}")),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(TEXT_5))
-                            .child(self.selected_resource_name()),
+                            .child(selected_name.map_or_else(
+                                || SharedString::from("No resource open"),
+                                |name| SharedString::from(format!("Selected: {name}")),
+                            )),
                     ),
             )
     }
 
-    fn render_resource_row(&self, index: usize, cx: &mut Context<Self>) -> Div {
-        let entry = self
-            .resource_rows
-            .as_ref()
-            .and_then(|rows| rows.get(index))
-            .expect("virtual range is within resource data")
-            .clone();
-        let is_selected = self.selected_resource == index;
+    fn render_resource_tabs(&self, cx: &mut Context<Self>) -> Div {
+        let tabs = {
+            let navigation = self.navigation.read(cx);
+            navigation
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    let resource = navigation.resource_for_tab(*tab)?;
+                    let snapshot = navigation.scopes[tab.context_index].snapshot;
+                    Some((
+                        *tab,
+                        format!("{} / {} / {}", resource.name, snapshot.target, snapshot.context),
+                        navigation.active_tab == Some(*tab),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let tab_elements = tabs.into_iter().map(|(tab, label, active)| {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(px(34.0))
+                .px_2()
+                .bg(rgb(if active { BG } else { RAISED }))
+                .border_1()
+                .border_color(rgb(if active { BORDER } else { RAISED }))
+                .child(
+                    div()
+                        .h(px(32.0))
+                        .flex()
+                        .items_center()
+                        .text_xs()
+                        .text_color(rgb(if active { TEXT_1 } else { TEXT_4 }))
+                        .child(label)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |panel, _, _, cx| {
+                                panel.navigation.update(cx, |navigation, cx| {
+                                    navigation.select_tab(tab);
+                                    cx.notify();
+                                });
+                            }),
+                        ),
+                )
+                .child(
+                    Button::new(format!(
+                        "close-resource-tab-{}-{}",
+                        tab.context_index, tab.resource_index
+                    ))
+                    .label("x")
+                    .compact()
+                    .ghost()
+                    .on_click(cx.listener(move |panel, _, _, cx| {
+                        panel.navigation.update(cx, |navigation, cx| {
+                            navigation.close_tab(tab);
+                            cx.notify();
+                        });
+                    })),
+                )
+        });
+
+        div().w_full().child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(px(36.0))
+                .px_2()
+                .bg(rgb(RAISED))
+                .children(tab_elements)
+                .overflow_x_scrollbar(),
+        )
+    }
+
+    fn render_resource_row(
+        &self,
+        context_index: usize,
+        resource_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let tab = ResourceTab {
+            context_index,
+            resource_index,
+        };
+        let (entry, is_selected) = {
+            let navigation = self.navigation.read(cx);
+            (
+                navigation
+                    .resource_for_tab(tab)
+                    .expect("virtual range is within resource data")
+                    .clone(),
+                navigation.active_tab == Some(tab),
+            )
+        };
         let status_color = match entry.status {
             "READY" => OK,
             "DEGRADED" => WARN,
@@ -409,26 +719,21 @@ impl WorkspacePanel {
                     .truncate()
                     .text_sm()
                     .text_color(rgb(if is_selected { TEXT_1 } else { TEXT_2 }))
-                    .child(entry.name),
+                    .child(entry.name.clone()),
             )
-            .child(fixed_cell(entry.status, 76.0, status_color, false))
+            .child(fixed_cell(entry.kind, 70.0, TEXT_4, false))
+            .child(fixed_cell(entry.status, 68.0, status_color, false))
             .child(fixed_cell(entry.replicas, 54.0, TEXT_2, true))
             .child(fixed_cell(entry.age, 42.0, TEXT_4, true))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
-                    panel.selected_resource = index;
-                    cx.notify();
+                    panel.navigation.update(cx, |navigation, cx| {
+                        navigation.open_resource(resource_index);
+                        cx.notify();
+                    });
                 }),
             )
-    }
-
-    fn selected_resource_name(&self) -> SharedString {
-        self.resource_rows
-            .as_ref()
-            .and_then(|rows| rows.get(self.selected_resource))
-            .map(|row| row.name.clone())
-            .unwrap_or_else(|| SharedString::from("no selection"))
     }
 
     fn detail_view_tab(
@@ -457,22 +762,71 @@ impl WorkspacePanel {
             )
     }
 
-    fn render_details(&mut self, cx: &mut Context<Self>) -> Div {
-        let body = match self.detail_view {
-            DetailView::Overview => render_detail_overview(self.snapshot),
-            DetailView::Yaml => self
-                .yaml_editor
+    fn render_details(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let (snapshot, active_tab, selected_resource) = {
+            let navigation = self.navigation.read(cx);
+            (
+                navigation.active_snapshot(),
+                navigation.active_tab,
+                navigation.active_resource().cloned(),
+            )
+        };
+        if self.yaml_tab != active_tab {
+            let yaml = selected_resource
                 .as_ref()
-                .map(|state| {
+                .map(|resource| resource_yaml(snapshot, resource))
+                .unwrap_or_default();
+            if let Some(editor) = &self.yaml_editor {
+                editor.update(cx, |editor, cx| editor.set_value(&yaml, window, cx));
+            }
+            self.yaml_tab = active_tab;
+        }
+
+        let body = match self.detail_view {
+            DetailView::Overview => render_detail_overview(snapshot, selected_resource.as_ref()),
+            DetailView::Yaml => match (self.yaml_editor.as_ref(), selected_resource.as_ref()) {
+                (Some(state), Some(_)) => {
                     div()
                         .flex_1()
                         .p_2()
                         .bg(rgb(BG))
                         .child(Editor::new(state).readonly(true).h(px(480.0)))
-                })
-                .unwrap_or_else(|| div().child("YAML fixture unavailable")),
-            DetailView::Diff => render_simulated_diff(),
+                }
+                _ => render_empty_detail("Open a simulated resource to inspect YAML."),
+            },
+            DetailView::Diff if selected_resource.is_some() => render_simulated_diff(),
+            DetailView::Diff => render_empty_detail("Open a simulated resource to inspect Diff."),
         };
+        let scope_summary = format!(
+            "SIMULATED / {} / {} / {}",
+            snapshot.target, snapshot.context, snapshot.namespace
+        );
+        let resource_header = selected_resource.as_ref().map_or_else(
+            || {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_sm().text_color(rgb(TEXT_4)).child("No resource open"))
+                    .child(div().flex_1())
+                    .child(pill("SIMULATED", TEXT_3, ACCENT_SOFT))
+            },
+            |resource| {
+                let status_color = match resource.status {
+                    "READY" => OK,
+                    "DEGRADED" => WARN,
+                    _ => DANGER,
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(pill(resource.kind, 0x7fb4e6, ACCENT_SOFT_2))
+                    .child(div().text_sm().text_color(rgb(TEXT_1)).child(resource.name.clone()))
+                    .child(div().flex_1())
+                    .child(pill(resource.status, status_color, ELEVATED))
+            },
+        );
 
         div()
             .size_full()
@@ -486,21 +840,12 @@ impl WorkspacePanel {
                     .gap_2()
                     .p_3()
                     .bg(rgb(RAISED))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(pill("Deployment", 0x7fb4e6, ACCENT_SOFT_2))
-                            .child(div().text_sm().text_color(rgb(TEXT_1)).child("payment-api"))
-                            .child(div().flex_1())
-                            .child(pill("READY", OK, 0x14261c)),
-                    )
+                    .child(resource_header)
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(TEXT_5))
-                            .child("payment-platform / sample resource"),
+                            .child(scope_summary),
                     ),
             )
             .child(
@@ -555,18 +900,23 @@ impl Focusable for WorkspacePanel {
 }
 
 impl Render for WorkspacePanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = self.navigation.read(cx).active_snapshot();
         match self.kind {
-            PanelKind::Sidebar => render_sidebar(self.snapshot),
+            PanelKind::Sidebar => render_sidebar(snapshot),
             PanelKind::Resources => self.render_resources(cx),
-            PanelKind::Details => self.render_details(cx),
+            PanelKind::Details => self.render_details(window, cx),
             PanelKind::Activity => self.render_activity(cx),
-            PanelKind::Agent => render_agent(self.snapshot),
+            PanelKind::Agent => render_agent(snapshot),
         }
     }
 }
 
-fn topbar(snapshot: SimulatedSnapshot) -> Div {
+fn topbar(
+    snapshot: SimulatedSnapshot,
+    search_input: &Entity<InputState>,
+    context_control: impl IntoElement,
+) -> Div {
     div()
         .flex()
         .items_center()
@@ -589,7 +939,7 @@ fn topbar(snapshot: SimulatedSnapshot) -> Div {
         .child(div().text_xs().text_color(rgb(TEXT_5)).child("/"))
         .child(div().text_sm().text_color(rgb(TEXT_2)).child(snapshot.target))
         .child(div().text_xs().text_color(rgb(TEXT_5)).child("/"))
-        .child(div().text_sm().text_color(rgb(TEXT_4)).child(snapshot.context))
+        .child(context_control)
         .child(div().text_xs().text_color(rgb(TEXT_5)).child("/"))
         .child(div().text_sm().text_color(rgb(TEXT_4)).child(snapshot.namespace))
         .child(div().flex_1())
@@ -605,18 +955,23 @@ fn topbar(snapshot: SimulatedSnapshot) -> Div {
                 .border_1()
                 .border_color(rgb(BORDER))
                 .bg(rgb(RAISED))
+                .child(div().text_xs().text_color(rgb(TEXT_5)).child("NAME / TYPE"))
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(TEXT_5))
-                        .child("Search resources, clusters or commands"),
+                    Input::new(search_input)
+                        .id("resource-search")
+                        .aria_label("Search simulated resources by name or type")
+                        .cleanable(true)
+                        .appearance(false)
+                        .bordered(false)
+                        .focus_bordered(false)
+                        .flex_1(),
                 )
-                .child(div().text_xs().font_family("Menlo").text_color(rgb(TEXT_4)).child("CMD+K")),
         )
         .child(pill("OFFLINE / SIMULATED", TEXT_3, ACCENT_SOFT))
 }
 
-fn pill(label: &'static str, foreground: u32, background: u32) -> Div {
+fn pill(label: impl Into<SharedString>, foreground: u32, background: u32) -> Div {
+    let label = label.into();
     div()
         .px_2()
         .py_1()
@@ -817,30 +1172,81 @@ const RESOURCE_COUNT: usize = 5_000;
 #[derive(Clone)]
 struct ResourceEntry {
     name: SharedString,
+    kind: &'static str,
     status: &'static str,
     replicas: SharedString,
     age: SharedString,
 }
 
-fn resource_entries() -> Rc<Vec<ResourceEntry>> {
+fn resource_entries(context_index: usize) -> Rc<Vec<ResourceEntry>> {
     Rc::new(
         (0..RESOURCE_COUNT)
             .map(|index| {
-                let (name, status, replicas, age) = match index {
-                    0 => ("payment-api".to_owned(), "READY", "6 / 6".to_owned(), "164d".to_owned()),
-                    1 => ("checkout-svc".to_owned(), "READY", "4 / 4".to_owned(), "42d".to_owned()),
-                    2 => ("catalog-api".to_owned(), "DEGRADED", "2 / 3".to_owned(), "87d".to_owned()),
-                    3 => ("cart-worker".to_owned(), "READY", "3 / 3".to_owned(), "12d".to_owned()),
-                    4 => ("recommend-engine".to_owned(), "ERROR", "0 / 2".to_owned(), "5d".to_owned()),
+                let (name, kind, status, replicas, age) = match index {
+                    0 if context_index == 0 => (
+                        "payment-api".to_owned(),
+                        "Deployment",
+                        "READY",
+                        "6 / 6".to_owned(),
+                        "164d".to_owned(),
+                    ),
+                    0 => (
+                        "payment-api".to_owned(),
+                        "Deployment",
+                        "DEGRADED",
+                        "1 / 2".to_owned(),
+                        "12d".to_owned(),
+                    ),
+                    1 => (
+                        "checkout-svc".to_owned(),
+                        "Service",
+                        "READY",
+                        "1 / 1".to_owned(),
+                        "42d".to_owned(),
+                    ),
+                    2 => (
+                        "catalog-api".to_owned(),
+                        "Deployment",
+                        "DEGRADED",
+                        "2 / 3".to_owned(),
+                        "87d".to_owned(),
+                    ),
+                    3 => (
+                        "cart-worker".to_owned(),
+                        "StatefulSet",
+                        "READY",
+                        "3 / 3".to_owned(),
+                        "12d".to_owned(),
+                    ),
+                    4 => (
+                        "recommend-engine".to_owned(),
+                        "CronJob",
+                        "ERROR",
+                        "0 active".to_owned(),
+                        "5d".to_owned(),
+                    ),
                     _ => {
                         let status = match index % 19 {
                             0 => "ERROR",
                             1..=3 => "DEGRADED",
                             _ => "READY",
                         };
-                        let replicas = if status == "ERROR" { "0 / 2" } else if status == "DEGRADED" { "2 / 3" } else { "3 / 3" };
+                        let kind = match index % 4 {
+                            0 => "Deployment",
+                            1 => "StatefulSet",
+                            2 => "DaemonSet",
+                            _ => "CronJob",
+                        };
+                        let replicas = if status == "ERROR" {
+                            "0 / 2"
+                        } else if status == "DEGRADED" {
+                            "2 / 3"
+                        } else {
+                            "3 / 3"
+                        };
                         (
                             format!("sample-deployment-{index:04}"),
+                            kind,
                             status,
                             replicas.to_owned(),
                             format!("{}d", index % 180 + 1),
@@ -850,6 +1256,7 @@ fn resource_entries() -> Rc<Vec<ResourceEntry>> {
 
                 ResourceEntry {
                     name: SharedString::from(name),
+                    kind,
                     status,
                     replicas: SharedString::from(replicas),
                     age: SharedString::from(age),
@@ -886,12 +1293,14 @@ fn render_resource_header() -> Div {
         .py_2()
         .bg(rgb(RAISED))
         .child(div().flex_1().text_xs().text_color(rgb(TEXT_5)).child("NAME"))
-        .child(fixed_cell("STATUS", 76.0, TEXT_5, false))
+        .child(fixed_cell("TYPE", 70.0, TEXT_5, false))
+        .child(fixed_cell("STATUS", 68.0, TEXT_5, false))
         .child(fixed_cell("REPL.", 54.0, TEXT_5, false))
         .child(fixed_cell("AGE", 42.0, TEXT_5, false))
 }
 
-fn info_row(label: &'static str, value: &'static str) -> Div {
+fn info_row(label: &'static str, value: impl Into<SharedString>) -> Div {
+    let value = value.into();
     div()
         .flex()
         .items_center()
@@ -921,8 +1330,25 @@ fn detail_tab(label: &'static str, active: bool) -> Div {
         )
 }
 
-fn render_detail_overview(snapshot: SimulatedSnapshot) -> Div {
-    let detail_body = div()
+fn render_empty_detail(message: impl Into<SharedString>) -> Div {
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(BG))
+        .child(div().text_sm().text_color(rgb(TEXT_4)).child(message.into()))
+}
+
+fn render_detail_overview(
+    snapshot: SimulatedSnapshot,
+    resource: Option<&ResourceEntry>,
+) -> Div {
+    let Some(resource) = resource else {
+        return render_empty_detail("Open a simulated resource to inspect its details.");
+    };
+
+    div()
         .flex_1()
         .flex()
         .flex_col()
@@ -930,14 +1356,15 @@ fn render_detail_overview(snapshot: SimulatedSnapshot) -> Div {
         .p_3()
         .bg(rgb(BG))
         .child(div().text_xs().text_color(rgb(TEXT_4)).child("BASIC INFORMATION"))
+        .child(info_row("Target", snapshot.target))
+        .child(info_row("Context", snapshot.context))
         .child(info_row("Namespace", snapshot.namespace))
-        .child(info_row("Replicas", "6 / 6"))
-        .child(info_row("Update strategy", "RollingUpdate"))
-        .child(info_row("Image", "nginx:1.25-alpine"))
-        .child(info_row("UID", "sample-uid-001"))
-        .child(div().text_xs().text_color(rgb(TEXT_4)).child("STATUS CONDITIONS"))
-        .child(info_row("Available", "Normal"))
-        .child(info_row("Progressing", "Normal"))
+        .child(info_row("Resource", resource.name.clone()))
+        .child(info_row("Type", resource.kind))
+        .child(info_row("Status", resource.status))
+        .child(info_row("Ready", resource.replicas.clone()))
+        .child(info_row("Age", resource.age.clone()))
+        .child(div().text_xs().text_color(rgb(TEXT_4)).child("DATA SOURCE"))
         .child(
             div()
                 .flex()
@@ -948,21 +1375,28 @@ fn render_detail_overview(snapshot: SimulatedSnapshot) -> Div {
                 .border_1()
                 .border_color(rgb(BORDER))
                 .bg(rgb(PANEL))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_sm().text_color(rgb(TEXT_1)).child("Container"))
-                        .child(div().text_xs().text_color(rgb(OK)).child("RUNNING")),
-                )
-                .child(info_row("Image", "nginx:1.25-alpine"))
-                .child(info_row("Ports", "8080/TCP / 8443/TCP"))
-                .child(info_row("Resources", "cpu 100m / mem 128Mi"))
-                .child(info_row("Restarts", "0")),
-        );
+                .child(info_row("Source", "Local simulated fixture"))
+                .child(info_row("Cluster access", "None"))
+                .child(info_row("Writes", "Disabled")),
+        )
+}
 
-    detail_body
+fn resource_yaml(snapshot: SimulatedSnapshot, resource: &ResourceEntry) -> String {
+    let api_version = match resource.kind {
+        "Service" => "v1",
+        "CronJob" => "batch/v1",
+        _ => "apps/v1",
+    };
+    format!(
+        "apiVersion: {api_version}\nkind: {}\nmetadata:\n  name: {}\n  namespace: {}\n  labels:\n    axiomlens.dev/data-source: simulated\nstatus:\n  state: {}\n  ready: \"{}\"\n  target: {}\n  context: {}\n",
+        resource.kind,
+        resource.name,
+        snapshot.namespace,
+        resource.status,
+        resource.replicas,
+        snapshot.target,
+        snapshot.context,
+    )
 }
 
 fn diff_line(prefix: &'static str, text: &'static str, color: u32, background: u32) -> Div {
@@ -1243,20 +1677,28 @@ fn render_agent(snapshot: SimulatedSnapshot) -> Div {
         )
 }
 
-pub fn build_workbench(
+pub(crate) fn build_workbench(
     snapshot: SimulatedSnapshot,
     window: &mut Window,
     cx: &mut App,
-) -> Entity<DockArea> {
+) -> Workbench {
     let (dock_area, _skin) = DockSkin::dock_area("axiomlens-workspace", Some(1), window, cx);
+    let navigation = cx.new(|_| ResourceNavigation::new(snapshot));
+    let search_input = cx.new(|cx| InputState::new(window, cx));
 
-    let sidebar =
-        WorkspacePanel::new("SidebarPanel", "Sidebar", PanelKind::Sidebar, snapshot, window, cx);
+    let sidebar = WorkspacePanel::new(
+        "SidebarPanel",
+        "Sidebar",
+        PanelKind::Sidebar,
+        navigation.clone(),
+        window,
+        cx,
+    );
     let resources = WorkspacePanel::new(
         "ResourceListPanel",
         "Resources",
         PanelKind::Resources,
-        snapshot,
+        navigation.clone(),
         window,
         cx,
     );
@@ -1264,13 +1706,26 @@ pub fn build_workbench(
         "ResourceDetailsPanel",
         "Resource details",
         PanelKind::Details,
-        snapshot,
+        navigation.clone(),
         window,
         cx,
     );
-    let agent = WorkspacePanel::new("AgentPanel", "Agent", PanelKind::Agent, snapshot, window, cx);
-    let activity =
-        WorkspacePanel::new("ActivityPanel", "Activity", PanelKind::Activity, snapshot, window, cx);
+    let agent = WorkspacePanel::new(
+        "AgentPanel",
+        "Agent",
+        PanelKind::Agent,
+        navigation.clone(),
+        window,
+        cx,
+    );
+    let activity = WorkspacePanel::new(
+        "ActivityPanel",
+        "Activity",
+        PanelKind::Activity,
+        navigation.clone(),
+        window,
+        cx,
+    );
 
     dock_area.update(cx, |area, cx| {
         area.set_center(
@@ -1309,5 +1764,74 @@ pub fn build_workbench(
         area.set_dock_size(DockPlacement::Bottom, px(220.0), window, cx);
     });
 
-    dock_area
+    Workbench {
+        dock_area,
+        navigation,
+        search_input,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_named_resources_remain_scoped_to_their_context() {
+        let mut navigation = ResourceNavigation::new(crate::simulated_data::initial_snapshot());
+        let local = navigation.active_resource().unwrap().clone();
+        let local_snapshot = navigation.active_snapshot();
+
+        navigation.switch_context();
+        let staging = navigation.active_resource().unwrap();
+        let staging_snapshot = navigation.active_snapshot();
+
+        assert_eq!(local.name.to_string(), staging.name.to_string());
+        assert_eq!(local_snapshot.namespace, "payment-platform");
+        assert_eq!(staging_snapshot.namespace, "checkout-staging");
+        assert_ne!(local.status, staging.status);
+        assert_eq!(navigation.active_tab.unwrap().context_index, 1);
+    }
+
+    #[test]
+    fn opening_a_resource_twice_does_not_duplicate_its_tab() {
+        let mut navigation = ResourceNavigation::new(crate::simulated_data::initial_snapshot());
+        navigation.open_resource(1);
+        navigation.open_resource(1);
+
+        assert_eq!(navigation.tabs.len(), 2);
+        assert_eq!(navigation.active_tab.unwrap().resource_index, 1);
+    }
+
+    #[test]
+    fn search_matches_names_and_types_only_in_the_active_context() {
+        let mut navigation = ResourceNavigation::new(crate::simulated_data::initial_snapshot());
+        navigation.set_search_query("PAYMENT-API".to_owned());
+        assert_eq!(navigation.filtered_resources.len(), 1);
+
+        navigation.set_search_query("statefulset".to_owned());
+        assert!(!navigation.filtered_resources.is_empty());
+        assert!(navigation.filtered_resources.iter().all(|index| {
+            navigation.scopes[navigation.active_context].resources[*index].kind == "StatefulSet"
+        }));
+
+        navigation.switch_context();
+        assert!(navigation.filtered_resources.iter().all(|index| {
+            navigation.scopes[navigation.active_context].resources[*index].kind == "StatefulSet"
+        }));
+    }
+
+    #[test]
+    fn unmatched_search_has_no_results_and_closing_tabs_clears_selection() {
+        let mut navigation = ResourceNavigation::new(crate::simulated_data::initial_snapshot());
+        navigation.set_search_query("no-such-resource".to_owned());
+        assert!(navigation.filtered_resources.is_empty());
+
+        navigation.set_search_query(String::new());
+        navigation.open_resource(1);
+        let selected = navigation.active_tab.unwrap();
+        navigation.close_tab(selected);
+        assert_eq!(navigation.active_tab.unwrap().resource_index, 0);
+        navigation.close_tab(navigation.active_tab.unwrap());
+        assert!(navigation.active_tab.is_none());
+    }
 }

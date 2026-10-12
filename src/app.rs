@@ -25,8 +25,8 @@ pub fn run() {
             ..WindowOptions::default()
         };
         gpui_kit::open_window(window_options, cx, |window, cx| {
-            let dock_area = ui::build_workbench(snapshot, window, cx);
-                cx.new(move |_| AxiomLensPrototype::new(dock_area, snapshot))
+            let workbench = ui::build_workbench(snapshot, window, cx);
+            cx.new(move |cx| AxiomLensPrototype::new(workbench, cx))
         })
         .expect("failed to open AxiomLens main window");
     });
