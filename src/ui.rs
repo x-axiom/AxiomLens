@@ -7,8 +7,8 @@ use gpui_kit::{
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{
-    register_panel, BasePanel, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement,
-    DockSkin, Panel as DockPanel, PanelEvent, PanelInfo, PanelState, panel_handle,
+    BasePanel, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSkin,
+    Panel as DockPanel, PanelEvent, PanelInfo, PanelState, panel_handle,
 };
 use gpui_kit::component::input::{Editor, EditorState, Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -2752,29 +2752,28 @@ fn build_workbench_with_settings(
         (PanelKind::Activity, activity.read(cx).focus_handle.clone()),
     ];
 
-    register_panel(cx, "SidebarPanel", {
-        let panel = sidebar.clone();
-        move |_, _, _| panel_handle(panel.clone())
-    });
-    register_panel(cx, "ResourceListPanel", {
-        let panel = resources.clone();
-        move |_, _, _| panel_handle(panel.clone())
-    });
-    register_panel(cx, "ResourceDetailsPanel", {
-        let panel = details.clone();
-        move |_, _, _| panel_handle(panel.clone())
-    });
-    register_panel(cx, "AgentPanel", {
-        let panel = agent.clone();
-        move |_, _, _| panel_handle(panel.clone())
-    });
-    register_panel(cx, "ActivityPanel", {
-        let panel = activity.clone();
-        move |_, _, _| panel_handle(panel.clone())
-    });
+    let restored_layout = match settings.workspace_layout.clone() {
+        None => None,
+        Some(saved_layout) => match serde_json::from_value::<DockAreaState>(saved_layout) {
+            Ok(state) if workspace_layout_has_all_panels(&state) => Some(state),
+            Ok(_) => {
+                settings_notice = Some(
+                    "Saved layout is incompatible; default layout is active.".to_owned(),
+                );
+                None
+            }
+            Err(error) => {
+                settings_notice = Some(format!(
+                    "Saved layout is invalid; default layout is active: {error}"
+                ));
+                None
+            }
+        },
+    };
 
-    set_default_dock_layout(
+    apply_workspace_layout(
         &dock_area,
+        restored_layout.as_ref(),
         &sidebar,
         &resources,
         &details,
@@ -2783,31 +2782,6 @@ fn build_workbench_with_settings(
         window,
         cx,
     );
-
-    if let Some(saved_layout) = settings.workspace_layout.clone() {
-        match serde_json::from_value::<DockAreaState>(saved_layout) {
-            Ok(state) if workspace_layout_has_all_panels(&state) => {
-                if let Err(error) = dock_area.update(cx, |area, cx| area.load(state, window, cx)) {
-                    settings_notice = Some(format!(
-                        "Saved layout could not be restored; defaults are active: {error}"
-                    ));
-                    set_default_dock_layout(
-                        &dock_area, &sidebar, &resources, &details, &agent, &activity, window, cx,
-                    );
-                }
-            }
-            Ok(_) => {
-                settings_notice = Some(
-                    "Saved layout is incompatible; default layout is active.".to_owned(),
-                );
-            }
-            Err(error) => {
-                settings_notice = Some(format!(
-                    "Saved layout is invalid; default layout is active: {error}"
-                ));
-            }
-        }
-    }
 
     Workbench {
         dock_area,
@@ -2823,8 +2797,9 @@ fn build_workbench_with_settings(
     }
 }
 
-fn set_default_dock_layout(
+fn apply_workspace_layout(
     dock_area: &Entity<DockArea>,
+    saved_layout: Option<&DockAreaState>,
     sidebar: &Entity<WorkspacePanel>,
     resources: &Entity<WorkspacePanel>,
     details: &Entity<WorkspacePanel>,
@@ -2833,16 +2808,25 @@ fn set_default_dock_layout(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let center_sizes = saved_layout.and_then(|state| state.center.info.sizes());
+    let resources_size = center_sizes.and_then(|sizes| sizes.first().copied());
+    let details_size = center_sizes
+        .and_then(|sizes| sizes.get(1).copied())
+        .or(Some(px(340.0)));
+    let left_dock = saved_layout.and_then(|state| state.left_dock.as_ref());
+    let right_dock = saved_layout.and_then(|state| state.right_dock.as_ref());
+    let bottom_dock = saved_layout.and_then(|state| state.bottom_dock.as_ref());
+
     dock_area.update(cx, |area, cx| {
         area.set_center(
             DockLayout::h_split()
                 .child(
                     DockLayout::tabs().panel_view(panel_handle(resources.clone()), cx),
-                    None,
+                    resources_size,
                 )
                 .child(
                     DockLayout::tabs().panel_view(panel_handle(details.clone()), cx),
-                    Some(px(340.0)),
+                    details_size,
                 ),
             window,
             cx,
@@ -2865,14 +2849,40 @@ fn set_default_dock_layout(
             window,
             cx,
         );
-        area.set_dock_size(DockPlacement::Left, px(248.0), window, cx);
-        area.set_dock_size(DockPlacement::Right, px(340.0), window, cx);
-        area.set_dock_size(DockPlacement::Bottom, px(220.0), window, cx);
+        area.set_dock_size(
+            DockPlacement::Left,
+            left_dock.map_or(px(248.0), |dock| dock.size()),
+            window,
+            cx,
+        );
+        area.set_dock_size(
+            DockPlacement::Right,
+            right_dock.map_or(px(340.0), |dock| dock.size()),
+            window,
+            cx,
+        );
+        area.set_dock_size(
+            DockPlacement::Bottom,
+            bottom_dock.map_or(px(220.0), |dock| dock.size()),
+            window,
+            cx,
+        );
+        for (placement, state) in [
+            (DockPlacement::Left, left_dock),
+            (DockPlacement::Right, right_dock),
+            (DockPlacement::Bottom, bottom_dock),
+        ] {
+            if state.is_some_and(|dock| !dock.open()) {
+                area.toggle_dock(placement, window, cx);
+            }
+        }
     });
 }
 
 fn workspace_layout_has_all_panels(state: &DockAreaState) -> bool {
-    if state.version != Some(1) {
+    if state.version != Some(1)
+        || !matches!(&state.center.info, PanelInfo::Stack { sizes, axis: 0 } if sizes.len() == 2 && sizes.iter().all(|size| *size > px(0.0)))
+    {
         return false;
     }
 
@@ -2896,7 +2906,22 @@ fn workspace_layout_has_all_panels(state: &DockAreaState) -> bool {
         "AgentPanel",
         "ActivityPanel",
     ];
-    panel_names.len() == expected.len()
+    let docks_match = [
+        (state.left_dock.as_ref(), DockPlacement::Left, "SidebarPanel"),
+        (state.right_dock.as_ref(), DockPlacement::Right, "AgentPanel"),
+        (state.bottom_dock.as_ref(), DockPlacement::Bottom, "ActivityPanel"),
+    ]
+    .into_iter()
+    .all(|(dock, placement, panel)| {
+        dock.is_some_and(|dock| {
+            let mut dock_panels = Vec::new();
+            collect_workspace_panel_names(dock.panel(), &mut dock_panels);
+            dock.placement() == placement && dock_panels == [panel.to_owned()]
+        })
+    });
+    docks_match
+        && state.center.children.len() == 2
+        && panel_names.len() == expected.len()
         && expected
             .iter()
             .all(|name| panel_names.iter().filter(|saved| *saved == name).count() == 1)
@@ -3182,6 +3207,12 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
+        cx.update_window(window_handle, |_, window, cx| {
+            window.click("toggle-theme", cx);
+            assert_eq!(Theme::global(cx).mode, ThemeMode::Light);
+        })
+        .unwrap();
+        cx.run_until_parked();
         for _ in 0..12 {
             cx.executor().advance_clock(Duration::from_millis(120));
             cx.run_until_parked();
@@ -3250,6 +3281,36 @@ mod tests {
         assert!(!records
             .iter()
             .any(|record| record["event"] == "simulated_task_finished"));
+    }
+
+    #[gpui_kit::test]
+    fn closing_workbench_drops_delayed_worker_without_orphaned_terminal(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::in_directory(directory.path()).unwrap();
+        let (window_handle, app) =
+            open_test_workbench_with_diagnostics(cx, diagnostics.clone());
+
+        cx.update_window(window_handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("simulate-success", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        cx.update_window(window_handle, |_, window, _| window.remove_window())
+            .unwrap();
+        drop(app);
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(10));
+        cx.run_until_parked();
+        diagnostics.flush().unwrap();
+
+        let contents = std::fs::read_to_string(directory.path().join("axiomlens.jsonl")).unwrap();
+        assert!(contents.contains("simulated_task_started"));
+        assert!(!contents.contains("simulated_task_finished"));
+        assert!(!contents.contains("simulated_task_failed"));
+        assert!(!contents.contains("simulated_task_cancelled"));
     }
 
     #[gpui_kit::test]

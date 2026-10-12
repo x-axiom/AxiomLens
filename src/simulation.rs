@@ -255,4 +255,25 @@ mod tests {
             .any(|message| matches!(message, SimulatedTaskMessage::Finished { .. })));
         drop(worker);
     }
+
+    #[gpui_kit::test]
+    fn dropping_worker_task_closes_channel_without_late_output(cx: &mut TestAppContext) {
+        let (sender, receiver) = async_channel::bounded(CHANNEL_CAPACITY);
+        let worker = spawn(
+            cx.executor(),
+            sender,
+            Arc::new(AtomicBool::new(false)),
+            SimulatedTaskMode::DelayedSuccess,
+        );
+        cx.run_until_parked();
+
+        assert!(receiver.is_empty());
+        drop(worker);
+        cx.run_until_parked();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Closed)
+        ));
+    }
 }
