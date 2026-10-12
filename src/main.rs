@@ -1,5 +1,6 @@
 mod app;
 pub mod diagnostics;
+pub mod kubeconfig;
 mod simulated_data;
 mod simulation;
 pub mod settings;

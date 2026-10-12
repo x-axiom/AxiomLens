@@ -13,15 +13,18 @@ use gpui_kit::component::dock::{
 use gpui_kit::component::input::{Editor, EditorState, Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::v_virtual_list;
-use std::rc::Rc;
 use std::{
     collections::VecDeque,
+    path::PathBuf,
+    rc::Rc,
     sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
 
 use crate::{simulated_data::SimulatedSnapshot, simulation::{self, SimulatedTaskMessage, SimulatedTaskMode}};
+use crate::kubeconfig::{ImportedKubeconfig, KubeconfigImportError};
 use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
+use crate::target::{ContextName, SessionRegistry};
 use crate::diagnostics::{DiagnosticEvent, Diagnostics, next_correlation_id};
 
 const BG: u32 = 0x0b0e13;
@@ -94,12 +97,18 @@ pub(crate) struct Workbench {
     navigation: Entity<ResourceNavigation>,
     search_input: Entity<InputState>,
     palette_input: Entity<InputState>,
+    kubeconfig_path_input: Entity<InputState>,
     panel_focus_handles: Vec<(PanelKind, FocusHandle)>,
     settings_store: Option<SettingsStore>,
     settings: SettingsDocument,
     settings_notice: Option<String>,
     diagnostics: Option<Diagnostics>,
     diagnostics_notice: Option<String>,
+}
+
+enum KubeconfigImportSource {
+    Path(PathBuf),
+    Environment,
 }
 
 struct SettingsSession {
@@ -123,11 +132,19 @@ pub struct AxiomLensPrototype {
     navigation: Entity<ResourceNavigation>,
     search_input: Entity<InputState>,
     palette_input: Entity<InputState>,
+    kubeconfig_path_input: Entity<InputState>,
     panel_focus_handles: Vec<(PanelKind, FocusHandle)>,
     focus_handle: FocusHandle,
     palette_open: bool,
     palette_query: String,
     selected_palette_result: usize,
+    kubeconfig_import_open: bool,
+    kubeconfig_selection_open: bool,
+    kubeconfig_import_loading: bool,
+    kubeconfig_import_error: Option<SharedString>,
+    imported_kubeconfig: Option<ImportedKubeconfig>,
+    selected_context_name: Option<ContextName>,
+    session_registry: SessionRegistry,
     previous_focus: Option<FocusHandle>,
     theme_mode: ThemeMode,
     settings_store: Option<SettingsStore>,
@@ -149,6 +166,7 @@ impl AxiomLensPrototype {
             navigation,
             search_input,
             palette_input,
+            kubeconfig_path_input,
             panel_focus_handles,
             settings_store,
             settings,
@@ -187,11 +205,19 @@ impl AxiomLensPrototype {
             navigation,
             search_input,
             palette_input,
+            kubeconfig_path_input,
             panel_focus_handles,
             focus_handle: cx.focus_handle(),
             palette_open: false,
             palette_query: String::new(),
             selected_palette_result: 0,
+            kubeconfig_import_open: false,
+            kubeconfig_selection_open: false,
+            kubeconfig_import_loading: false,
+            kubeconfig_import_error: None,
+            imported_kubeconfig: None,
+            selected_context_name: None,
+            session_registry: SessionRegistry::default(),
             previous_focus: None,
             theme_mode,
             settings_store,
@@ -342,6 +368,96 @@ impl AxiomLensPrototype {
         cx.notify();
     }
 
+    fn open_kubeconfig_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.kubeconfig_import_open = true;
+        self.kubeconfig_selection_open = false;
+        self.kubeconfig_import_error = None;
+        self.kubeconfig_path_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        cx.on_next_frame(window, |app, window, cx| {
+            if app.kubeconfig_import_open {
+                app.kubeconfig_path_input
+                    .update(cx, |input, cx| input.focus(window, cx));
+            }
+        });
+        cx.notify();
+    }
+
+    fn begin_kubeconfig_import(&mut self, source: KubeconfigImportSource, cx: &mut Context<Self>) {
+        if self.kubeconfig_import_loading {
+            return;
+        }
+        self.kubeconfig_import_loading = true;
+        self.kubeconfig_import_error = None;
+        cx.notify();
+
+        let executor = cx.background_executor().clone();
+        let app = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let result = executor
+                .spawn(async move {
+                    match source {
+                        KubeconfigImportSource::Path(path) => {
+                            ImportedKubeconfig::import_path(path)
+                        }
+                        KubeconfigImportSource::Environment => {
+                            ImportedKubeconfig::import_from_environment()
+                        }
+                    }
+                })
+                .await;
+            let _ = app.update(cx, |app, cx| {
+                app.kubeconfig_import_loading = false;
+                match result {
+                    Ok(imported) => {
+                        app.session_registry.end_session();
+                        app.imported_kubeconfig = Some(imported);
+                        app.selected_context_name = None;
+                        app.kubeconfig_import_error = None;
+                        app.kubeconfig_import_open = false;
+                        app.kubeconfig_selection_open = true;
+                    }
+                    Err(error) => {
+                        app.kubeconfig_import_error = Some(SharedString::from(error.to_string()));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn select_kubeconfig_context(&mut self, name: String, cx: &mut Context<Self>) {
+        let selected_name = self.imported_kubeconfig.as_ref().and_then(|imported| {
+            imported
+                .contexts()
+                .iter()
+                .find(|context| context.name().as_str() == name)
+                .map(|context| context.name().clone())
+        });
+        let result = match &self.imported_kubeconfig {
+            Some(imported) => imported.select_context(&name, &mut self.session_registry),
+            None => Err(KubeconfigImportError::UnknownContext),
+        };
+        match (result, selected_name) {
+            (Ok(_target), Some(context_name)) => {
+                self.selected_context_name = Some(context_name);
+                self.kubeconfig_selection_open = false;
+                self.kubeconfig_import_error = None;
+            }
+            (Err(error), _) => {
+                self.kubeconfig_import_error = Some(SharedString::from(error.to_string()));
+            }
+            (Ok(_), None) => {
+                self.kubeconfig_import_error = Some(SharedString::from(
+                    KubeconfigImportError::UnknownContext.to_string(),
+                ));
+            }
+        }
+        cx.notify();
+    }
+
     fn close_command_palette(
         &mut self,
         focus_target: Option<FocusHandle>,
@@ -476,6 +592,268 @@ impl AxiomLensPrototype {
             }
         };
         self.close_command_palette(focus_target, window, cx);
+    }
+
+    fn render_kubeconfig_import(&self, cx: &mut Context<Self>) -> Div {
+        let error = self.kubeconfig_import_error.clone();
+        let loading = self.kubeconfig_import_loading;
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(70.0))
+            .bg(hsla(0.0, 0.0, 0.0, 0.58))
+            .child(
+                div()
+                    .w(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_3()
+                            .child(div().text_sm().text_color(rgb(TEXT_1)).child("Import kubeconfig"))
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("close-kubeconfig-import")
+                                    .label("Close")
+                                    .compact()
+                                    .ghost()
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        app.kubeconfig_import_open = false;
+                                        app.kubeconfig_import_error = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .child(div().text_xs().text_color(rgb(TEXT_4)).child("KUBECONFIG FILE")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .h(px(38.0))
+                            .mx_3()
+                            .px_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(BG))
+                            .child(
+                                Input::new(&self.kubeconfig_path_input)
+                                    .id("kubeconfig-path-input")
+                                    .aria_label("Kubeconfig file path")
+                                    .cleanable(true)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .focus_bordered(false)
+                                    .flex_1(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .child(div().text_xs().text_color(rgb(TEXT_5)).child(
+                                "Import reads one file; credentials stay in source file.",
+                            )),
+                    )
+                    .child(if let Some(error) = error {
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .child(div().text_xs().text_color(rgb(DANGER)).child(error))
+                    } else {
+                        div().h(px(24.0))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_3()
+                            .py_2()
+                            .child(
+                                Button::new("load-kubeconfig-environment")
+                                    .label("Use KUBECONFIG")
+                                    .compact()
+                                    .ghost()
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        app.begin_kubeconfig_import(
+                                            KubeconfigImportSource::Environment,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new("load-kubeconfig-path")
+                                    .label(if loading { "Loading..." } else { "Load file" })
+                                    .compact()
+                                    .primary()
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        let path = app
+                                            .kubeconfig_path_input
+                                            .read(cx)
+                                            .value()
+                                            .to_string();
+                                        if path.trim().is_empty() {
+                                            app.kubeconfig_import_error = Some(SharedString::from(
+                                                "Enter a kubeconfig file path.",
+                                            ));
+                                            cx.notify();
+                                        } else {
+                                            app.begin_kubeconfig_import(
+                                                KubeconfigImportSource::Path(expand_home_path(&path)),
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_kubeconfig_contexts(&self, cx: &mut Context<Self>) -> Div {
+        let rows = self
+            .imported_kubeconfig
+            .as_ref()
+            .map(|imported| {
+                imported
+                    .contexts()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, context)| {
+                        let name = context.name().as_str().to_owned();
+                        let details = format!(
+                            "{} / {} / {}",
+                            context.cluster_name(),
+                            context.api_server(),
+                            context.default_namespace().as_str()
+                        );
+                        let selected_name = name.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_3()
+                            .py_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .flex_1()
+                                    .child(div().text_sm().text_color(rgb(TEXT_1)).child(name))
+                                    .child(div().text_xs().text_color(rgb(TEXT_4)).child(details)),
+                            )
+                            .child(
+                                Button::new(format!("select-kubeconfig-context-{index}"))
+                                    .label("Select")
+                                    .compact()
+                                    .ghost()
+                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                        app.select_kubeconfig_context(selected_name.clone(), cx);
+                                    })),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let current_context = self
+            .imported_kubeconfig
+            .as_ref()
+            .and_then(ImportedKubeconfig::current_context)
+            .map(|context| format!("Current: {}", context.as_str()))
+            .unwrap_or_else(|| "No current Context".to_owned());
+        let error = self.kubeconfig_import_error.clone();
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(70.0))
+            .bg(hsla(0.0, 0.0, 0.0, 0.58))
+            .child(
+                div()
+                    .w(px(680.0))
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_3()
+                            .child(div().text_sm().text_color(rgb(TEXT_1)).child("Select Context"))
+                            .child(div().flex_1())
+                            .child(div().text_xs().text_color(rgb(TEXT_5)).child(current_context))
+                            .child(
+                                Button::new("close-kubeconfig-contexts")
+                                    .label("Close")
+                                    .compact()
+                                    .ghost()
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        app.kubeconfig_selection_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(div().h(px(320.0)).overflow_y_scrollbar().children(rows))
+                    .child(if let Some(error) = error {
+                        div()
+                            .px_3()
+                            .py_2()
+                            .child(div().text_xs().text_color(rgb(DANGER)).child(error))
+                    } else {
+                        div().h(px(24.0))
+                    })
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_3()
+                            .py_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_5))
+                                    .child("Disconnected · sample data only"),
+                            )
+                            .child(
+                                Button::new("import-another-kubeconfig")
+                                    .label("Import another")
+                                    .compact()
+                                    .ghost()
+                                    .on_click(cx.listener(|app, _, window, cx| {
+                                        app.open_kubeconfig_import(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     fn render_command_palette(&self, cx: &mut Context<Self>) -> Div {
@@ -677,15 +1055,26 @@ impl Focusable for AxiomLensPrototype {
 impl Render for AxiomLensPrototype {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.navigation.read(cx).active_snapshot();
-        let context_control = Button::new("switch-simulated-context")
-            .label(format!("{} v", snapshot.context))
+        let selected_context = self.selected_context_name.as_ref().and_then(|name| {
+            self.imported_kubeconfig.as_ref()?.contexts().iter().find(|context| {
+                context.name().as_str() == name.as_str()
+            })
+        });
+        let context_label = selected_context
+            .map(|context| context.name().as_str())
+            .unwrap_or("Choose Context");
+        let context_control = Button::new("kubeconfig-context-selector")
+            .label(format!("{context_label} v"))
             .compact()
             .ghost()
-            .on_click(cx.listener(|app, _, _, cx| {
-                app.navigation.update(cx, |navigation, cx| {
-                    navigation.switch_context();
+            .on_click(cx.listener(|app, _, window, cx| {
+                if app.imported_kubeconfig.is_some() {
+                    app.kubeconfig_import_error = None;
+                    app.kubeconfig_selection_open = true;
                     cx.notify();
-                });
+                } else {
+                    app.open_kubeconfig_import(window, cx);
+                }
             }));
 
         let commands_button = div()
@@ -742,6 +1131,9 @@ impl Render for AxiomLensPrototype {
             }))
             .child(topbar(
                 snapshot,
+                selected_context.map(|context| {
+                    (context.cluster_name(), context.default_namespace().as_str())
+                }),
                 &self.search_input,
                 context_control,
                 commands_button,
@@ -771,10 +1163,38 @@ impl Render for AxiomLensPrototype {
         } else {
             workspace
         };
+        let workspace = if let Some(context) = selected_context {
+            workspace.child(
+                div()
+                    .id("selected-kubeconfig-target-notice")
+                    .flex()
+                    .items_center()
+                    .h(px(28.0))
+                    .px_3()
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(INFO))
+                            .child(format!(
+                                "Target selected: {} / {} / {} · Disconnected; resource panes remain simulated",
+                                context.cluster_name(),
+                                context.name().as_str(),
+                                context.default_namespace().as_str()
+                            )),
+                    ),
+            )
+        } else {
+            workspace
+        };
         let workspace = workspace.child(div().flex_1().child(self.dock_area.clone()));
 
         if self.palette_open {
             workspace.child(self.render_command_palette(cx))
+        } else if self.kubeconfig_import_open {
+            workspace.child(self.render_kubeconfig_import(cx))
+        } else if self.kubeconfig_selection_open {
+            workspace.child(self.render_kubeconfig_contexts(cx))
         } else {
             workspace
         }
@@ -1045,6 +1465,11 @@ impl ResourceNavigation {
         self.scopes[self.active_context].snapshot
     }
 
+    #[cfg(test)]
+    fn switch_context(&mut self) {
+        self.switch_context_to((self.active_context + 1) % self.scopes.len());
+    }
+
     fn active_resource(&self) -> Option<&ResourceEntry> {
         self.active_tab.and_then(|tab| self.resource_for_tab(tab))
     }
@@ -1091,10 +1516,6 @@ impl ResourceNavigation {
             }
         }
         self.refresh_filter();
-    }
-
-    fn switch_context(&mut self) {
-        self.switch_context_to((self.active_context + 1) % self.scopes.len());
     }
 
     fn switch_context_to(&mut self, context_index: usize) {
@@ -1842,11 +2263,20 @@ impl Render for WorkspacePanel {
 
 fn topbar(
     snapshot: SimulatedSnapshot,
+    selected_scope: Option<(&str, &str)>,
     search_input: &Entity<InputState>,
     context_control: impl IntoElement,
     commands_button: impl IntoElement,
     theme_button: impl IntoElement,
 ) -> impl IntoElement {
+    let has_selected_target = selected_scope.is_some();
+    let (target_name, namespace_name) =
+        selected_scope.unwrap_or((snapshot.target, snapshot.namespace));
+    let connection_status = if has_selected_target {
+        "TARGET SELECTED / DISCONNECTED"
+    } else {
+        "OFFLINE / SIMULATED"
+    };
     div()
         .flex()
         .items_center()
@@ -1867,11 +2297,11 @@ fn topbar(
         )
         .child(div().text_sm().text_color(rgb(TEXT_1)).child("AxiomLens"))
         .child(div().text_xs().text_color(rgb(TEXT_5)).child("/"))
-        .child(div().text_sm().text_color(rgb(TEXT_2)).child(snapshot.target))
+        .child(div().text_sm().text_color(rgb(TEXT_2)).child(target_name.to_owned()))
         .child(div().text_xs().text_color(rgb(TEXT_5)).child("/"))
         .child(context_control)
         .child(div().text_xs().text_color(rgb(TEXT_5)).child("/"))
-        .child(div().text_sm().text_color(rgb(TEXT_4)).child(snapshot.namespace))
+        .child(div().text_sm().text_color(rgb(TEXT_4)).child(namespace_name.to_owned()))
         .child(div().flex_1())
         .child(
             div()
@@ -1902,9 +2332,21 @@ fn topbar(
         .child(
             div()
                 .id("connection-state")
-                .child(pill("OFFLINE / SIMULATED", TEXT_3, ACCENT_SOFT)),
+                .child(pill(connection_status, TEXT_3, ACCENT_SOFT)),
         )
         .id("workbench-topbar")
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return std::env::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(relative) = path.strip_prefix("~/")
+        && let Some(home) = std::env::home_dir()
+    {
+        return home.join(relative);
+    }
+    PathBuf::from(path)
 }
 
 fn pill(label: impl Into<SharedString>, foreground: u32, background: u32) -> Div {
@@ -2698,6 +3140,7 @@ fn build_workbench_with_settings(
     let navigation = cx.new(|_| ResourceNavigation::new(snapshot));
     let search_input = cx.new(|cx| InputState::new(window, cx));
     let palette_input = cx.new(|cx| InputState::new(window, cx));
+    let kubeconfig_path_input = cx.new(|cx| InputState::new(window, cx));
 
     let sidebar = WorkspacePanel::new(
         "SidebarPanel",
@@ -2788,6 +3231,7 @@ fn build_workbench_with_settings(
         navigation,
         search_input,
         palette_input,
+        kubeconfig_path_input,
         panel_focus_handles,
         settings_store,
         settings,
