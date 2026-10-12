@@ -7,16 +7,21 @@ use gpui_kit::{
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{
-    BasePanel, DockArea, DockLayout, DockPlacement, DockSkin, Panel as DockPanel, PanelEvent,
-    panel_handle,
+    register_panel, BasePanel, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement,
+    DockSkin, Panel as DockPanel, PanelEvent, PanelInfo, PanelState, panel_handle,
 };
 use gpui_kit::component::input::{Editor, EditorState, Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::v_virtual_list;
 use std::rc::Rc;
-use std::{collections::VecDeque, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    time::Duration,
+};
 
 use crate::{simulated_data::SimulatedSnapshot, simulation::{self, SimulatedTaskMessage, SimulatedTaskMode}};
+use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
 
 const BG: u32 = 0x0b0e13;
 const PANEL: u32 = 0x11151c;
@@ -36,6 +41,17 @@ const WARN: u32 = 0xe0a24e;
 const DANGER: u32 = 0xe5564d;
 const INFO: u32 = 0x5aa9e6;
 static LIGHT_THEME_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn initialize_theme_palette(mode: ThemeMode) {
+    LIGHT_THEME_ACTIVE.store(!mode.is_dark(), Ordering::Release);
+}
+
+fn theme_mode_for_appearance(appearance: AppearancePreference) -> ThemeMode {
+    match appearance {
+        AppearancePreference::Light => ThemeMode::Light,
+        AppearancePreference::System | AppearancePreference::Dark => ThemeMode::Dark,
+    }
+}
 
 fn rgb(color: u32) -> gpui_kit::Rgba {
     let color = if LIGHT_THEME_ACTIVE.load(Ordering::Acquire) {
@@ -78,6 +94,25 @@ pub(crate) struct Workbench {
     search_input: Entity<InputState>,
     palette_input: Entity<InputState>,
     panel_focus_handles: Vec<(PanelKind, FocusHandle)>,
+    settings_store: Option<SettingsStore>,
+    settings: SettingsDocument,
+    settings_notice: Option<String>,
+}
+
+struct SettingsSession {
+    store: Option<SettingsStore>,
+    settings: SettingsDocument,
+    notice: Option<String>,
+}
+
+impl Default for SettingsSession {
+    fn default() -> Self {
+        Self {
+            store: None,
+            settings: SettingsDocument::default(),
+            notice: None,
+        }
+    }
 }
 
 pub struct AxiomLensPrototype {
@@ -92,17 +127,32 @@ pub struct AxiomLensPrototype {
     selected_palette_result: usize,
     previous_focus: Option<FocusHandle>,
     theme_mode: ThemeMode,
+    settings_store: Option<SettingsStore>,
+    settings: SettingsDocument,
+    settings_notice: Option<SharedString>,
+    settings_write_generation: u64,
     _navigation_subscription: Subscription,
     _search_subscription: Subscription,
     _palette_subscription: Subscription,
+    _layout_subscription: Subscription,
 }
 
 impl AxiomLensPrototype {
     pub(crate) fn new(workbench: Workbench, cx: &mut Context<Self>) -> Self {
-        let navigation = workbench.navigation;
-        let search_input = workbench.search_input;
-        let palette_input = workbench.palette_input;
+        let Workbench {
+            dock_area,
+            navigation,
+            search_input,
+            palette_input,
+            panel_focus_handles,
+            settings_store,
+            settings,
+            settings_notice,
+        } = workbench;
+        let theme_mode = theme_mode_for_appearance(settings.preferences.appearance);
+        initialize_theme_palette(theme_mode);
         let search_navigation = navigation.clone();
+        let layout_dock_area = dock_area.clone();
         let navigation_subscription = cx.observe(&navigation, |_, _, cx| cx.notify());
         let search_subscription = cx.observe(&search_input, move |_, input, cx| {
             let query = input.read(cx).value().to_string();
@@ -116,23 +166,93 @@ impl AxiomLensPrototype {
             app.selected_palette_result = 0;
             cx.notify();
         });
+        let layout_subscription = cx.subscribe(
+            &layout_dock_area,
+            |app, area, event: &DockEvent, cx| {
+                if matches!(event, DockEvent::LayoutChanged) {
+                    app.persist_dock_layout(area, cx);
+                }
+            },
+        );
 
         Self {
-            dock_area: workbench.dock_area,
+            dock_area,
             navigation,
             search_input,
             palette_input,
-            panel_focus_handles: workbench.panel_focus_handles,
+            panel_focus_handles,
             focus_handle: cx.focus_handle(),
             palette_open: false,
             palette_query: String::new(),
             selected_palette_result: 0,
             previous_focus: None,
-            theme_mode: ThemeMode::Dark,
+            theme_mode,
+            settings_store,
+            settings,
+            settings_notice: settings_notice.map(SharedString::from),
+            settings_write_generation: 0,
             _navigation_subscription: navigation_subscription,
             _search_subscription: search_subscription,
             _palette_subscription: palette_subscription,
+            _layout_subscription: layout_subscription,
         }
+    }
+
+    fn persist_dock_layout(&mut self, area: Entity<DockArea>, cx: &mut Context<Self>) {
+        let layout = area.read(cx).dump(cx);
+        match serde_json::to_value(layout) {
+            Ok(layout) => {
+                let mut settings = self.settings.clone();
+                settings.workspace_layout = Some(layout);
+                self.persist_settings(settings, cx);
+            }
+            Err(error) => {
+                self.settings_notice = Some(SharedString::from(format!(
+                    "Layout could not be saved: {error}"
+                )));
+                cx.notify();
+            }
+        }
+    }
+
+    fn persist_settings(&mut self, settings: SettingsDocument, cx: &mut Context<Self>) {
+        self.settings = settings.clone();
+        self.settings_write_generation = self.settings_write_generation.wrapping_add(1);
+        let generation = self.settings_write_generation;
+        let Some(store) = self.settings_store.clone() else {
+            self.settings_notice = Some(SharedString::from(
+                "Settings are session-only; configuration storage is unavailable.",
+            ));
+            cx.notify();
+            return;
+        };
+
+        self.settings_notice = Some(SharedString::from("Saving settings..."));
+        cx.notify();
+        let executor = cx.background_executor().clone();
+        let debounce = executor.timer(Duration::from_millis(250));
+        let app = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            debounce.await;
+            let is_current = app
+                .update(cx, |app, _| app.settings_write_generation == generation)
+                .unwrap_or(false);
+            if !is_current {
+                return;
+            }
+
+            let result = executor.spawn(async move { store.save(&settings) }).await;
+            app.update(cx, |app, cx| {
+                if app.settings_write_generation == generation {
+                    app.settings_notice = result.err().map(|error| {
+                        SharedString::from(format!("Settings were not saved: {error}"))
+                    });
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn command_items(&self, cx: &App) -> Vec<PaletteItem> {
@@ -556,13 +676,21 @@ impl Render for AxiomLensPrototype {
             .compact()
             .ghost()
             .on_click(cx.listener(|app, _, _, cx| {
-                app.theme_mode = if app.theme_mode.is_dark() {
+                let next_mode = if app.theme_mode.is_dark() {
                     ThemeMode::Light
                 } else {
                     ThemeMode::Dark
                 };
-                LIGHT_THEME_ACTIVE.store(!app.theme_mode.is_dark(), Ordering::Release);
-                Theme::change(app.theme_mode, None, cx);
+                app.theme_mode = next_mode;
+                let mut settings = app.settings.clone();
+                settings.preferences.appearance = if next_mode.is_dark() {
+                    AppearancePreference::Dark
+                } else {
+                    AppearancePreference::Light
+                };
+                app.persist_settings(settings, cx);
+                LIGHT_THEME_ACTIVE.store(!next_mode.is_dark(), Ordering::Release);
+                Theme::change(next_mode, None, cx);
                 cx.notify();
             }));
 
@@ -581,8 +709,22 @@ impl Render for AxiomLensPrototype {
                 context_control,
                 commands_button,
                 theme_button,
-            ))
-            .child(div().flex_1().child(self.dock_area.clone()));
+            ));
+        let workspace = if let Some(notice) = &self.settings_notice {
+            workspace.child(
+                div()
+                    .id("settings-notice")
+                    .flex()
+                    .items_center()
+                    .h(px(28.0))
+                    .px_3()
+                    .bg(rgb(RAISED))
+                    .child(div().text_xs().text_color(rgb(WARN)).child(notice.clone())),
+            )
+        } else {
+            workspace
+        };
+        let workspace = workspace.child(div().flex_1().child(self.dock_area.clone()));
 
         if self.palette_open {
             workspace.child(self.render_command_palette(cx))
@@ -2378,6 +2520,50 @@ pub(crate) fn build_workbench(
     window: &mut Window,
     cx: &mut App,
 ) -> Workbench {
+    build_workbench_with_settings(snapshot, load_settings_session(), window, cx)
+}
+
+fn load_settings_session() -> SettingsSession {
+    let store = match SettingsStore::for_current_user() {
+        Ok(store) => store,
+        Err(error) => {
+            return SettingsSession {
+                store: None,
+                settings: SettingsDocument::default(),
+                notice: Some(format!("Settings unavailable; using defaults: {error}")),
+            };
+        }
+    };
+
+    match store.load() {
+        Ok(settings) => SettingsSession {
+            store: Some(store),
+            settings,
+            notice: None,
+        },
+        Err(error) => SettingsSession {
+            store: None,
+            settings: SettingsDocument::default(),
+            notice: Some(format!("Settings could not be loaded; using defaults: {error}")),
+        },
+    }
+}
+
+fn build_workbench_with_settings(
+    snapshot: SimulatedSnapshot,
+    session: SettingsSession,
+    window: &mut Window,
+    cx: &mut App,
+) -> Workbench {
+    let SettingsSession {
+        store: settings_store,
+        settings,
+        notice: mut settings_notice,
+    } = session;
+    let theme_mode = theme_mode_for_appearance(settings.preferences.appearance);
+    initialize_theme_palette(theme_mode);
+    Theme::change(theme_mode, None, cx);
+
     let (dock_area, _skin) = DockSkin::dock_area("axiomlens-workspace", Some(1), window, cx);
     let navigation = cx.new(|_| ResourceNavigation::new(snapshot));
     let search_input = cx.new(|cx| InputState::new(window, cx));
@@ -2431,42 +2617,62 @@ pub(crate) fn build_workbench(
         (PanelKind::Activity, activity.read(cx).focus_handle.clone()),
     ];
 
-    dock_area.update(cx, |area, cx| {
-        area.set_center(
-            DockLayout::h_split()
-                .child(
-                    DockLayout::tabs().panel_view(panel_handle(resources), cx),
-                    None,
-                )
-                .child(
-                    DockLayout::tabs().panel_view(panel_handle(details), cx),
-                    Some(px(340.0)),
-                ),
-            window,
-            cx,
-        );
-        area.set_dock(
-            DockPlacement::Left,
-            DockLayout::tabs().panel_view(panel_handle(sidebar), cx),
-            window,
-            cx,
-        );
-        area.set_dock(
-            DockPlacement::Right,
-            DockLayout::tabs().panel_view(panel_handle(agent), cx),
-            window,
-            cx,
-        );
-        area.set_dock(
-            DockPlacement::Bottom,
-            DockLayout::tabs().panel_view(panel_handle(activity), cx),
-            window,
-            cx,
-        );
-        area.set_dock_size(DockPlacement::Left, px(248.0), window, cx);
-        area.set_dock_size(DockPlacement::Right, px(340.0), window, cx);
-        area.set_dock_size(DockPlacement::Bottom, px(220.0), window, cx);
+    register_panel(cx, "SidebarPanel", {
+        let panel = sidebar.clone();
+        move |_, _, _| panel_handle(panel.clone())
     });
+    register_panel(cx, "ResourceListPanel", {
+        let panel = resources.clone();
+        move |_, _, _| panel_handle(panel.clone())
+    });
+    register_panel(cx, "ResourceDetailsPanel", {
+        let panel = details.clone();
+        move |_, _, _| panel_handle(panel.clone())
+    });
+    register_panel(cx, "AgentPanel", {
+        let panel = agent.clone();
+        move |_, _, _| panel_handle(panel.clone())
+    });
+    register_panel(cx, "ActivityPanel", {
+        let panel = activity.clone();
+        move |_, _, _| panel_handle(panel.clone())
+    });
+
+    set_default_dock_layout(
+        &dock_area,
+        &sidebar,
+        &resources,
+        &details,
+        &agent,
+        &activity,
+        window,
+        cx,
+    );
+
+    if let Some(saved_layout) = settings.workspace_layout.clone() {
+        match serde_json::from_value::<DockAreaState>(saved_layout) {
+            Ok(state) if workspace_layout_has_all_panels(&state) => {
+                if let Err(error) = dock_area.update(cx, |area, cx| area.load(state, window, cx)) {
+                    settings_notice = Some(format!(
+                        "Saved layout could not be restored; defaults are active: {error}"
+                    ));
+                    set_default_dock_layout(
+                        &dock_area, &sidebar, &resources, &details, &agent, &activity, window, cx,
+                    );
+                }
+            }
+            Ok(_) => {
+                settings_notice = Some(
+                    "Saved layout is incompatible; default layout is active.".to_owned(),
+                );
+            }
+            Err(error) => {
+                settings_notice = Some(format!(
+                    "Saved layout is invalid; default layout is active: {error}"
+                ));
+            }
+        }
+    }
 
     Workbench {
         dock_area,
@@ -2474,6 +2680,97 @@ pub(crate) fn build_workbench(
         search_input,
         palette_input,
         panel_focus_handles,
+        settings_store,
+        settings,
+        settings_notice,
+    }
+}
+
+fn set_default_dock_layout(
+    dock_area: &Entity<DockArea>,
+    sidebar: &Entity<WorkspacePanel>,
+    resources: &Entity<WorkspacePanel>,
+    details: &Entity<WorkspacePanel>,
+    agent: &Entity<WorkspacePanel>,
+    activity: &Entity<WorkspacePanel>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    dock_area.update(cx, |area, cx| {
+        area.set_center(
+            DockLayout::h_split()
+                .child(
+                    DockLayout::tabs().panel_view(panel_handle(resources.clone()), cx),
+                    None,
+                )
+                .child(
+                    DockLayout::tabs().panel_view(panel_handle(details.clone()), cx),
+                    Some(px(340.0)),
+                ),
+            window,
+            cx,
+        );
+        area.set_dock(
+            DockPlacement::Left,
+            DockLayout::tabs().panel_view(panel_handle(sidebar.clone()), cx),
+            window,
+            cx,
+        );
+        area.set_dock(
+            DockPlacement::Right,
+            DockLayout::tabs().panel_view(panel_handle(agent.clone()), cx),
+            window,
+            cx,
+        );
+        area.set_dock(
+            DockPlacement::Bottom,
+            DockLayout::tabs().panel_view(panel_handle(activity.clone()), cx),
+            window,
+            cx,
+        );
+        area.set_dock_size(DockPlacement::Left, px(248.0), window, cx);
+        area.set_dock_size(DockPlacement::Right, px(340.0), window, cx);
+        area.set_dock_size(DockPlacement::Bottom, px(220.0), window, cx);
+    });
+}
+
+fn workspace_layout_has_all_panels(state: &DockAreaState) -> bool {
+    if state.version != Some(1) {
+        return false;
+    }
+
+    let mut panel_names = Vec::new();
+    collect_workspace_panel_names(&state.center, &mut panel_names);
+    for dock in [
+        state.left_dock.as_ref(),
+        state.right_dock.as_ref(),
+        state.bottom_dock.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        collect_workspace_panel_names(dock.panel(), &mut panel_names);
+    }
+
+    let expected = [
+        "SidebarPanel",
+        "ResourceListPanel",
+        "ResourceDetailsPanel",
+        "AgentPanel",
+        "ActivityPanel",
+    ];
+    panel_names.len() == expected.len()
+        && expected
+            .iter()
+            .all(|name| panel_names.iter().filter(|saved| *saved == name).count() == 1)
+}
+
+fn collect_workspace_panel_names(state: &PanelState, panel_names: &mut Vec<String>) {
+    if matches!(&state.info, PanelInfo::Panel(_)) {
+        panel_names.push(state.panel_name.clone());
+    }
+    for child in &state.children {
+        collect_workspace_panel_names(child, panel_names);
     }
 }
 
@@ -2560,8 +2857,40 @@ mod tests {
                 gpui_kit::WindowOptions::default(),
                 cx,
                 |window, cx| {
-                    let workbench =
-                        build_workbench(crate::simulated_data::initial_snapshot(), window, cx);
+                    let workbench = build_workbench_with_settings(
+                        crate::simulated_data::initial_snapshot(),
+                        SettingsSession::default(),
+                        window,
+                        cx,
+                    );
+                    cx.new(|cx| AxiomLensPrototype::new(workbench, cx))
+                },
+            )
+            .unwrap()
+        })
+    }
+
+    fn open_test_workbench_with_store(
+        cx: &mut TestAppContext,
+        store: SettingsStore,
+        settings: SettingsDocument,
+    ) -> (gpui_kit::AnyWindowHandle, Entity<AxiomLensPrototype>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(
+                gpui_kit::WindowOptions::default(),
+                cx,
+                move |window, cx| {
+                    let workbench = build_workbench_with_settings(
+                        crate::simulated_data::initial_snapshot(),
+                        SettingsSession {
+                            store: Some(store),
+                            settings,
+                            notice: None,
+                        },
+                        window,
+                        cx,
+                    );
                     cx.new(|cx| AxiomLensPrototype::new(workbench, cx))
                 },
             )
@@ -2772,6 +3101,125 @@ mod tests {
             assert_eq!(navigation.read(cx).active_tab, initial_tab);
             assert_eq!(navigation.read(cx).active_context, initial_context);
             assert_eq!(navigation.read(cx).tabs, initial_tabs);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn saved_theme_and_dock_layout_restore_in_a_new_workbench(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at_path(directory.path().join("settings.json"));
+        let mut initial_settings = SettingsDocument::default();
+        initial_settings.preferences.default_namespace = Some("payment-platform".to_owned());
+        let (first_window, first_app) =
+            open_test_workbench_with_store(cx, store.clone(), initial_settings);
+
+        cx.update_window(first_window, |_, window, cx| {
+            let dock_area = first_app.read(cx).dock_area.clone();
+            dock_area.update(cx, |area, cx| {
+                area.set_dock_size(DockPlacement::Left, px(312.0), window, cx);
+                area.toggle_dock(DockPlacement::Bottom, window, cx);
+            });
+            window.click("toggle-theme", cx);
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+
+        let saved = store.load().unwrap();
+        assert_eq!(saved.preferences.appearance, AppearancePreference::Light);
+        assert_eq!(
+            saved.preferences.default_namespace.as_deref(),
+            Some("payment-platform")
+        );
+        let layout: DockAreaState =
+            serde_json::from_value(saved.workspace_layout.clone().unwrap()).unwrap();
+        assert_eq!(layout.left_dock.as_ref().unwrap().size(), px(312.0));
+        assert!(!layout.bottom_dock.as_ref().unwrap().open());
+
+        let (second_window, second_app) =
+            open_test_workbench_with_store(cx, store.clone(), saved);
+        cx.update_window(second_window, |_, window, cx| {
+            window.render_frame(cx);
+            let restored_dock = second_app.read(cx).dock_area.clone();
+            assert_eq!(second_app.read(cx).theme_mode, ThemeMode::Light);
+            assert_eq!(
+                second_app
+                    .read(cx)
+                    .settings
+                    .preferences
+                    .default_namespace
+                    .as_deref(),
+                Some("payment-platform")
+            );
+            assert_eq!(Theme::global(cx).mode, ThemeMode::Light);
+            assert_eq!(restored_dock.read(cx).dock_size(DockPlacement::Left), Some(px(312.0)));
+            assert!(!restored_dock.read(cx).is_dock_open(DockPlacement::Bottom));
+            assert!(second_app.read(cx).settings_notice.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn incompatible_saved_dock_layout_uses_defaults_with_visible_notice(
+        cx: &mut TestAppContext,
+    ) {
+        let state = DockAreaState {
+            version: Some(99),
+            center: PanelState::new("ResourceListPanel"),
+            ..DockAreaState::default()
+        };
+        let mut settings = SettingsDocument::default();
+        settings.workspace_layout = Some(serde_json::to_value(state).unwrap());
+        let (window_handle, app) = open_test_workbench_with_store(
+            cx,
+            SettingsStore::at_path("/tmp/axiomlens-unused-settings.json"),
+            settings,
+        );
+
+        cx.update_window(window_handle, |_, _, cx| {
+            let dock = app.read(cx).dock_area.clone();
+            assert_eq!(dock.read(cx).dock_size(DockPlacement::Left), Some(px(248.0)));
+            assert!(dock.read(cx).is_dock_open(DockPlacement::Left));
+            assert!(app
+                .read(cx)
+                .settings_notice
+                .as_ref()
+                .is_some_and(|notice| notice.contains("incompatible")));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn settings_write_failure_is_visible_and_never_reported_as_saved(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let blocking_file = directory.path().join("not-a-directory");
+        std::fs::write(&blocking_file, b"preserve-me").unwrap();
+        let store = SettingsStore::at_path(blocking_file.join("settings.json"));
+        let (window_handle, app) =
+            open_test_workbench_with_store(cx, store, SettingsDocument::default());
+
+        cx.update_window(window_handle, |_, window, cx| {
+            window.click("toggle-theme", cx);
+            assert!(app
+                .read(cx)
+                .settings_notice
+                .as_ref()
+                .is_some_and(|notice| notice.contains("Saving settings")));
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+
+        cx.update_window(window_handle, |_, _, cx| {
+            assert!(app
+                .read(cx)
+                .settings_notice
+                .as_ref()
+                .is_some_and(|notice| notice.contains("Settings were not saved")));
+            assert_eq!(std::fs::read(&blocking_file).unwrap(), b"preserve-me");
         })
         .unwrap();
     }

@@ -11,9 +11,10 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_CREDENTIAL_REFERENCES: usize = 128;
+const MAX_WORKSPACE_LAYOUT_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +25,9 @@ pub struct SettingsDocument {
     /// Opaque secure-store references only; this map must never contain credential bodies.
     #[serde(default)]
     pub credential_refs: BTreeMap<String, CredentialReference>,
+    /// Serialized GPUI DockAreaState, validated again before the UI restores it.
+    #[serde(default)]
+    pub workspace_layout: Option<Value>,
 }
 
 impl Default for SettingsDocument {
@@ -32,6 +36,7 @@ impl Default for SettingsDocument {
             schema_version: CURRENT_SCHEMA_VERSION,
             preferences: SettingsPreferences::default(),
             credential_refs: BTreeMap::new(),
+            workspace_layout: None,
         }
     }
 }
@@ -203,6 +208,11 @@ impl SettingsDocument {
         if self.credential_refs.len() > MAX_CREDENTIAL_REFERENCES {
             return Err(SettingsError::InvalidSettings("credential_refs"));
         }
+        if let Some(layout) = &self.workspace_layout {
+            if !layout.is_object() || serde_json::to_vec(layout)?.len() > MAX_WORKSPACE_LAYOUT_BYTES {
+                return Err(SettingsError::InvalidSettings("workspace_layout"));
+            }
+        }
         if self
             .preferences
             .default_namespace
@@ -236,6 +246,16 @@ struct SettingsV1 {
     credential_reference: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsV2 {
+    schema_version: u32,
+    #[serde(default)]
+    preferences: SettingsPreferences,
+    #[serde(default)]
+    credential_refs: BTreeMap<String, CredentialReference>,
+}
+
 fn decode_settings(bytes: &[u8]) -> Result<(SettingsDocument, bool), SettingsError> {
     let value: Value = serde_json::from_slice(bytes)?;
     let version = value
@@ -266,6 +286,21 @@ fn decode_settings(bytes: &[u8]) -> Result<(SettingsDocument, bool), SettingsErr
                     default_namespace: legacy.default_namespace,
                 },
                 credential_refs,
+                workspace_layout: None,
+            };
+            settings.validate()?;
+            Ok((settings, true))
+        }
+        2 => {
+            let legacy: SettingsV2 = serde_json::from_value(value)?;
+            if legacy.schema_version != 2 {
+                return Err(SettingsError::UnsupportedSchemaVersion(version));
+            }
+            let settings = SettingsDocument {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                preferences: legacy.preferences,
+                credential_refs: legacy.credential_refs,
+                workspace_layout: None,
             };
             settings.validate()?;
             Ok((settings, true))
@@ -333,6 +368,10 @@ mod tests {
             .update(|settings| {
                 settings.preferences.appearance = AppearancePreference::Dark;
                 settings.preferences.default_namespace = Some("payment-platform".to_owned());
+                settings.workspace_layout = Some(serde_json::json!({
+                    "version": 1,
+                    "center": {"panel_name": "ResourceListPanel"}
+                }));
                 settings.credential_refs.insert(
                     "primary-cluster".to_owned(),
                     CredentialReference {
@@ -351,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_and_rewrites_as_v2() {
+    fn schema_v1_migrates_and_rewrites_as_v3() {
         let directory = TempDir::new().unwrap();
         let store = store(&directory);
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
@@ -380,6 +419,29 @@ mod tests {
         let rewritten: Value = serde_json::from_slice(&fs::read(store.path()).unwrap()).unwrap();
         assert_eq!(rewritten["schema_version"], CURRENT_SCHEMA_VERSION);
         assert!(rewritten.get("credential_reference").is_none());
+    }
+
+    #[test]
+    fn schema_v2_migrates_to_v3_with_default_workspace_layout() {
+        let directory = TempDir::new().unwrap();
+        let store = store(&directory);
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(
+            store.path(),
+            br#"{
+                "schema_version": 2,
+                "preferences": {"appearance": "light", "default_namespace": "payment-platform"},
+                "credential_refs": {}
+            }"#,
+        )
+        .unwrap();
+
+        let migrated = store.load().unwrap();
+        assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(migrated.preferences.appearance, AppearancePreference::Light);
+        assert!(migrated.workspace_layout.is_none());
+        let rewritten: Value = serde_json::from_slice(&fs::read(store.path()).unwrap()).unwrap();
+        assert_eq!(rewritten["schema_version"], CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -426,6 +488,7 @@ mod tests {
                 default_namespace: None,
             },
             credential_refs: BTreeMap::new(),
+            workspace_layout: None,
         })
         .unwrap();
 
