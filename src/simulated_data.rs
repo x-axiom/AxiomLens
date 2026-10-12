@@ -13,6 +13,6 @@ pub fn initial_snapshot() -> SimulatedSnapshot {
         connection_status: "Disconnected",
         context: "demo-context",
         namespace: "payment-platform",
-        resource_summary: "5 sample resources",
+        resource_summary: "5,000 sample resources",
     }
 }

@@ -6,6 +6,10 @@ rust-version = "1.95"
 license = "MIT"
 
 [dependencies]
+async-channel = "=2.5.0"
 gpui-kit = "=0.7.1"
 kube = { version = "=4.2.0", features = ["runtime"] }
 k8s-openapi = { version = "=0.28.0", features = ["latest"] }
+
+[dev-dependencies]
+gpui-kit = { version = "=0.7.1", features = ["test-support"] }
