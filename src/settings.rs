@@ -2,7 +2,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     fs::{self, File},
@@ -14,6 +14,7 @@ use tempfile::NamedTempFile;
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_CREDENTIAL_REFERENCES: usize = 128;
+const MAX_TRUSTED_EXEC_PLUGINS: usize = 128;
 const MAX_WORKSPACE_LAYOUT_BYTES: usize = 512 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_SECONDS: u16 = 10;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u16 = 20;
@@ -28,6 +29,9 @@ pub struct SettingsDocument {
     /// Opaque secure-store references only; this map must never contain credential bodies.
     #[serde(default)]
     pub credential_refs: BTreeMap<String, CredentialReference>,
+    /// Fingerprints of exact kubeconfig exec plugin configurations explicitly trusted by the user.
+    #[serde(default)]
+    pub trusted_exec_plugins: BTreeSet<String>,
     /// Serialized GPUI DockAreaState, validated again before the UI restores it.
     #[serde(default)]
     pub workspace_layout: Option<Value>,
@@ -39,6 +43,7 @@ impl Default for SettingsDocument {
             schema_version: CURRENT_SCHEMA_VERSION,
             preferences: SettingsPreferences::default(),
             credential_refs: BTreeMap::new(),
+            trusted_exec_plugins: BTreeSet::new(),
             workspace_layout: None,
         }
     }
@@ -246,6 +251,16 @@ impl SettingsDocument {
         if self.credential_refs.len() > MAX_CREDENTIAL_REFERENCES {
             return Err(SettingsError::InvalidSettings("credential_refs"));
         }
+        if self.trusted_exec_plugins.len() > MAX_TRUSTED_EXEC_PLUGINS
+            || self.trusted_exec_plugins.iter().any(|fingerprint| {
+                fingerprint.len() != 64
+                    || !fingerprint
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
+            return Err(SettingsError::InvalidSettings("trusted_exec_plugins"));
+        }
         if let Some(layout) = &self.workspace_layout {
             if !layout.is_object() || serde_json::to_vec(layout)?.len() > MAX_WORKSPACE_LAYOUT_BYTES {
                 return Err(SettingsError::InvalidSettings("workspace_layout"));
@@ -331,6 +346,7 @@ fn decode_settings(bytes: &[u8]) -> Result<(SettingsDocument, bool), SettingsErr
                     ..SettingsPreferences::default()
                 },
                 credential_refs,
+                trusted_exec_plugins: BTreeSet::new(),
                 workspace_layout: None,
             };
             settings.validate()?;
@@ -345,6 +361,7 @@ fn decode_settings(bytes: &[u8]) -> Result<(SettingsDocument, bool), SettingsErr
                 schema_version: CURRENT_SCHEMA_VERSION,
                 preferences: legacy.preferences,
                 credential_refs: legacy.credential_refs,
+                trusted_exec_plugins: BTreeSet::new(),
                 workspace_layout: None,
             };
             settings.validate()?;
@@ -424,6 +441,9 @@ mod tests {
                         key: "item-7f4c".to_owned(),
                     },
                 );
+                settings
+                    .trusted_exec_plugins
+                    .insert("a".repeat(64));
             })
             .unwrap();
 
@@ -431,7 +451,25 @@ mod tests {
         assert_eq!(store.load().unwrap(), updated);
         let serialized = fs::read_to_string(store.path()).unwrap();
         assert!(serialized.contains("item-7f4c"));
+        assert!(serialized.contains(&"a".repeat(64)));
         assert!(!serialized.contains("credential_value"));
+        assert!(!serialized.contains("ARG_SECRET_VALUE"));
+        assert!(!serialized.contains("ENV_SECRET_VALUE"));
+    }
+
+    #[test]
+    fn malformed_exec_trust_fingerprints_are_rejected() {
+        let directory = TempDir::new().unwrap();
+        let store = store(&directory);
+        let result = store.update(|settings| {
+            settings.trusted_exec_plugins.insert("not-a-fingerprint".to_owned());
+        });
+
+        assert!(matches!(
+            result,
+            Err(SettingsError::InvalidSettings("trusted_exec_plugins"))
+        ));
+        assert_eq!(store.load().unwrap(), SettingsDocument::default());
     }
 
     #[test]
@@ -534,6 +572,7 @@ mod tests {
                 ..SettingsPreferences::default()
             },
             credential_refs: BTreeMap::new(),
+            trusted_exec_plugins: BTreeSet::new(),
             workspace_layout: None,
         })
         .unwrap();

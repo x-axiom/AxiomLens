@@ -1,4 +1,5 @@
 use crate::{
+    exec_plugin::{self, ExecPluginFailureKind},
     kubeconfig::{
         ImportedKubeconfig, KubeconfigImportError, KubeconfigReferenceKind,
     },
@@ -8,9 +9,11 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Api, Client,
     api::ListParams,
-    config::{Config, KubeConfigOptions, Kubeconfig, KubeconfigError},
+    config::{Config, ExecAuthCluster, KubeConfigOptions, Kubeconfig, KubeconfigError},
 };
+use jiff::Timestamp;
 use std::{
+    collections::BTreeSet,
     error::Error,
     fmt,
     io,
@@ -106,6 +109,10 @@ pub enum ConnectionFailureKind {
     TimedOut,
     ServerUnavailable,
     ExecPluginRequiresTrust,
+    ExecPluginFailed,
+    ExecPluginTimedOut,
+    ExecPluginInvalidOutput,
+    ExecPluginInteractiveUnsupported,
     UnsupportedAuthProvider,
     TlsVerificationDisabled,
     Internal,
@@ -138,6 +145,12 @@ impl ConnectionFailure {
             ConnectionFailureKind::TimedOut => "request_timeout",
             ConnectionFailureKind::ServerUnavailable => "server_unavailable",
             ConnectionFailureKind::ExecPluginRequiresTrust => "exec_plugin_requires_trust",
+            ConnectionFailureKind::ExecPluginFailed => "exec_plugin_failed",
+            ConnectionFailureKind::ExecPluginTimedOut => "exec_plugin_timeout",
+            ConnectionFailureKind::ExecPluginInvalidOutput => "exec_plugin_invalid_output",
+            ConnectionFailureKind::ExecPluginInteractiveUnsupported => {
+                "exec_plugin_interactive_unsupported"
+            }
             ConnectionFailureKind::UnsupportedAuthProvider => "unsupported_auth_provider",
             ConnectionFailureKind::TlsVerificationDisabled => "tls_verification_disabled",
             ConnectionFailureKind::Internal => "connection_internal",
@@ -172,6 +185,18 @@ impl ConnectionFailure {
             }
             ConnectionFailureKind::ExecPluginRequiresTrust => {
                 "Context uses an exec authentication plugin that requires explicit trust."
+            }
+            ConnectionFailureKind::ExecPluginFailed => {
+                "Authentication plugin could not start or exited unsuccessfully."
+            }
+            ConnectionFailureKind::ExecPluginTimedOut => {
+                "Authentication plugin exceeded its time limit."
+            }
+            ConnectionFailureKind::ExecPluginInvalidOutput => {
+                "Authentication plugin returned invalid or oversized credentials."
+            }
+            ConnectionFailureKind::ExecPluginInteractiveUnsupported => {
+                "Authentication plugin requires interactive input not available in this flow."
             }
             ConnectionFailureKind::UnsupportedAuthProvider => {
                 "Context uses an authentication provider not supported by this connection flow."
@@ -217,6 +242,18 @@ impl ConnectionFailure {
             }
             ConnectionFailureKind::ExecPluginRequiresTrust => {
                 "Review and trust the authentication command in the dedicated plugin-trust flow."
+            }
+            ConnectionFailureKind::ExecPluginFailed => {
+                "Check executable permissions, plugin installation, arguments, and exit status."
+            }
+            ConnectionFailureKind::ExecPluginTimedOut => {
+                "Check plugin availability and authentication provider; execution was stopped at the configured limit."
+            }
+            ConnectionFailureKind::ExecPluginInvalidOutput => {
+                "Verify plugin API version and ExecCredential token or certificate output."
+            }
+            ConnectionFailureKind::ExecPluginInteractiveUnsupported => {
+                "Use a non-interactive credential flow or a plugin configured for IfAvailable/Never."
             }
             ConnectionFailureKind::UnsupportedAuthProvider => {
                 "Use a supported token or client-certificate Context."
@@ -285,6 +322,7 @@ pub async fn connect(
     imported: ImportedKubeconfig,
     target: TargetBinding,
     policy: ConnectionPolicy,
+    trusted_exec_plugins: BTreeSet<String>,
 ) -> Result<ActiveConnection, ConnectionFailure> {
     let context_name = target.context_name().as_str().to_owned();
     let context = imported
@@ -298,16 +336,31 @@ pub async fn connect(
         ));
     }
     let namespace = context.default_namespace().as_str().to_owned();
-    let kubeconfig = imported
+    let exec_trust_fingerprint = context
+        .exec_plugin()
+        .map(|plugin| plugin.trust_fingerprint().to_owned());
+    let mut kubeconfig = imported
         .load_raw_for_connection(&context_name)
         .map_err(map_import_error)?;
-    ensure_auth_requires_no_untrusted_plugin(&kubeconfig, &context_name)?;
+    ensure_auth_requires_no_untrusted_plugin(
+        &kubeconfig,
+        &context_name,
+        exec_trust_fingerprint.as_deref(),
+        &trusted_exec_plugins,
+    )?;
 
     let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("axiomlens-kubernetes-connect".to_owned())
         .spawn(move || {
-            let outcome = Builder::new_multi_thread()
+            let result = prepare_exec_credentials(
+                &mut kubeconfig,
+                &context_name,
+                exec_trust_fingerprint.as_deref(),
+                &trusted_exec_plugins,
+                policy.request_timeout,
+            );
+            let outcome = result.and_then(|valid_until| Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_all()
                 .build()
@@ -318,6 +371,7 @@ pub async fn connect(
                         context_name,
                         namespace,
                         policy,
+                        valid_until,
                     ));
                     result.map(|(client, attempts)| ActiveConnection {
                         target,
@@ -325,7 +379,7 @@ pub async fn connect(
                         _runtime: runtime,
                         attempts,
                     })
-                });
+                }));
             let _ = sender.send(outcome);
         })
         .map_err(|_| ConnectionFailure::new(ConnectionFailureKind::Internal))?;
@@ -339,6 +393,7 @@ async fn connect_and_probe(
     context_name: String,
     namespace: String,
     policy: ConnectionPolicy,
+    valid_until: Option<Timestamp>,
 ) -> Result<(Client, u8), ConnectionFailure> {
     let options = KubeConfigOptions {
         context: Some(context_name),
@@ -357,7 +412,9 @@ async fn connect_and_probe(
     config.write_timeout = Some(policy.request_timeout);
     config.default_retry = false;
 
-    let client = Client::try_from(config).map_err(|error| classify_kube_error(&error))?;
+    let client = Client::try_from(config)
+        .map_err(|error| classify_kube_error(&error))?
+        .with_valid_until(valid_until);
     let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
     for attempt_index in 0..=policy.retry_limit {
         let attempt = attempt_index + 1;
@@ -382,6 +439,8 @@ async fn connect_and_probe(
 fn ensure_auth_requires_no_untrusted_plugin(
     kubeconfig: &Kubeconfig,
     context_name: &str,
+    exec_trust_fingerprint: Option<&str>,
+    trusted_exec_plugins: &BTreeSet<String>,
 ) -> Result<(), ConnectionFailure> {
     let context = kubeconfig
         .contexts
@@ -399,8 +458,19 @@ fn ensure_auth_requires_no_untrusted_plugin(
         .and_then(|user| user.auth_info.as_ref())
         .ok_or_else(|| ConnectionFailure::new(ConnectionFailureKind::InvalidConfiguration))?;
     if auth_info.exec.is_some() {
+        let Some(fingerprint) = exec_trust_fingerprint else {
+            return Err(ConnectionFailure::new(
+                ConnectionFailureKind::ExecPluginRequiresTrust,
+            ));
+        };
+        if !trusted_exec_plugins.contains(fingerprint) {
+            return Err(ConnectionFailure::new(
+                ConnectionFailureKind::ExecPluginRequiresTrust,
+            ));
+        }
+    } else if exec_trust_fingerprint.is_some() {
         return Err(ConnectionFailure::new(
-            ConnectionFailureKind::ExecPluginRequiresTrust,
+            ConnectionFailureKind::ConfigurationChanged,
         ));
     }
     if auth_info.auth_provider.is_some() {
@@ -409,6 +479,101 @@ fn ensure_auth_requires_no_untrusted_plugin(
         ));
     }
     Ok(())
+}
+
+fn prepare_exec_credentials(
+    kubeconfig: &mut Kubeconfig,
+    context_name: &str,
+    trust_fingerprint: Option<&str>,
+    trusted_exec_plugins: &std::collections::BTreeSet<String>,
+    timeout: Duration,
+) -> Result<Option<Timestamp>, ConnectionFailure> {
+    let context = kubeconfig
+        .contexts
+        .iter()
+        .find(|context| context.name == context_name)
+        .and_then(|context| context.context.as_ref())
+        .ok_or_else(|| ConnectionFailure::new(ConnectionFailureKind::InvalidConfiguration))?;
+    let cluster_name = context.cluster.clone();
+    let user_name = context
+        .user
+        .as_deref()
+        .ok_or_else(|| ConnectionFailure::new(ConnectionFailureKind::InvalidConfiguration))?;
+    let auth_info = kubeconfig
+        .auth_infos
+        .iter_mut()
+        .find(|user| user.name == user_name)
+        .and_then(|user| user.auth_info.as_mut())
+        .ok_or_else(|| ConnectionFailure::new(ConnectionFailureKind::InvalidConfiguration))?;
+    let Some(exec) = auth_info.exec.clone() else {
+        return Ok(None);
+    };
+    let fingerprint = trust_fingerprint.ok_or_else(|| {
+        ConnectionFailure::new(ConnectionFailureKind::ExecPluginRequiresTrust)
+    })?;
+    if !trusted_exec_plugins.contains(fingerprint) {
+        return Err(ConnectionFailure::new(
+            ConnectionFailureKind::ExecPluginRequiresTrust,
+        ));
+    }
+    if auth_info.username.is_some()
+        || auth_info.password.is_some()
+        || auth_info.token.is_some()
+        || auth_info.token_file.is_some()
+        || auth_info.client_certificate.is_some()
+        || auth_info.client_certificate_data.is_some()
+        || auth_info.client_key.is_some()
+        || auth_info.client_key_data.is_some()
+        || auth_info.auth_provider.is_some()
+    {
+        return Err(ConnectionFailure::new(
+            ConnectionFailureKind::InvalidConfiguration,
+        ));
+    }
+    let api_version = exec
+        .api_version
+        .as_deref()
+        .ok_or_else(|| ConnectionFailure::new(ConnectionFailureKind::InvalidConfiguration))?;
+    let cluster_info = if exec.provide_cluster_info {
+        let cluster = kubeconfig
+            .clusters
+            .iter()
+            .find(|cluster| cluster.name == cluster_name)
+            .and_then(|cluster| cluster.cluster.as_ref())
+            .ok_or_else(|| ConnectionFailure::new(ConnectionFailureKind::InvalidConfiguration))?;
+        Some(
+            ExecAuthCluster::try_from(cluster)
+                .map_err(map_config_error)?,
+        )
+    } else {
+        None
+    };
+    let credentials = exec_plugin::execute(&exec, api_version, cluster_info.as_ref(), timeout)
+        .map_err(map_exec_plugin_error)?;
+    let expiration = credentials.expiration();
+    credentials.install(auth_info);
+    Ok(expiration)
+}
+
+fn map_exec_plugin_error(error: exec_plugin::ExecPluginFailure) -> ConnectionFailure {
+    let kind = match error.kind() {
+        ExecPluginFailureKind::TimedOut => ConnectionFailureKind::ExecPluginTimedOut,
+        ExecPluginFailureKind::InteractiveModeUnsupported => {
+            ConnectionFailureKind::ExecPluginInteractiveUnsupported
+        }
+        ExecPluginFailureKind::MissingCommand
+        | ExecPluginFailureKind::StartFailed
+        | ExecPluginFailureKind::NonZeroExit => ConnectionFailureKind::ExecPluginFailed,
+        ExecPluginFailureKind::OutputTooLarge
+        | ExecPluginFailureKind::OutputReadFailed
+        | ExecPluginFailureKind::InvalidOutput
+        | ExecPluginFailureKind::ApiVersionMismatch
+        | ExecPluginFailureKind::MissingCredentials
+        | ExecPluginFailureKind::ConflictingCredentials
+        | ExecPluginFailureKind::InvalidEnvironment => ConnectionFailureKind::ExecPluginInvalidOutput,
+        ExecPluginFailureKind::ExpiredCredentials => ConnectionFailureKind::CredentialsRejected,
+    };
+    ConnectionFailure::new(kind)
 }
 
 fn map_import_error(error: KubeconfigImportError) -> ConnectionFailure {
@@ -633,8 +798,17 @@ mod tests {
         target: TargetBinding,
         policy: ConnectionPolicy,
     ) -> Result<ActiveConnection, ConnectionFailure> {
+        run_connect_with_trust(imported, target, policy, BTreeSet::new())
+    }
+
+    fn run_connect_with_trust(
+        imported: ImportedKubeconfig,
+        target: TargetBinding,
+        policy: ConnectionPolicy,
+        trusted_exec_plugins: BTreeSet<String>,
+    ) -> Result<ActiveConnection, ConnectionFailure> {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        runtime.block_on(connect(imported, target, policy))
+        runtime.block_on(connect(imported, target, policy, trusted_exec_plugins))
     }
 
     #[test]
@@ -737,6 +911,88 @@ mod tests {
         let failure = run_connect(imported, target, policy(0)).unwrap_err();
 
         assert_eq!(failure.kind(), ConnectionFailureKind::ExecPluginRequiresTrust);
+    }
+
+    #[test]
+    fn exec_plugin_requires_exact_persisted_trust_fingerprint() {
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            "http://127.0.0.1:9",
+            "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: should-never-run\n      args:\n      - --profile\n      - SECRET_ARG\n      interactiveMode: Never\n",
+        );
+        let (imported, _) = imported_target(&path);
+        let plugin = imported.contexts()[0].exec_plugin().unwrap();
+        let trust_fingerprint = plugin.trust_fingerprint().to_owned();
+        let kubeconfig = imported.load_raw_for_connection("local").unwrap();
+        let untrusted = BTreeSet::new();
+
+        assert_eq!(
+            ensure_auth_requires_no_untrusted_plugin(
+                &kubeconfig,
+                "local",
+                Some(&trust_fingerprint),
+                &untrusted,
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectionFailureKind::ExecPluginRequiresTrust
+        );
+
+        let trusted = BTreeSet::from([trust_fingerprint]);
+        assert!(ensure_auth_requires_no_untrusted_plugin(
+            &kubeconfig,
+            "local",
+            Some(plugin.trust_fingerprint()),
+            &trusted,
+        )
+        .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_exec_plugin_supplies_token_to_read_only_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mock = MockApi::start(&[200]);
+        let directory = TempDir::new().unwrap();
+        let script_path = directory.path().join("credential-helper");
+        let token = "TRUSTED_EXEC_TOKEN_SECRET";
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s' '{{\"kind\":\"ExecCredential\",\"apiVersion\":\"client.authentication.k8s.io/v1\",\"status\":{{\"token\":\"{token}\"}}}}'\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let auth = format!(
+            "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      interactiveMode: Never\n",
+            serde_json::to_string(&script_path.to_string_lossy().to_string()).unwrap()
+        );
+        let path = config_file(&directory, &mock.address, &auth);
+        let (imported, target) = imported_target(&path);
+        let trust_key = imported.contexts()[0]
+            .exec_plugin()
+            .unwrap()
+            .trust_fingerprint()
+            .to_owned();
+        let connected = run_connect_with_trust(
+            imported,
+            target,
+            policy(0),
+            BTreeSet::from([trust_key]),
+        )
+        .unwrap();
+        assert_eq!(connected.attempts(), 1);
+        assert!(format!("{connected:?}").contains("local"));
+        let requests = mock.requests();
+        mock.join();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {token}").to_ascii_lowercase()));
+        assert!(!format!("{connected:?}").contains(token));
     }
 
     #[test]

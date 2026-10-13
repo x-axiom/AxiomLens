@@ -9,12 +9,14 @@ license = "MIT"
 async-channel = "=2.5.0"
 base64 = "=0.22.1"
 gpui-kit = "=0.7.1"
+jiff = "=0.2.38"
 keyring = "=4.2.0"
 kube = { version = "=4.2.0", features = ["runtime"] }
 k8s-openapi = { version = "=0.28.0", features = ["latest"] }
 directories = "=6.0.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.152"
+secrecy = "=0.10.3"
 sha2 = "=0.11.0"
 tempfile = "=3.27.0"
 tokio = { version = "=1.53.2", features = ["net", "rt-multi-thread", "sync", "time"] }

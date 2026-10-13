@@ -23,7 +23,7 @@ use std::{
 
 use crate::{simulated_data::SimulatedSnapshot, simulation::{self, SimulatedTaskMessage, SimulatedTaskMode}};
 use crate::connection::{self, ActiveConnection, ConnectionFailure, ConnectionPolicy};
-use crate::kubeconfig::{ImportedKubeconfig, KubeconfigImportError};
+use crate::kubeconfig::{ExecPluginSummary, ImportedKubeconfig, KubeconfigImportError};
 use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
 use crate::target::{ContextName, SessionRegistry};
 use crate::diagnostics::{DiagnosticEvent, Diagnostics, next_correlation_id};
@@ -112,6 +112,12 @@ enum KubeconfigImportSource {
     Environment,
 }
 
+#[derive(Clone)]
+struct ExecTrustPrompt {
+    context_name: String,
+    plugin: ExecPluginSummary,
+}
+
 #[derive(Clone, Copy)]
 enum ConnectionViewState {
     Disconnected,
@@ -182,6 +188,9 @@ pub struct AxiomLensPrototype {
     kubeconfig_import_error: Option<SharedString>,
     imported_kubeconfig: Option<ImportedKubeconfig>,
     selected_context_name: Option<ContextName>,
+    exec_trust_prompt: Option<ExecTrustPrompt>,
+    exec_trust_saving: bool,
+    exec_trust_error: Option<SharedString>,
     session_registry: SessionRegistry,
     connection_view_state: ConnectionViewState,
     _active_connection: Option<ActiveConnection>,
@@ -257,6 +266,9 @@ impl AxiomLensPrototype {
             kubeconfig_import_error: None,
             imported_kubeconfig: None,
             selected_context_name: None,
+            exec_trust_prompt: None,
+            exec_trust_saving: false,
+            exec_trust_error: None,
             session_registry: SessionRegistry::default(),
             connection_view_state: ConnectionViewState::Disconnected,
             _active_connection: None,
@@ -413,6 +425,8 @@ impl AxiomLensPrototype {
     fn open_kubeconfig_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.kubeconfig_import_open = true;
         self.kubeconfig_selection_open = false;
+        self.exec_trust_prompt = None;
+        self.exec_trust_error = None;
         self.kubeconfig_import_error = None;
         self.kubeconfig_path_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
@@ -458,6 +472,8 @@ impl AxiomLensPrototype {
                         app.connection_view_state = ConnectionViewState::Disconnected;
                         app.imported_kubeconfig = Some(imported);
                         app.selected_context_name = None;
+                        app.exec_trust_prompt = None;
+                        app.exec_trust_error = None;
                         app.kubeconfig_import_error = None;
                         app.kubeconfig_import_open = false;
                         app.kubeconfig_selection_open = true;
@@ -473,6 +489,9 @@ impl AxiomLensPrototype {
     }
 
     fn select_kubeconfig_context(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.exec_trust_saving {
+            return;
+        }
         let Some(imported) = self.imported_kubeconfig.clone() else {
             self.kubeconfig_import_error = Some(SharedString::from(
                 KubeconfigImportError::UnknownContext.to_string(),
@@ -480,10 +499,38 @@ impl AxiomLensPrototype {
             cx.notify();
             return;
         };
+        let plugin = imported
+            .contexts()
+            .iter()
+            .find(|context| context.name().as_str() == name)
+            .and_then(|context| context.exec_plugin())
+            .cloned();
+        if let Some(plugin) = plugin
+            && !self.settings.trusted_exec_plugins.contains(plugin.trust_fingerprint())
+        {
+            self.exec_trust_prompt = Some(ExecTrustPrompt {
+                context_name: name,
+                plugin,
+            });
+            self.exec_trust_error = None;
+            self.kubeconfig_selection_open = false;
+            cx.notify();
+            return;
+        }
+        self.complete_context_selection(name, imported, cx);
+    }
+
+    fn complete_context_selection(
+        &mut self,
+        name: String,
+        imported: ImportedKubeconfig,
+        cx: &mut Context<Self>,
+    ) {
         match imported.select_context(&name, &mut self.session_registry) {
             Ok(target) => {
                 self.selected_context_name = Some(target.context_name().clone());
                 self.kubeconfig_selection_open = false;
+                self.exec_trust_prompt = None;
                 self.kubeconfig_import_error = None;
                 self.begin_kubeconfig_connection(imported, target, cx);
             }
@@ -492,6 +539,86 @@ impl AxiomLensPrototype {
             }
         }
         cx.notify();
+    }
+
+    fn reject_exec_plugin_trust(&mut self, cx: &mut Context<Self>) {
+        if self.exec_trust_saving {
+            return;
+        }
+        self.exec_trust_prompt = None;
+        self.exec_trust_error = None;
+        self.kubeconfig_selection_open = true;
+        cx.notify();
+    }
+
+    fn trust_exec_plugin_and_connect(&mut self, cx: &mut Context<Self>) {
+        if self.exec_trust_saving {
+            return;
+        }
+        let Some(prompt) = self.exec_trust_prompt.clone() else {
+            return;
+        };
+        let Some(store) = self.settings_store.clone() else {
+            self.exec_trust_error = Some(SharedString::from(
+                "Trust could not be saved; authentication plugin was not run.",
+            ));
+            cx.notify();
+            return;
+        };
+        let Some(imported) = self.imported_kubeconfig.clone() else {
+            self.exec_trust_error = Some(SharedString::from(
+                KubeconfigImportError::UnknownContext.to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+
+        let mut settings = self.settings.clone();
+        settings
+            .trusted_exec_plugins
+            .insert(prompt.plugin.trust_fingerprint().to_owned());
+        self.exec_trust_saving = true;
+        self.exec_trust_error = None;
+        cx.notify();
+
+        let executor = cx.background_executor().clone();
+        let app = cx.weak_entity();
+        let diagnostics = self.diagnostics.clone();
+        cx.spawn(async move |_, cx| {
+            let result = executor
+                .spawn(async move { store.save(&settings).map(|()| settings) })
+                .await;
+            if let (Some(diagnostics), Err(error)) = (&diagnostics, &result) {
+                diagnostics.record(
+                    DiagnosticEvent::SettingsSaveFailed,
+                    "settings",
+                    None,
+                    Some(error.diagnostic_code()),
+                    None,
+                );
+            }
+            let _ = app.update(cx, |app, cx| {
+                app.exec_trust_saving = false;
+                match result {
+                    Ok(settings) => {
+                        app.settings = settings;
+                        app.settings_write_generation =
+                            app.settings_write_generation.wrapping_add(1);
+                        app.settings_notice = None;
+                        app.exec_trust_error = None;
+                        app.exec_trust_prompt = None;
+                        app.complete_context_selection(prompt.context_name, imported, cx);
+                    }
+                    Err(_) => {
+                        app.exec_trust_error = Some(SharedString::from(
+                            "Trust could not be saved; authentication plugin was not run.",
+                        ));
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     fn begin_kubeconfig_connection(
@@ -521,12 +648,15 @@ impl AxiomLensPrototype {
         }
 
         let target_for_completion = target.clone();
+        let trusted_exec_plugins = self.settings.trusted_exec_plugins.clone();
         let diagnostics = self.diagnostics.clone();
         let executor = cx.background_executor().clone();
         let app = cx.weak_entity();
         cx.spawn(async move |_, cx| {
             let result = executor
-                .spawn(async move { connection::connect(imported, target, policy).await })
+                .spawn(async move {
+                    connection::connect(imported, target, policy, trusted_exec_plugins).await
+                })
                 .await;
             if let (Some(diagnostics), Err(error)) = (&diagnostics, &result) {
                 diagnostics.record(
@@ -930,6 +1060,146 @@ impl AxiomLensPrototype {
                 ConnectionPolicyField::RetryLimit,
                 cx,
             ))
+    }
+
+    fn render_exec_trust_prompt(&self, cx: &mut Context<Self>) -> Div {
+        let Some(prompt) = self.exec_trust_prompt.as_ref() else {
+            return div();
+        };
+        let plugin = &prompt.plugin;
+        let environment_names = if plugin.environment_names().is_empty() {
+            "None".to_owned()
+        } else {
+            plugin.environment_names().join(", ")
+        };
+        let argument_summary = if plugin.argument_summary().is_empty() {
+            "None".to_owned()
+        } else {
+            plugin.argument_summary().join(" ")
+        };
+        let api_version = plugin.api_version().unwrap_or("Not specified");
+        let interactive_mode = plugin.interactive_mode().unwrap_or("Not specified");
+        let trust_error = self.exec_trust_error.clone();
+        let saving = self.exec_trust_saving;
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(70.0))
+            .bg(hsla(0.0, 0.0, 0.0, 0.62))
+            .child(
+                div()
+                    .w(px(680.0))
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(TEXT_1))
+                                    .child("Trust authentication plugin?"),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(WARN))
+                                    .child("LOCAL CODE EXECUTION"),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(
+                        div()
+                            .px_3()
+                            .py_3()
+                            .bg(rgb(ACCENT_SOFT))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_2))
+                                    .child("This executable runs locally to obtain Kubernetes credentials. It cannot be used by Agent actions."),
+                            ),
+                    )
+                    .child(self.exec_trust_detail_row("CONTEXT", &prompt.context_name))
+                    .child(self.exec_trust_detail_row("EXECUTABLE", plugin.executable()))
+                    .child(self.exec_trust_detail_row("API VERSION", api_version))
+                    .child(self.exec_trust_detail_row("ARGUMENTS", &argument_summary))
+                    .child(self.exec_trust_detail_row("ENVIRONMENT NAMES", &environment_names))
+                    .child(self.exec_trust_detail_row("INTERACTIVE MODE", interactive_mode))
+                    .child(if let Some(error) = trust_error {
+                        div()
+                            .px_3()
+                            .py_2()
+                            .child(div().text_xs().text_color(rgb(DANGER)).child(error))
+                    } else {
+                        div().h(px(12.0))
+                    })
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_3()
+                            .py_3()
+                            .child(
+                                Button::new("reject-exec-plugin-trust")
+                                    .label("Reject")
+                                    .compact()
+                                    .ghost()
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        app.reject_exec_plugin_trust(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("trust-exec-plugin-and-connect")
+                                    .label(if saving { "Saving trust..." } else { "Trust and connect" })
+                                    .compact()
+                                    .primary()
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        app.trust_exec_plugin_and_connect(cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn exec_trust_detail_row(&self, label: &'static str, value: &str) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .w(px(150.0))
+                    .text_xs()
+                    .text_color(rgb(TEXT_5))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .font_family("Menlo")
+                    .text_xs()
+                    .text_color(rgb(TEXT_2))
+                    .child(value.to_owned()),
+            )
     }
 
     fn render_kubeconfig_contexts(&self, cx: &mut Context<Self>) -> Div {
@@ -1440,6 +1710,8 @@ impl Render for AxiomLensPrototype {
 
         if self.palette_open {
             workspace.child(self.render_command_palette(cx))
+        } else if self.exec_trust_prompt.is_some() {
+            workspace.child(self.render_exec_trust_prompt(cx))
         } else if self.kubeconfig_import_open {
             workspace.child(self.render_kubeconfig_import(cx))
         } else if self.kubeconfig_selection_open {

@@ -3,7 +3,9 @@ use crate::target::{
     NamespaceScope, SessionRegistry, TargetBinding, TargetModelError,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use kube::config::{AuthInfo, Cluster, Kubeconfig, KubeconfigError as KubeLibraryError};
+use kube::config::{
+    AuthInfo, Cluster, ExecConfig, Kubeconfig, KubeconfigError as KubeLibraryError,
+};
 use sha2::{Digest, Sha256};
 use std::{
     env,
@@ -17,6 +19,7 @@ use std::{
 const KUBECONFIG_ENV: &str = "KUBECONFIG";
 const MAX_KUBECONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CA_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_EXECUTABLE_FINGERPRINT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KubeconfigReferenceKind {
@@ -63,6 +66,9 @@ pub enum KubeconfigImportError {
     ReferencedFileTooLarge(KubeconfigReferenceKind),
     InvalidCertificateAuthorityData,
     IncompleteClientCertificatePair,
+    InvalidExecConfiguration,
+    ExecExecutableUnreadable,
+    ExecExecutableTooLarge,
     UnknownContext,
     ConfigChangedSinceImport,
     InvalidTargetIdentity,
@@ -121,6 +127,15 @@ impl fmt::Display for KubeconfigImportError {
             Self::IncompleteClientCertificatePair => {
                 formatter.write_str("client certificate and client key must be configured together")
             }
+            Self::InvalidExecConfiguration => {
+                formatter.write_str("exec authentication configuration is incomplete or invalid")
+            }
+            Self::ExecExecutableUnreadable => {
+                formatter.write_str("exec authentication executable could not be fingerprinted")
+            }
+            Self::ExecExecutableTooLarge => {
+                formatter.write_str("exec authentication executable exceeds fingerprint size limit")
+            }
             Self::UnknownContext => formatter.write_str("selected context does not exist"),
             Self::ConfigChangedSinceImport => {
                 formatter.write_str("kubeconfig target changed since import; import and select again")
@@ -133,12 +148,215 @@ impl fmt::Display for KubeconfigImportError {
 impl std::error::Error for KubeconfigImportError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecPluginSummary {
+    executable: String,
+    api_version: Option<String>,
+    argument_summary: Vec<String>,
+    environment_names: Vec<String>,
+    interactive_mode: Option<&'static str>,
+    trust_fingerprint: String,
+}
+
+impl ExecPluginSummary {
+    pub fn executable(&self) -> &str {
+        &self.executable
+    }
+
+    pub fn api_version(&self) -> Option<&str> {
+        self.api_version.as_deref()
+    }
+
+    pub fn argument_count(&self) -> usize {
+        self.argument_summary.len()
+    }
+
+    pub fn argument_summary(&self) -> &[String] {
+        &self.argument_summary
+    }
+
+    pub fn environment_names(&self) -> &[String] {
+        &self.environment_names
+    }
+
+    pub fn interactive_mode(&self) -> Option<&'static str> {
+        self.interactive_mode
+    }
+
+    pub fn trust_fingerprint(&self) -> &str {
+        &self.trust_fingerprint
+    }
+}
+
+fn summarize_exec_plugin(
+    source_path: &Path,
+    context_name: &str,
+    user_name: &str,
+    exec: &ExecConfig,
+) -> Result<ExecPluginSummary, KubeconfigImportError> {
+    let executable = exec
+        .command
+        .as_deref()
+        .filter(|command| !command.trim().is_empty())
+        .ok_or(KubeconfigImportError::InvalidExecConfiguration)?;
+    if executable.chars().any(char::is_control) {
+        return Err(KubeconfigImportError::InvalidExecConfiguration);
+    }
+    let serialized = serde_json::to_vec(exec)
+        .map_err(|_| KubeconfigImportError::InvalidExecConfiguration)?;
+    let executable_identity = executable_identity(executable)?;
+    let source = source_path.to_string_lossy();
+    let trust_fingerprint = fingerprint_parts(&[
+        source.as_bytes(),
+        context_name.as_bytes(),
+        user_name.as_bytes(),
+        executable_identity.as_bytes(),
+        &serialized,
+    ]);
+    let mut environment_names = exec
+        .env
+        .iter()
+        .flatten()
+        .filter_map(|entry| entry.get("name"))
+        .filter(|name| is_safe_environment_name(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    environment_names.sort();
+    environment_names.dedup();
+    let interactive_mode = exec.interactive_mode.as_ref().map(|mode| match mode {
+        kube::config::ExecInteractiveMode::Never => "Never",
+        kube::config::ExecInteractiveMode::IfAvailable => "IfAvailable",
+        kube::config::ExecInteractiveMode::Always => "Always",
+    });
+    let argument_summary = exec
+        .args
+        .iter()
+        .flatten()
+        .map(|argument| summarize_argument(argument))
+        .collect();
+
+    Ok(ExecPluginSummary {
+        executable: executable.to_owned(),
+        api_version: exec.api_version.clone(),
+        argument_summary,
+        environment_names,
+        interactive_mode,
+        trust_fingerprint,
+    })
+}
+
+fn summarize_argument(argument: &str) -> String {
+    if let Some((name, _)) = argument.split_once('=')
+        && name.starts_with("--")
+        && name[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return format!("{name}=[value hidden]");
+    }
+    if argument.starts_with("--")
+        && argument[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return argument.to_owned();
+    }
+    "[value hidden]".to_owned()
+}
+
+fn executable_identity(command: &str) -> Result<String, KubeconfigImportError> {
+    let Some(path) = resolve_executable_path(command) else {
+        return Ok(format!("missing:{command}"));
+    };
+    let path = fs::canonicalize(&path).unwrap_or(path);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(format!("missing:{}", path.to_string_lossy()));
+        }
+        Err(_) => return Err(KubeconfigImportError::ExecExecutableUnreadable),
+    };
+    if !metadata.is_file() {
+        return Ok(format!("not-file:{}", path.to_string_lossy()));
+    }
+    if metadata.len() > MAX_EXECUTABLE_FINGERPRINT_BYTES {
+        return Err(KubeconfigImportError::ExecExecutableTooLarge);
+    }
+    let mut file = File::open(&path).map_err(|_| KubeconfigImportError::ExecExecutableUnreadable)?;
+    let mut digest = Sha256::new();
+    let mut bytes_read = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| KubeconfigImportError::ExecExecutableUnreadable)?;
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(count as u64);
+        if bytes_read > MAX_EXECUTABLE_FINGERPRINT_BYTES {
+            return Err(KubeconfigImportError::ExecExecutableTooLarge);
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!(
+        "{}:{}:{}",
+        path.to_string_lossy(),
+        bytes_read,
+        encode_hex(&digest.finalize())
+    ))
+}
+
+fn resolve_executable_path(command: &str) -> Option<PathBuf> {
+    let requested = Path::new(command);
+    if requested.is_absolute() || requested.components().count() > 1 {
+        return Some(requested.to_owned());
+    }
+    let search_paths = env::var_os("PATH")?;
+    for directory in env::split_paths(&search_paths) {
+        let candidate = directory.join(command);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        if candidate.extension().is_none() {
+            let extensions = env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            for extension in extensions.to_string_lossy().split(';') {
+                let extension = extension.trim_start_matches('.');
+                let candidate = candidate.with_extension(extension);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn fingerprint_parts(parts: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    encode_hex(&digest.finalize())
+}
+
+fn is_safe_environment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedContext {
     name: ContextName,
     cluster_name: String,
     api_server: String,
     default_namespace: NamespaceName,
     connection: ConnectionIdentity,
+    exec_plugin: Option<ExecPluginSummary>,
 }
 
 impl ImportedContext {
@@ -161,6 +379,10 @@ impl ImportedContext {
 
     pub(crate) fn connection_identity(&self) -> &ConnectionIdentity {
         &self.connection
+    }
+
+    pub fn exec_plugin(&self) -> Option<&ExecPluginSummary> {
+        self.exec_plugin.as_ref()
     }
 }
 
@@ -314,6 +536,7 @@ impl ImportedKubeconfig {
 
             let certificate_authority_fingerprint =
                 certificate_authority_fingerprint(cluster)?;
+            let mut exec_plugin = None;
             let authentication_reference = match context.user.as_deref() {
                 Some(user_name) => {
                     let named_user = kubeconfig
@@ -326,7 +549,19 @@ impl ImportedKubeconfig {
                         .as_ref()
                         .ok_or(KubeconfigImportError::MissingUserReference)?;
                     validate_auth_references(auth_info)?;
-                    Some(opaque_auth_reference(&source_path, user_name))
+                    if let Some(exec) = &auth_info.exec {
+                        let summary = summarize_exec_plugin(
+                            &source_path,
+                            name.as_str(),
+                            user_name,
+                            exec,
+                        )?;
+                        let fingerprint = summary.trust_fingerprint.clone();
+                        exec_plugin = Some(summary);
+                        Some(fingerprint)
+                    } else {
+                        Some(opaque_auth_reference(&source_path, user_name))
+                    }
                 }
                 None => None,
             };
@@ -348,6 +583,7 @@ impl ImportedKubeconfig {
                 api_server: api_server.to_owned(),
                 default_namespace,
                 connection: ConnectionIdentity::new(ClusterKey::generate(), fingerprint),
+                exec_plugin,
             });
         }
 
@@ -621,6 +857,78 @@ mod tests {
             imported.load_raw_for_connection("production"),
             Err(KubeconfigImportError::ConfigChangedSinceImport)
         ));
+    }
+
+    #[test]
+    fn exec_summary_redacts_values_and_configuration_changes_rotate_trust_key() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        let original = kubeconfig_yaml().replace(
+            &format!("    token: {TOKEN}\n"),
+            "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: /usr/local/bin/credential-helper\n      args:\n      - --profile\n      - ARG_SECRET_VALUE\n      env:\n      - name: CLOUD_PROFILE\n        value: ENV_SECRET_VALUE\n      interactiveMode: Never\n",
+        );
+        fs::write(&path, &original).unwrap();
+        let imported = ImportedKubeconfig::import_path(&path).unwrap();
+        let context = &imported.contexts()[0];
+        let plugin = context.exec_plugin().unwrap();
+        assert_eq!(plugin.executable(), "/usr/local/bin/credential-helper");
+        assert_eq!(plugin.api_version(), Some("client.authentication.k8s.io/v1"));
+        assert_eq!(plugin.argument_count(), 2);
+        assert_eq!(plugin.environment_names(), &["CLOUD_PROFILE"]);
+        assert_eq!(plugin.interactive_mode(), Some("Never"));
+        assert!(!format!("{plugin:?}").contains("ARG_SECRET_VALUE"));
+        assert!(!format!("{plugin:?}").contains("ENV_SECRET_VALUE"));
+        assert!(!format!("{imported:?}").contains("ARG_SECRET_VALUE"));
+        assert!(!format!("{imported:?}").contains("ENV_SECRET_VALUE"));
+
+        let first_trust_key = plugin.trust_fingerprint().to_owned();
+        let first_connection_fingerprint = context.connection_identity().fingerprint().clone();
+        fs::write(
+            &path,
+            original.replace("credential-helper", "replacement-helper"),
+        )
+        .unwrap();
+        let changed = ImportedKubeconfig::import_path(&path).unwrap();
+        let changed_context = &changed.contexts()[0];
+        assert_ne!(
+            changed_context.exec_plugin().unwrap().trust_fingerprint(),
+            first_trust_key
+        );
+        assert_ne!(
+            changed_context.connection_identity().fingerprint(),
+            &first_connection_fingerprint
+        );
+    }
+
+    #[test]
+    fn replacing_executable_at_same_path_rotates_trust_fingerprint() {
+        let directory = TempDir::new().unwrap();
+        let executable = directory.path().join("credential-helper");
+        fs::write(&executable, b"plugin version one").unwrap();
+        let command = serde_json::to_string(executable.to_str().unwrap()).unwrap();
+        let yaml = kubeconfig_yaml().replace(
+            &format!("    token: {TOKEN}\n"),
+            &format!(
+                "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {command}\n      interactiveMode: Never\n"
+            ),
+        );
+        let path = write_config(&directory, &yaml);
+        let initial = ImportedKubeconfig::import_path(&path).unwrap();
+        let initial_fingerprint = initial.contexts()[0]
+            .exec_plugin()
+            .unwrap()
+            .trust_fingerprint()
+            .to_owned();
+
+        fs::write(&executable, b"plugin version two").unwrap();
+        let replaced = ImportedKubeconfig::import_path(&path).unwrap();
+        assert_ne!(
+            replaced.contexts()[0]
+                .exec_plugin()
+                .unwrap()
+                .trust_fingerprint(),
+            initial_fingerprint
+        );
     }
 
     #[test]
