@@ -6,11 +6,16 @@ use crate::{
     },
     target::TargetBinding,
 };
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::{
+    api::{authorization::v1::{ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec}, core::v1::Pod},
+    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+};
 use kube::{
     Api, Client,
-    api::ListParams,
+    api::{ListParams, PostParams},
     config::{Config, ExecAuthCluster, KubeConfigOptions, Kubeconfig, KubeconfigError},
+    core::gvk::GroupVersion,
+    discovery::{self, ApiResource, Scope, verbs},
 };
 use jiff::Timestamp;
 use std::{
@@ -26,6 +31,12 @@ const MAX_CONNECT_TIMEOUT_SECONDS: u64 = 60;
 const MAX_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 const MAX_RETRY_LIMIT: u8 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const DISCOVERY_GROUPS: &[(&str, &str, &[&str])] = &[
+    ("", "v1", &["Namespace", "Pod", "Service", "Node"]),
+    ("apps", "v1", &["Deployment", "StatefulSet", "DaemonSet"]),
+    ("batch", "v1", &["Job"]),
+    ("networking.k8s.io", "v1", &["Ingress"]),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionPolicy {
@@ -96,6 +107,107 @@ impl fmt::Display for ConnectionPolicyError {
 }
 
 impl Error for ConnectionPolicyError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiResourceScope {
+    Namespaced,
+    Cluster,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiResourceDiscoveryState {
+    Served {
+        scope: ApiResourceScope,
+        list_supported: bool,
+        access: ApiResourceAccessAssessment,
+    },
+    Unsupported,
+    DiscoveryDenied,
+    Unavailable,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiResourceAccessAssessment {
+    Allowed,
+    Denied,
+    NotChecked,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiResourceCapability {
+    kind: &'static str,
+    api_group: &'static str,
+    api_version: &'static str,
+    resource: Option<ApiResource>,
+    state: ApiResourceDiscoveryState,
+}
+
+impl ApiResourceCapability {
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    pub fn api_group(&self) -> &'static str {
+        self.api_group
+    }
+
+    pub fn api_version(&self) -> &'static str {
+        self.api_version
+    }
+
+    pub fn state(&self) -> ApiResourceDiscoveryState {
+        self.state
+    }
+
+    pub fn api_resource(&self) -> Option<&ApiResource> {
+        self.resource.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiCapabilitySnapshot {
+    resources: Vec<ApiResourceCapability>,
+}
+
+impl ApiCapabilitySnapshot {
+    pub fn resources(&self) -> &[ApiResourceCapability] {
+        &self.resources
+    }
+
+    pub fn resource(&self, kind: &str) -> Option<&ApiResourceCapability> {
+        self.resources.iter().find(|resource| resource.kind == kind)
+    }
+
+    pub fn served_count(&self) -> usize {
+        self.resources
+            .iter()
+            .filter(|resource| matches!(resource.state, ApiResourceDiscoveryState::Served { .. }))
+            .count()
+    }
+
+    pub fn unsupported_count(&self) -> usize {
+        self.resources
+            .iter()
+            .filter(|resource| resource.state == ApiResourceDiscoveryState::Unsupported)
+            .count()
+    }
+
+    pub fn denied_count(&self) -> usize {
+        self.resources
+            .iter()
+            .filter(|resource| match resource.state {
+                ApiResourceDiscoveryState::DiscoveryDenied => true,
+                ApiResourceDiscoveryState::Served {
+                    access: ApiResourceAccessAssessment::Denied,
+                    ..
+                } => true,
+                _ => false,
+            })
+            .count()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionFailureKind {
@@ -311,6 +423,32 @@ impl ActiveConnection {
     pub fn attempts(&self) -> u8 {
         self.attempts
     }
+
+    pub async fn discover_capabilities(
+        &self,
+        cancellation: CancellationToken,
+        timeout: Duration,
+    ) -> Result<ApiCapabilitySnapshot, ConnectionFailure> {
+        let namespace = self
+            .target
+            .namespace_scope()
+            .single_namespace()
+            .ok_or_else(|| ConnectionFailure::new(ConnectionFailureKind::InvalidConfiguration))?
+            .as_str()
+            .to_owned();
+        let Some(runtime) = &self._runtime else {
+            return Err(ConnectionFailure::new(ConnectionFailureKind::Internal));
+        };
+        runtime
+            .spawn(discover_api_capabilities(
+                self.client.clone(),
+                namespace,
+                cancellation,
+                timeout,
+            ))
+            .await
+            .map_err(|_| ConnectionFailure::new(ConnectionFailureKind::Internal))?
+    }
 }
 
 impl fmt::Debug for ActiveConnection {
@@ -354,7 +492,12 @@ pub async fn connect(
             ConnectionFailureKind::ConfigurationChanged,
         ));
     }
-    let namespace = context.default_namespace().as_str().to_owned();
+    let namespace = target
+        .namespace_scope()
+        .single_namespace()
+        .ok_or_else(|| ConnectionFailure::new(ConnectionFailureKind::InvalidConfiguration))?
+        .as_str()
+        .to_owned();
     let exec_trust_fingerprint = context
         .exec_plugin()
         .map(|plugin| plugin.trust_fingerprint().to_owned());
@@ -429,6 +572,7 @@ async fn connect_and_probe(
     let mut config = Config::from_custom_kubeconfig(kubeconfig, &options)
         .await
         .map_err(map_config_error)?;
+    config.default_namespace = namespace.clone();
     if config.accept_invalid_certs {
         return Err(ConnectionFailure::new(
             ConnectionFailureKind::TlsVerificationDisabled,
@@ -474,6 +618,167 @@ async fn connect_and_probe(
         }
     }
     Err(ConnectionFailure::new(ConnectionFailureKind::Internal))
+}
+
+async fn discover_api_capabilities(
+    client: Client,
+    namespace: String,
+    cancellation: CancellationToken,
+    timeout: Duration,
+) -> Result<ApiCapabilitySnapshot, ConnectionFailure> {
+    let mut resources = Vec::new();
+    for &(group, version, kinds) in DISCOVERY_GROUPS {
+        if cancellation.is_cancelled() {
+            return Err(ConnectionFailure::new(ConnectionFailureKind::Cancelled));
+        }
+        let group_version = GroupVersion::gv(group, version);
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(ConnectionFailure::new(ConnectionFailureKind::Cancelled));
+            }
+            result = tokio::time::timeout(
+                timeout,
+                discovery::pinned_group(&client, &group_version),
+            ) => result,
+        };
+
+        match result {
+            Ok(Ok(api_group)) => {
+                let discovered = api_group.versioned_resources(version);
+                for kind in kinds {
+                    let found = discovered
+                        .iter()
+                        .find(|(resource, _)| resource.kind == *kind);
+                    let resource = found.map(|(resource, _)| resource.clone());
+                    let state = found
+                        .map(|(_, capabilities)| ApiResourceDiscoveryState::Served {
+                            scope: match capabilities.scope {
+                                Scope::Namespaced => ApiResourceScope::Namespaced,
+                                Scope::Cluster => ApiResourceScope::Cluster,
+                            },
+                            list_supported: capabilities.supports_operation(verbs::LIST),
+                            access: ApiResourceAccessAssessment::NotChecked,
+                        })
+                        .unwrap_or(ApiResourceDiscoveryState::Unsupported);
+                    resources.push(ApiResourceCapability {
+                        kind,
+                        api_group: group,
+                        api_version: version,
+                        resource,
+                        state,
+                    });
+                }
+            }
+            Ok(Err(kube::Error::Api(status))) if status.code == 403 => {
+                resources.extend(kinds.iter().map(|kind| ApiResourceCapability {
+                    kind,
+                    api_group: group,
+                    api_version: version,
+                    resource: None,
+                    state: ApiResourceDiscoveryState::DiscoveryDenied,
+                }));
+            }
+            Ok(Err(kube::Error::Api(status))) if status.code == 404 => {
+                resources.extend(kinds.iter().map(|kind| ApiResourceCapability {
+                    kind,
+                    api_group: group,
+                    api_version: version,
+                    resource: None,
+                    state: ApiResourceDiscoveryState::Unsupported,
+                }));
+            }
+            Ok(Err(error)) => {
+                let failure = classify_kube_error(&error);
+                let state = match failure.kind() {
+                    ConnectionFailureKind::PermissionDenied => {
+                        ApiResourceDiscoveryState::DiscoveryDenied
+                    }
+                    ConnectionFailureKind::TimedOut => ApiResourceDiscoveryState::TimedOut,
+                    _ => ApiResourceDiscoveryState::Unavailable,
+                };
+                resources.extend(kinds.iter().map(|kind| ApiResourceCapability {
+                    kind,
+                    api_group: group,
+                    api_version: version,
+                    resource: None,
+                    state,
+                }));
+            }
+            Err(_) => {
+                resources.extend(kinds.iter().map(|kind| ApiResourceCapability {
+                    kind,
+                    api_group: group,
+                    api_version: version,
+                    resource: None,
+                    state: ApiResourceDiscoveryState::TimedOut,
+                }));
+            }
+        }
+    }
+    let reviews: Api<SelfSubjectAccessReview> = Api::all(client.clone());
+    let review_params = PostParams::default();
+    for capability in &mut resources {
+        let ApiResourceDiscoveryState::Served {
+            scope,
+            list_supported: true,
+            access: ApiResourceAccessAssessment::NotChecked,
+        } = capability.state
+        else {
+            continue;
+        };
+        let Some(resource) = capability.resource.as_ref() else {
+            capability.state = ApiResourceDiscoveryState::Served {
+                scope,
+                list_supported: true,
+                access: ApiResourceAccessAssessment::Unavailable,
+            };
+            continue;
+        };
+        let review = SelfSubjectAccessReview {
+            metadata: ObjectMeta::default(),
+            spec: SelfSubjectAccessReviewSpec {
+                resource_attributes: Some(ResourceAttributes {
+                    group: Some(resource.group.clone()),
+                    version: Some(resource.version.clone()),
+                    resource: Some(resource.plural.clone()),
+                    namespace: match scope {
+                        ApiResourceScope::Namespaced => Some(namespace.clone()),
+                        ApiResourceScope::Cluster => None,
+                    },
+                    verb: Some("list".to_owned()),
+                    ..ResourceAttributes::default()
+                }),
+                ..SelfSubjectAccessReviewSpec::default()
+            },
+            ..SelfSubjectAccessReview::default()
+        };
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(ConnectionFailure::new(ConnectionFailureKind::Cancelled));
+            }
+            result = tokio::time::timeout(timeout, reviews.create(&review_params, &review)) => result,
+        };
+        let access = match result {
+            Ok(Ok(review)) => assess_access_review(review.status.as_ref()),
+            Ok(Err(_)) | Err(_) => ApiResourceAccessAssessment::Unavailable,
+        };
+        capability.state = ApiResourceDiscoveryState::Served {
+            scope,
+            list_supported: true,
+            access,
+        };
+    }
+    Ok(ApiCapabilitySnapshot { resources })
+}
+
+fn assess_access_review(
+    status: Option<&k8s_openapi::api::authorization::v1::SubjectAccessReviewStatus>,
+) -> ApiResourceAccessAssessment {
+    match status {
+        Some(status) if status.allowed => ApiResourceAccessAssessment::Allowed,
+        Some(status) if status.denied == Some(true) => ApiResourceAccessAssessment::Denied,
+        Some(_) | None => ApiResourceAccessAssessment::Unavailable,
+    }
 }
 
 fn ensure_auth_requires_no_untrusted_plugin(
@@ -741,7 +1046,6 @@ mod tests {
     use tempfile::TempDir;
 
     const TEST_TOKEN: &str = "CONNECTION_TEST_TOKEN_NEVER_LOG";
-    const POD_LIST: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"1"},"items":[]}"#;
 
     struct MockApi {
         address: String,
@@ -766,14 +1070,15 @@ mod tests {
                         return;
                     };
                     let request = read_request(&mut stream);
-                    captured.lock().unwrap().push(request);
+                    captured.lock().unwrap().push(request.clone());
                     if !response_delay.is_zero() {
                         thread::sleep(response_delay);
                     }
                     let body = match status {
-                        200 => POD_LIST,
+                        200 => mock_success_body(&request),
                         401 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Unauthorized","message":"expired token detail","code":401}"#,
                         403 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","message":"permission denied","code":403}"#,
+                        404 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"api version unavailable","code":404}"#,
                         _ => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"ServiceUnavailable","message":"temporary failure","code":503}"#,
                     };
                     let response = format!(
@@ -821,6 +1126,25 @@ mod tests {
         String::from_utf8_lossy(&request).into_owned()
     }
 
+    fn mock_success_body(request: &str) -> &'static str {
+        const CORE: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"namespaces","singularName":"","namespaced":false,"kind":"Namespace","verbs":["get","list"]},{"name":"pods","singularName":"","namespaced":true,"kind":"Pod","verbs":["get","list"]},{"name":"services","singularName":"","namespaced":true,"kind":"Service","verbs":["get","list"]},{"name":"nodes","singularName":"","namespaced":false,"kind":"Node","verbs":["get","list"]}]}"#;
+        const NETWORKING: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"networking.k8s.io/v1","resources":[{"name":"ingresses","singularName":"","namespaced":true,"kind":"Ingress","verbs":["get","list"]}]}"#;
+        const ACCESS_REVIEW: &str = r#"{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","metadata":{},"spec":{},"status":{"allowed":true,"denied":false}}"#;
+        const PODS: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"1"},"items":[]}"#;
+        let request_target = request.split_whitespace().nth(1).unwrap_or_default();
+        let path_start = request_target.find("/api").unwrap_or(0);
+        let path = request_target[path_start..]
+            .split('?')
+            .next()
+            .unwrap_or_default();
+        match path {
+            "/api/v1" => CORE,
+            "/apis/networking.k8s.io/v1" => NETWORKING,
+            "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" => ACCESS_REVIEW,
+            _ => PODS,
+        }
+    }
+
     fn config_file(directory: &TempDir, api_server: &str, auth: &str) -> PathBuf {
         let path = directory.path().join("config");
         let yaml = format!(
@@ -837,6 +1161,18 @@ mod tests {
         let imported = ImportedKubeconfig::import_path(path).unwrap();
         let mut sessions = crate::target::SessionRegistry::default();
         let target = imported.select_context("local", &mut sessions).unwrap();
+        (imported, target)
+    }
+
+    fn imported_target_in_namespace(
+        path: &PathBuf,
+        namespace: &str,
+    ) -> (ImportedKubeconfig, TargetBinding) {
+        let imported = ImportedKubeconfig::import_path(path).unwrap();
+        let mut sessions = crate::target::SessionRegistry::default();
+        let target = imported
+            .select_context_in_namespace("local", namespace, &mut sessions)
+            .unwrap();
         (imported, target)
     }
 
@@ -889,6 +1225,119 @@ mod tests {
         assert!(requests[0].to_ascii_lowercase().contains(&format!(
             "authorization: bearer {TEST_TOKEN}"
         ).to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn explicit_namespace_override_constrains_probe_request() {
+        let mock = MockApi::start(&[200]);
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target_in_namespace(&path, "team-a");
+
+        let connected = run_connect(imported, target.clone(), policy(0)).unwrap();
+        assert_eq!(
+            connected
+                .target()
+                .namespace_scope()
+                .single_namespace()
+                .unwrap()
+                .as_str(),
+            "team-a"
+        );
+        let requests = mock.requests();
+        mock.join();
+        assert!(requests[0].contains("/api/v1/namespaces/team-a/pods"));
+    }
+
+    #[test]
+    fn discovery_preserves_supported_unsupported_and_forbidden_group_states() {
+        let mock = MockApi::start(&[200, 200, 403, 404, 200, 200, 200, 200, 200, 200]);
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target(&path);
+        let connection = run_connect(imported, target, policy(0)).unwrap();
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let capabilities = runtime
+            .block_on(connection.discover_capabilities(
+                CancellationToken::new(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+
+        let node = capabilities.resource("Node").unwrap();
+        assert_eq!(
+            node.state(),
+            ApiResourceDiscoveryState::Served {
+                scope: ApiResourceScope::Cluster,
+                list_supported: true,
+                access: ApiResourceAccessAssessment::Allowed,
+            }
+        );
+        assert_eq!(
+            capabilities.resource("Deployment").unwrap().state(),
+            ApiResourceDiscoveryState::DiscoveryDenied
+        );
+        assert_eq!(
+            capabilities.resource("Job").unwrap().state(),
+            ApiResourceDiscoveryState::Unsupported
+        );
+        assert_eq!(
+            capabilities.resource("Ingress").unwrap().state(),
+            ApiResourceDiscoveryState::Served {
+                scope: ApiResourceScope::Namespaced,
+                list_supported: true,
+                access: ApiResourceAccessAssessment::Allowed,
+            }
+        );
+        assert_eq!(capabilities.served_count(), 5);
+        assert_eq!(capabilities.denied_count(), 3);
+        assert_eq!(capabilities.unsupported_count(), 1);
+
+        let requests = mock.requests();
+        mock.join();
+        assert_eq!(requests.len(), 10);
+        assert!(requests[0].contains("/api/v1/namespaces/payments/pods"));
+        assert!(requests[1].contains("/api/v1"));
+        assert!(requests[2].contains("/apis/apps/v1"));
+        assert!(requests[3].contains("/apis/batch/v1"));
+        assert!(requests[4].contains("/apis/networking.k8s.io/v1"));
+        assert!(requests[5..]
+            .iter()
+            .all(|request| request.contains("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews")));
+    }
+
+    #[test]
+    fn ssar_precheck_distinguishes_allowed_denied_and_unknown() {
+        use k8s_openapi::api::authorization::v1::SubjectAccessReviewStatus;
+
+        assert_eq!(
+            assess_access_review(Some(&SubjectAccessReviewStatus {
+                allowed: true,
+                denied: Some(false),
+                ..SubjectAccessReviewStatus::default()
+            })),
+            ApiResourceAccessAssessment::Allowed
+        );
+        assert_eq!(
+            assess_access_review(Some(&SubjectAccessReviewStatus {
+                allowed: false,
+                denied: Some(true),
+                ..SubjectAccessReviewStatus::default()
+            })),
+            ApiResourceAccessAssessment::Denied
+        );
+        assert_eq!(
+            assess_access_review(Some(&SubjectAccessReviewStatus::default())),
+            ApiResourceAccessAssessment::Unavailable
+        );
     }
 
     #[test]

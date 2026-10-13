@@ -22,7 +22,10 @@ use std::{
 };
 
 use crate::{simulated_data::SimulatedSnapshot, simulation::{self, SimulatedTaskMessage, SimulatedTaskMode}};
-use crate::connection::{self, ActiveConnection, ConnectionFailure, ConnectionPolicy};
+use crate::connection::{
+    self, ActiveConnection, ApiCapabilitySnapshot, ApiResourceDiscoveryState, ConnectionFailure,
+    ConnectionPolicy,
+};
 use crate::kubeconfig::{ExecPluginSummary, ImportedKubeconfig, KubeconfigImportError};
 use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
 use crate::target::{ContextName, SessionRegistry};
@@ -99,6 +102,7 @@ pub(crate) struct Workbench {
     search_input: Entity<InputState>,
     palette_input: Entity<InputState>,
     kubeconfig_path_input: Entity<InputState>,
+    namespace_override_input: Entity<InputState>,
     panel_focus_handles: Vec<(PanelKind, FocusHandle)>,
     settings_store: Option<SettingsStore>,
     settings: SettingsDocument,
@@ -115,6 +119,7 @@ enum KubeconfigImportSource {
 #[derive(Clone)]
 struct ExecTrustPrompt {
     context_name: String,
+    namespace_override: Option<String>,
     plugin: ExecPluginSummary,
 }
 
@@ -177,6 +182,7 @@ pub struct AxiomLensPrototype {
     search_input: Entity<InputState>,
     palette_input: Entity<InputState>,
     kubeconfig_path_input: Entity<InputState>,
+    namespace_override_input: Entity<InputState>,
     panel_focus_handles: Vec<(PanelKind, FocusHandle)>,
     focus_handle: FocusHandle,
     palette_open: bool,
@@ -188,11 +194,13 @@ pub struct AxiomLensPrototype {
     kubeconfig_import_error: Option<SharedString>,
     imported_kubeconfig: Option<ImportedKubeconfig>,
     selected_context_name: Option<ContextName>,
+    selected_namespace: Option<String>,
     exec_trust_prompt: Option<ExecTrustPrompt>,
     exec_trust_saving: bool,
     exec_trust_error: Option<SharedString>,
     session_registry: SessionRegistry,
     connection_view_state: ConnectionViewState,
+    resource_capabilities: Option<ApiCapabilitySnapshot>,
     _active_connection: Option<ActiveConnection>,
     previous_focus: Option<FocusHandle>,
     theme_mode: ThemeMode,
@@ -216,6 +224,7 @@ impl AxiomLensPrototype {
             search_input,
             palette_input,
             kubeconfig_path_input,
+            namespace_override_input,
             panel_focus_handles,
             settings_store,
             settings,
@@ -255,6 +264,7 @@ impl AxiomLensPrototype {
             search_input,
             palette_input,
             kubeconfig_path_input,
+            namespace_override_input,
             panel_focus_handles,
             focus_handle: cx.focus_handle(),
             palette_open: false,
@@ -266,11 +276,13 @@ impl AxiomLensPrototype {
             kubeconfig_import_error: None,
             imported_kubeconfig: None,
             selected_context_name: None,
+            selected_namespace: None,
             exec_trust_prompt: None,
             exec_trust_saving: false,
             exec_trust_error: None,
             session_registry: SessionRegistry::default(),
             connection_view_state: ConnectionViewState::Disconnected,
+            resource_capabilities: None,
             _active_connection: None,
             previous_focus: None,
             theme_mode,
@@ -472,6 +484,7 @@ impl AxiomLensPrototype {
                         app.cancel_active_session();
                         app.imported_kubeconfig = Some(imported);
                         app.selected_context_name = None;
+                        app.selected_namespace = None;
                         app.exec_trust_prompt = None;
                         app.exec_trust_error = None;
                         app.kubeconfig_import_error = None;
@@ -488,7 +501,12 @@ impl AxiomLensPrototype {
         .detach();
     }
 
-    fn select_kubeconfig_context(&mut self, name: String, cx: &mut Context<Self>) {
+    fn select_kubeconfig_context(
+        &mut self,
+        name: String,
+        namespace_override: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.exec_trust_saving {
             return;
         }
@@ -510,6 +528,7 @@ impl AxiomLensPrototype {
         {
             self.exec_trust_prompt = Some(ExecTrustPrompt {
                 context_name: name,
+                namespace_override,
                 plugin,
             });
             self.exec_trust_error = None;
@@ -517,20 +536,30 @@ impl AxiomLensPrototype {
             cx.notify();
             return;
         }
-        self.complete_context_selection(name, imported, cx);
+        self.complete_context_selection(name, namespace_override, imported, cx);
     }
 
     fn complete_context_selection(
         &mut self,
         name: String,
+        namespace_override: Option<String>,
         imported: ImportedKubeconfig,
         cx: &mut Context<Self>,
     ) {
-        self.cancel_active_session();
-        self.selected_context_name = None;
-        match imported.select_context(&name, &mut self.session_registry) {
+        let selection = match namespace_override.as_deref() {
+            Some(namespace) => {
+                imported.select_context_in_namespace(&name, namespace, &mut self.session_registry)
+            }
+            None => imported.select_context(&name, &mut self.session_registry),
+        };
+        match selection {
             Ok(target) => {
+                self._active_connection = None;
                 self.selected_context_name = Some(target.context_name().clone());
+                self.selected_namespace = target
+                    .namespace_scope()
+                    .single_namespace()
+                    .map(|namespace| namespace.as_str().to_owned());
                 self.kubeconfig_selection_open = false;
                 self.exec_trust_prompt = None;
                 self.kubeconfig_import_error = None;
@@ -538,6 +567,7 @@ impl AxiomLensPrototype {
             }
             Err(error) => {
                 self.kubeconfig_import_error = Some(SharedString::from(error.to_string()));
+                self.kubeconfig_selection_open = true;
             }
         }
         cx.notify();
@@ -546,6 +576,7 @@ impl AxiomLensPrototype {
     fn cancel_active_session(&mut self) {
         self.session_registry.end_session();
         self._active_connection = None;
+        self.resource_capabilities = None;
         self.connection_view_state = ConnectionViewState::Disconnected;
     }
 
@@ -615,7 +646,12 @@ impl AxiomLensPrototype {
                         app.settings_notice = None;
                         app.exec_trust_error = None;
                         app.exec_trust_prompt = None;
-                        app.complete_context_selection(prompt.context_name, imported, cx);
+                        app.complete_context_selection(
+                            prompt.context_name,
+                            prompt.namespace_override,
+                            imported,
+                            cx,
+                        );
                     }
                     Err(_) => {
                         app.exec_trust_error = Some(SharedString::from(
@@ -637,6 +673,7 @@ impl AxiomLensPrototype {
     ) {
         self._active_connection = None;
         self.connection_view_state = ConnectionViewState::Connecting;
+        self.resource_capabilities = None;
         let Some(cancellation) = self.session_registry.cancellation_for(&target) else {
             self.connection_view_state = ConnectionViewState::Disconnected;
             return;
@@ -661,6 +698,7 @@ impl AxiomLensPrototype {
 
         let target_for_completion = target.clone();
         let task_cancellation = cancellation;
+        let discovery_cancellation = task_cancellation.clone();
         let trusted_exec_plugins = self.settings.trusted_exec_plugins.clone();
         let diagnostics = self.diagnostics.clone();
         let executor = cx.background_executor().clone();
@@ -668,14 +706,20 @@ impl AxiomLensPrototype {
         cx.spawn(async move |_, cx| {
             let result = executor
                 .spawn(async move {
-                    connection::connect(
+                    let connection = connection::connect(
                         imported,
                         target,
                         policy,
                         trusted_exec_plugins,
-                        task_cancellation,
+                        task_cancellation.clone(),
                     )
-                    .await
+                    .await?;
+                    let discovery_timeout =
+                        Duration::from_secs(u64::from(policy.request_timeout_seconds()));
+                    let capabilities = connection
+                        .discover_capabilities(discovery_cancellation, discovery_timeout)
+                        .await?;
+                    Ok::<_, ConnectionFailure>((connection, capabilities))
                 })
                 .await;
             if let (Some(diagnostics), Err(error)) = (&diagnostics, &result) {
@@ -687,7 +731,7 @@ impl AxiomLensPrototype {
                     None,
                 );
             }
-            if let (Some(diagnostics), Ok(connection)) = (&diagnostics, &result) {
+            if let (Some(diagnostics), Ok((connection, _))) = (&diagnostics, &result) {
                 diagnostics.record(
                     DiagnosticEvent::KubernetesConnectionSucceeded,
                     "connection",
@@ -702,10 +746,11 @@ impl AxiomLensPrototype {
                     return;
                 }
                 match result {
-                    Ok(connection) => {
+                    Ok((connection, capabilities)) => {
                         app.connection_view_state = ConnectionViewState::Connected {
                             attempts: connection.attempts(),
                         };
+                        app.resource_capabilities = Some(capabilities);
                         app._active_connection = Some(connection);
                     }
                     Err(error) => {
@@ -1261,13 +1306,112 @@ impl AxiomLensPrototype {
                                     .compact()
                                     .ghost()
                                     .on_click(cx.listener(move |app, _, _, cx| {
-                                        app.select_kubeconfig_context(selected_name.clone(), cx);
+                                        let value = app
+                                            .namespace_override_input
+                                            .read(cx)
+                                            .value()
+                                            .to_string();
+                                        let namespace_override = (!value.trim().is_empty())
+                                            .then(|| value.trim().to_owned());
+                                        app.select_kubeconfig_context(
+                                            selected_name.clone(),
+                                            namespace_override,
+                                            cx,
+                                        );
                                     })),
                             )
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let capability_rows = self
+            .resource_capabilities
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .resources()
+                    .iter()
+                    .map(|capability| {
+                        let group = if capability.api_group().is_empty() {
+                            "core"
+                        } else {
+                            capability.api_group()
+                        };
+                        let state = match capability.state() {
+                            ApiResourceDiscoveryState::Served {
+                                scope,
+                                list_supported,
+                                access,
+                            } => format!(
+                                "SERVED / {} / LIST {} / RBAC {}",
+                                match scope {
+                                    connection::ApiResourceScope::Namespaced => "NAMESPACE",
+                                    connection::ApiResourceScope::Cluster => "CLUSTER",
+                                },
+                                if list_supported { "YES" } else { "NO" },
+                                match access {
+                                    connection::ApiResourceAccessAssessment::Allowed => "ALLOWED",
+                                    connection::ApiResourceAccessAssessment::Denied => "DENIED",
+                                    connection::ApiResourceAccessAssessment::NotChecked => "NOT CHECKED",
+                                    connection::ApiResourceAccessAssessment::Unavailable => "UNAVAILABLE",
+                                }
+                            ),
+                            ApiResourceDiscoveryState::Unsupported => "UNSUPPORTED".to_owned(),
+                            ApiResourceDiscoveryState::DiscoveryDenied => {
+                                "DISCOVERY DENIED".to_owned()
+                            }
+                            ApiResourceDiscoveryState::Unavailable => "UNAVAILABLE".to_owned(),
+                            ApiResourceDiscoveryState::TimedOut => "TIMED OUT".to_owned(),
+                        };
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .h(px(22.0))
+                            .px_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_2))
+                                    .child(format!(
+                                        "{} / {}/{}",
+                                        capability.kind(),
+                                        group,
+                                        capability.api_version()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(match capability.state() {
+                                        ApiResourceDiscoveryState::Served {
+                                            access: connection::ApiResourceAccessAssessment::Allowed,
+                                            list_supported: true,
+                                            ..
+                                        } => OK,
+                                        ApiResourceDiscoveryState::DiscoveryDenied
+                                        | ApiResourceDiscoveryState::Served {
+                                            access: connection::ApiResourceAccessAssessment::Denied
+                                                | connection::ApiResourceAccessAssessment::Unavailable,
+                                            ..
+                                        }
+                                        | ApiResourceDiscoveryState::TimedOut
+                                        | ApiResourceDiscoveryState::Unavailable => WARN,
+                                        ApiResourceDiscoveryState::Unsupported
+                                        | ApiResourceDiscoveryState::Served { .. } => TEXT_5,
+                                    }))
+                                    .child(state),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let capability_hint = if self.resource_capabilities.is_some() {
+            "Discovery capability only; API authorization is enforced on each read."
+        } else {
+            "Connect to discover served APIs; no global Namespace listing is required."
+        };
         let current_context = self
             .imported_kubeconfig
             .as_ref()
@@ -1316,9 +1460,56 @@ impl AxiomLensPrototype {
                             ),
                     )
                     .child(div().h(px(1.0)).bg(rgb(BORDER)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .child(
+                                div()
+                                    .w(px(150.0))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_5))
+                                    .child("NAMESPACE OVERRIDE"),
+                            )
+                            .child(
+                                Input::new(&self.namespace_override_input)
+                                    .id("namespace-override-input")
+                                    .aria_label("Optional authorized Namespace override; blank uses the Context default")
+                                    .cleanable(true)
+                                    .appearance(false)
+                                    .bordered(true)
+                                    .flex_1(),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_5))
+                                    .child("Blank = Context default; no global scan"),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).bg(rgb(BORDER)))
                     .child(self.render_connection_policy_controls(cx))
                     .child(div().h(px(1.0)).bg(rgb(BORDER)))
-                    .child(div().h(px(320.0)).overflow_y_scrollbar().children(rows))
+                    .child(div().h(px(180.0)).overflow_y_scrollbar().children(rows))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .h(px(26.0))
+                            .px_3()
+                            .bg(rgb(BG))
+                            .child(div().text_xs().text_color(rgb(TEXT_5)).child("API CAPABILITIES")),
+                    )
+                    .child(div().h(px(200.0)).overflow_y_scrollbar().children(capability_rows))
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .child(div().text_xs().text_color(rgb(TEXT_5)).child(capability_hint)),
+                    )
                     .child(if let Some(error) = error {
                         div()
                             .px_3()
@@ -1651,7 +1842,12 @@ impl Render for AxiomLensPrototype {
             .child(topbar(
                 snapshot,
                 selected_context.map(|context| {
-                    (context.cluster_name(), context.default_namespace().as_str())
+                    (
+                        context.cluster_name(),
+                        self.selected_namespace
+                            .as_deref()
+                            .unwrap_or(context.default_namespace().as_str()),
+                    )
                 }),
                 connection_status.clone(),
                 &self.search_input,
@@ -1700,7 +1896,9 @@ impl Render for AxiomLensPrototype {
                                 "Target selected: {} / {} / {} · {}; resource panes remain simulated",
                                 context.cluster_name(),
                                 context.name().as_str(),
-                                context.default_namespace().as_str(),
+                                self.selected_namespace
+                                    .as_deref()
+                                    .unwrap_or(context.default_namespace().as_str()),
                                 connection_status
                             )),
                     ),
@@ -1713,6 +1911,7 @@ impl Render for AxiomLensPrototype {
                 .selected_context_name
                 .as_ref()
                 .map(|context| context.as_str().to_owned());
+            let retry_namespace = self.selected_namespace.clone();
             workspace.child(
                 div()
                     .id("connection-failure-notice")
@@ -1738,7 +1937,11 @@ impl Render for AxiomLensPrototype {
                             .ghost()
                             .on_click(cx.listener(move |app, _, _, cx| {
                                 if let Some(context) = retry_context.clone() {
-                                    app.select_kubeconfig_context(context, cx);
+                                    app.select_kubeconfig_context(
+                                        context,
+                                        retry_namespace.clone(),
+                                        cx,
+                                    );
                                 }
                             })),
                     ),
@@ -3703,6 +3906,7 @@ fn build_workbench_with_settings(
     let search_input = cx.new(|cx| InputState::new(window, cx));
     let palette_input = cx.new(|cx| InputState::new(window, cx));
     let kubeconfig_path_input = cx.new(|cx| InputState::new(window, cx));
+    let namespace_override_input = cx.new(|cx| InputState::new(window, cx));
 
     let sidebar = WorkspacePanel::new(
         "SidebarPanel",
@@ -3794,6 +3998,7 @@ fn build_workbench_with_settings(
         search_input,
         palette_input,
         kubeconfig_path_input,
+        namespace_override_input,
         panel_focus_handles,
         settings_store,
         settings,

@@ -203,6 +203,16 @@ impl NamespaceScope {
         matches!(self.0, NamespaceScopeKind::All)
     }
 
+    pub fn single_namespace(&self) -> Option<&NamespaceName> {
+        match &self.0 {
+            NamespaceScopeKind::Single(namespace) => Some(namespace),
+            NamespaceScopeKind::Selected(namespaces) if namespaces.len() == 1 => {
+                namespaces.first()
+            }
+            NamespaceScopeKind::Selected(_) | NamespaceScopeKind::All => None,
+        }
+    }
+
     fn contains(&self, namespace: &NamespaceName) -> bool {
         match &self.0 {
             NamespaceScopeKind::Single(selected) => selected == namespace,

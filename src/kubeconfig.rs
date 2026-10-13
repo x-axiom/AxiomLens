@@ -449,6 +449,26 @@ impl ImportedKubeconfig {
         ))
     }
 
+    pub fn select_context_in_namespace(
+        &self,
+        context_name: &str,
+        namespace: &str,
+        sessions: &mut SessionRegistry,
+    ) -> Result<TargetBinding, KubeconfigImportError> {
+        let context = self
+            .contexts
+            .iter()
+            .find(|context| context.name.as_str() == context_name)
+            .ok_or(KubeconfigImportError::UnknownContext)?;
+        let scope = NamespaceScope::single(namespace)
+            .map_err(|_| KubeconfigImportError::InvalidContextNamespace)?;
+        Ok(sessions.begin_session(
+            context.connection.clone(),
+            context.name.clone(),
+            scope,
+        ))
+    }
+
     pub(crate) fn load_raw_for_connection(
         &self,
         context_name: &str,
@@ -843,6 +863,33 @@ mod tests {
             .select_context("production", &mut sessions)
             .unwrap();
         assert_ne!(selected_again.session_id(), previous_session);
+    }
+
+    #[test]
+    fn explicit_authorized_namespace_override_stays_with_selected_target() {
+        let directory = TempDir::new().unwrap();
+        let path = write_config(&directory, &kubeconfig_yaml());
+        let imported = ImportedKubeconfig::import_path(&path).unwrap();
+        let mut sessions = SessionRegistry::default();
+
+        let selected = imported
+            .select_context_in_namespace("production", "team-a", &mut sessions)
+            .unwrap();
+
+        assert_eq!(
+            selected
+                .namespace_scope()
+                .single_namespace()
+                .unwrap()
+                .as_str(),
+            "team-a"
+        );
+        assert_eq!(sessions.current(), Some(&selected));
+        assert!(matches!(
+            imported.select_context_in_namespace("production", "Invalid_Name", &mut sessions),
+            Err(KubeconfigImportError::InvalidContextNamespace)
+        ));
+        assert_eq!(sessions.current(), Some(&selected));
     }
 
     #[test]
