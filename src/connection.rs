@@ -1,4 +1,5 @@
 use crate::{
+    cancellation::CancellationToken,
     exec_plugin::{self, ExecPluginFailureKind},
     kubeconfig::{
         ImportedKubeconfig, KubeconfigImportError, KubeconfigReferenceKind,
@@ -113,6 +114,7 @@ pub enum ConnectionFailureKind {
     ExecPluginTimedOut,
     ExecPluginInvalidOutput,
     ExecPluginInteractiveUnsupported,
+    Cancelled,
     UnsupportedAuthProvider,
     TlsVerificationDisabled,
     Internal,
@@ -151,6 +153,7 @@ impl ConnectionFailure {
             ConnectionFailureKind::ExecPluginInteractiveUnsupported => {
                 "exec_plugin_interactive_unsupported"
             }
+            ConnectionFailureKind::Cancelled => "connection_cancelled",
             ConnectionFailureKind::UnsupportedAuthProvider => "unsupported_auth_provider",
             ConnectionFailureKind::TlsVerificationDisabled => "tls_verification_disabled",
             ConnectionFailureKind::Internal => "connection_internal",
@@ -198,6 +201,7 @@ impl ConnectionFailure {
             ConnectionFailureKind::ExecPluginInteractiveUnsupported => {
                 "Authentication plugin requires interactive input not available in this flow."
             }
+            ConnectionFailureKind::Cancelled => "Connection attempt was cancelled.",
             ConnectionFailureKind::UnsupportedAuthProvider => {
                 "Context uses an authentication provider not supported by this connection flow."
             }
@@ -264,6 +268,9 @@ impl ConnectionFailure {
             ConnectionFailureKind::Internal => {
                 "Retry once; if failure continues, report the error code without sharing credentials."
             }
+            ConnectionFailureKind::Cancelled => {
+                "Selected target changed; results from the cancelled session were discarded."
+            }
         }
     }
 
@@ -288,7 +295,7 @@ impl Error for ConnectionFailure {}
 pub struct ActiveConnection {
     target: TargetBinding,
     client: Client,
-    _runtime: Runtime,
+    _runtime: Option<Runtime>,
     attempts: u8,
 }
 
@@ -316,6 +323,14 @@ impl fmt::Debug for ActiveConnection {
     }
 }
 
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        if let Some(runtime) = self._runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 /// Connect to the explicitly selected target using a read-only Pod list probe.
 /// The owned Tokio runtime keeps kube's Hyper executor available for later reads.
 pub async fn connect(
@@ -323,7 +338,11 @@ pub async fn connect(
     target: TargetBinding,
     policy: ConnectionPolicy,
     trusted_exec_plugins: BTreeSet<String>,
+    cancellation: CancellationToken,
 ) -> Result<ActiveConnection, ConnectionFailure> {
+    if cancellation.is_cancelled() {
+        return Err(ConnectionFailure::new(ConnectionFailureKind::Cancelled));
+    }
     let context_name = target.context_name().as_str().to_owned();
     let context = imported
         .contexts()
@@ -350,16 +369,22 @@ pub async fn connect(
     )?;
 
     let (sender, receiver) = tokio::sync::oneshot::channel();
+    let worker_cancellation = cancellation.clone();
     std::thread::Builder::new()
         .name("axiomlens-kubernetes-connect".to_owned())
         .spawn(move || {
-            let result = prepare_exec_credentials(
-                &mut kubeconfig,
-                &context_name,
-                exec_trust_fingerprint.as_deref(),
-                &trusted_exec_plugins,
-                policy.request_timeout,
-            );
+            let result = if worker_cancellation.is_cancelled() {
+                Err(ConnectionFailure::new(ConnectionFailureKind::Cancelled))
+            } else {
+                prepare_exec_credentials(
+                    &mut kubeconfig,
+                    &context_name,
+                    exec_trust_fingerprint.as_deref(),
+                    &trusted_exec_plugins,
+                    policy.request_timeout,
+                    &worker_cancellation,
+                )
+            };
             let outcome = result.and_then(|valid_until| Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_all()
@@ -372,11 +397,12 @@ pub async fn connect(
                         namespace,
                         policy,
                         valid_until,
+                        worker_cancellation,
                     ));
                     result.map(|(client, attempts)| ActiveConnection {
                         target,
                         client,
-                        _runtime: runtime,
+                        _runtime: Some(runtime),
                         attempts,
                     })
                 }));
@@ -394,6 +420,7 @@ async fn connect_and_probe(
     namespace: String,
     policy: ConnectionPolicy,
     valid_until: Option<Timestamp>,
+    cancellation: CancellationToken,
 ) -> Result<(Client, u8), ConnectionFailure> {
     let options = KubeConfigOptions {
         context: Some(context_name),
@@ -416,13 +443,21 @@ async fn connect_and_probe(
         .map_err(|error| classify_kube_error(&error))?
         .with_valid_until(valid_until);
     let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    let list_params = ListParams::default().limit(1);
     for attempt_index in 0..=policy.retry_limit {
+        if cancellation.is_cancelled() {
+            return Err(ConnectionFailure::new(ConnectionFailureKind::Cancelled));
+        }
         let attempt = attempt_index + 1;
-        let probe = tokio::time::timeout(
-            policy.request_timeout,
-            pods.list(&ListParams::default().limit(1)),
-        )
-        .await;
+        let probe = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(ConnectionFailure::new(ConnectionFailureKind::Cancelled));
+            }
+            probe = tokio::time::timeout(
+                policy.request_timeout,
+                pods.list(&list_params),
+            ) => probe,
+        };
         let failure = match probe {
             Ok(Ok(_)) => return Ok((client, attempt)),
             Ok(Err(error)) => classify_kube_error(&error),
@@ -431,7 +466,12 @@ async fn connect_and_probe(
         if !failure.is_retryable() || attempt_index == policy.retry_limit {
             return Err(failure);
         }
-        tokio::time::sleep(RETRY_BACKOFF * u32::from(attempt)).await;
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(ConnectionFailure::new(ConnectionFailureKind::Cancelled));
+            }
+            _ = tokio::time::sleep(RETRY_BACKOFF * u32::from(attempt)) => {}
+        }
     }
     Err(ConnectionFailure::new(ConnectionFailureKind::Internal))
 }
@@ -487,7 +527,11 @@ fn prepare_exec_credentials(
     trust_fingerprint: Option<&str>,
     trusted_exec_plugins: &std::collections::BTreeSet<String>,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<Option<Timestamp>, ConnectionFailure> {
+    if cancellation.is_cancelled() {
+        return Err(ConnectionFailure::new(ConnectionFailureKind::Cancelled));
+    }
     let context = kubeconfig
         .contexts
         .iter()
@@ -548,8 +592,14 @@ fn prepare_exec_credentials(
     } else {
         None
     };
-    let credentials = exec_plugin::execute(&exec, api_version, cluster_info.as_ref(), timeout)
-        .map_err(map_exec_plugin_error)?;
+    let credentials = exec_plugin::execute_cancellable(
+        &exec,
+        api_version,
+        cluster_info.as_ref(),
+        timeout,
+        cancellation,
+    )
+    .map_err(map_exec_plugin_error)?;
     let expiration = credentials.expiration();
     credentials.install(auth_info);
     Ok(expiration)
@@ -572,6 +622,7 @@ fn map_exec_plugin_error(error: exec_plugin::ExecPluginFailure) -> ConnectionFai
         | ExecPluginFailureKind::ConflictingCredentials
         | ExecPluginFailureKind::InvalidEnvironment => ConnectionFailureKind::ExecPluginInvalidOutput,
         ExecPluginFailureKind::ExpiredCredentials => ConnectionFailureKind::CredentialsRejected,
+        ExecPluginFailureKind::Cancelled => ConnectionFailureKind::Cancelled,
     };
     ConnectionFailure::new(kind)
 }
@@ -808,7 +859,13 @@ mod tests {
         trusted_exec_plugins: BTreeSet<String>,
     ) -> Result<ActiveConnection, ConnectionFailure> {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        runtime.block_on(connect(imported, target, policy, trusted_exec_plugins))
+        runtime.block_on(connect(
+            imported,
+            target,
+            policy,
+            trusted_exec_plugins,
+            CancellationToken::new(),
+        ))
     }
 
     #[test]
@@ -895,6 +952,43 @@ mod tests {
 
         let failure = run_connect(imported, target, short_policy).unwrap_err();
         assert_eq!(failure.kind(), ConnectionFailureKind::TimedOut);
+        assert_eq!(mock.request_count(), 1);
+        mock.join();
+    }
+
+    #[test]
+    fn cancellation_interrupts_in_flight_probe_without_retry() {
+        let mock = MockApi::start_with_delay(&[200], Duration::from_millis(500));
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target(&path);
+        let cancellation = CancellationToken::new();
+        let cancellation_for_switch = cancellation.clone();
+        let received_requests = mock.requests.clone();
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let result = runtime.block_on(async move {
+            tokio::spawn(async move {
+                loop {
+                    if !received_requests.lock().unwrap().is_empty() {
+                        cancellation_for_switch.cancel();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            connect(imported, target, policy(3), BTreeSet::new(), cancellation).await
+        });
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            ConnectionFailureKind::Cancelled
+        );
+        assert!(started.elapsed() < Duration::from_millis(400));
         assert_eq!(mock.request_count(), 1);
         mock.join();
     }

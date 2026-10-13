@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use crate::cancellation::CancellationToken;
 use jiff::Timestamp;
 use kube::config::{AuthInfo, ExecAuthCluster, ExecConfig, ExecInteractiveMode};
 use secrecy::{ExposeSecret, SecretString, zeroize::Zeroize};
@@ -28,6 +29,7 @@ pub enum ExecPluginFailureKind {
     MissingCredentials,
     ConflictingCredentials,
     ExpiredCredentials,
+    Cancelled,
     InteractiveModeUnsupported,
     InvalidEnvironment,
 }
@@ -59,6 +61,7 @@ impl ExecPluginFailure {
             ExecPluginFailureKind::MissingCredentials => "exec_missing_credentials",
             ExecPluginFailureKind::ConflictingCredentials => "exec_conflicting_credentials",
             ExecPluginFailureKind::ExpiredCredentials => "exec_expired_credentials",
+            ExecPluginFailureKind::Cancelled => "exec_cancelled",
             ExecPluginFailureKind::InteractiveModeUnsupported => "exec_interactive_unsupported",
             ExecPluginFailureKind::InvalidEnvironment => "exec_invalid_environment",
         }
@@ -77,6 +80,7 @@ impl ExecPluginFailure {
             ExecPluginFailureKind::MissingCredentials => "Authentication plugin returned no usable credentials.",
             ExecPluginFailureKind::ConflictingCredentials => "Authentication plugin returned conflicting credentials.",
             ExecPluginFailureKind::ExpiredCredentials => "Authentication plugin returned already-expired credentials.",
+            ExecPluginFailureKind::Cancelled => "Authentication plugin execution was cancelled.",
             ExecPluginFailureKind::InteractiveModeUnsupported => "Interactive authentication is unavailable in this flow.",
             ExecPluginFailureKind::InvalidEnvironment => "Authentication plugin environment configuration is invalid.",
         }
@@ -190,6 +194,25 @@ pub fn execute(
     cluster_info: Option<&ExecAuthCluster>,
     timeout: Duration,
 ) -> Result<ExecPluginCredentials, ExecPluginFailure> {
+    execute_cancellable(
+        config,
+        expected_api_version,
+        cluster_info,
+        timeout,
+        &CancellationToken::new(),
+    )
+}
+
+pub fn execute_cancellable(
+    config: &ExecConfig,
+    expected_api_version: &str,
+    cluster_info: Option<&ExecAuthCluster>,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<ExecPluginCredentials, ExecPluginFailure> {
+    if cancellation.is_cancelled() {
+        return Err(ExecPluginFailure::new(ExecPluginFailureKind::Cancelled));
+    }
     let executable = config
         .command
         .as_deref()
@@ -263,6 +286,13 @@ pub fn execute(
     let stderr_reader = spawn_output_reader(stderr);
     let deadline = Instant::now() + timeout;
     let status = loop {
+        if cancellation.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_output_reader(stdout_reader);
+            let _ = join_output_reader(stderr_reader);
+            return Err(ExecPluginFailure::new(ExecPluginFailureKind::Cancelled));
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_POLL_INTERVAL),
@@ -460,6 +490,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancellation_kills_running_plugin_promptly() {
+        let directory = TempDir::new().unwrap();
+        let command = executable(&directory, "#!/bin/sh\nexec /bin/sleep 5\n");
+        let cancellation = CancellationToken::new();
+        let worker_token = cancellation.clone();
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            execute_cancellable(
+                &config(command),
+                API_VERSION,
+                None,
+                Duration::from_secs(5),
+                &worker_token,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(80));
+        cancellation.cancel();
+        let failure = worker.join().unwrap().unwrap_err();
+        assert_eq!(failure.kind(), ExecPluginFailureKind::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn validates_exec_credential_kind_version_and_status() {
         let directory = TempDir::new().unwrap();
         let command = executable(
@@ -482,7 +537,7 @@ mod tests {
             &directory,
             "#!/bin/sh\nprintf '%s' 'PRIVATE_INVALID_PLUGIN_OUTPUT'\n",
         );
-        let failure = execute(&config(command), API_VERSION, None, Duration::from_secs(2))
+        let failure = execute(&config(command), API_VERSION, None, Duration::from_secs(10))
             .unwrap_err();
         assert_eq!(failure.kind(), ExecPluginFailureKind::InvalidOutput);
         assert!(!failure.to_string().contains("PRIVATE_INVALID_PLUGIN_OUTPUT"));

@@ -1,3 +1,4 @@
+use crate::cancellation::CancellationToken;
 use sha2::{Digest, Sha256};
 use std::{error::Error, fmt};
 use uuid::Uuid;
@@ -294,6 +295,7 @@ impl TargetBinding {
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
     current: Option<TargetBinding>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl SessionRegistry {
@@ -303,6 +305,7 @@ impl SessionRegistry {
         context_name: ContextName,
         namespace_scope: NamespaceScope,
     ) -> TargetBinding {
+        self.end_session();
         let target = TargetBinding {
             connection,
             session_id: SessionId::generate(),
@@ -310,6 +313,7 @@ impl SessionRegistry {
             namespace_scope,
         };
         self.current = Some(target.clone());
+        self.cancellation = Some(CancellationToken::new());
         target
     }
 
@@ -325,8 +329,23 @@ impl SessionRegistry {
         self.is_current(&response.target)
     }
 
+    pub fn cancellation_for(&self, target: &TargetBinding) -> Option<CancellationToken> {
+        self.is_current(target)
+            .then(|| self.cancellation.clone())
+            .flatten()
+    }
+
     pub fn end_session(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel();
+        }
         self.current = None;
+    }
+}
+
+impl Drop for SessionRegistry {
+    fn drop(&mut self) {
+        self.end_session();
     }
 }
 
@@ -616,6 +635,45 @@ mod tests {
         assert!(sessions.is_current(&new_target));
         sessions.end_session();
         assert!(!sessions.is_current(&new_target));
+    }
+
+    #[test]
+    fn replacing_or_ending_session_cancels_its_work_token() {
+        let mut sessions = SessionRegistry::default();
+        let first_target = sessions.begin_session(
+            identity("https://cluster-a.example", "keychain-ref-a"),
+            ContextName::new("prod").unwrap(),
+            NamespaceScope::single("payment-platform").unwrap(),
+        );
+        let first_cancellation = sessions.cancellation_for(&first_target).unwrap();
+        assert!(!first_cancellation.is_cancelled());
+
+        let second_target = sessions.begin_session(
+            identity("https://cluster-b.example", "keychain-ref-b"),
+            ContextName::new("prod").unwrap(),
+            NamespaceScope::single("payment-platform").unwrap(),
+        );
+        assert!(first_cancellation.is_cancelled());
+        assert!(sessions.cancellation_for(&first_target).is_none());
+        let second_cancellation = sessions.cancellation_for(&second_target).unwrap();
+
+        sessions.end_session();
+        assert!(second_cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn dropping_session_registry_cancels_current_work() {
+        let cancellation;
+        {
+            let mut sessions = SessionRegistry::default();
+            let target = sessions.begin_session(
+                identity("https://cluster-a.example", "keychain-ref-a"),
+                ContextName::new("prod").unwrap(),
+                NamespaceScope::single("payment-platform").unwrap(),
+            );
+            cancellation = sessions.cancellation_for(&target).unwrap();
+        }
+        assert!(cancellation.is_cancelled());
     }
 
     #[test]

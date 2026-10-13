@@ -444,6 +444,8 @@ impl AxiomLensPrototype {
         if self.kubeconfig_import_loading {
             return;
         }
+        self.cancel_active_session();
+        self.selected_context_name = None;
         self.kubeconfig_import_loading = true;
         self.kubeconfig_import_error = None;
         cx.notify();
@@ -467,9 +469,7 @@ impl AxiomLensPrototype {
                 app.kubeconfig_import_loading = false;
                 match result {
                     Ok(imported) => {
-                        app.session_registry.end_session();
-                        app._active_connection = None;
-                        app.connection_view_state = ConnectionViewState::Disconnected;
+                        app.cancel_active_session();
                         app.imported_kubeconfig = Some(imported);
                         app.selected_context_name = None;
                         app.exec_trust_prompt = None;
@@ -526,6 +526,8 @@ impl AxiomLensPrototype {
         imported: ImportedKubeconfig,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_active_session();
+        self.selected_context_name = None;
         match imported.select_context(&name, &mut self.session_registry) {
             Ok(target) => {
                 self.selected_context_name = Some(target.context_name().clone());
@@ -539,6 +541,12 @@ impl AxiomLensPrototype {
             }
         }
         cx.notify();
+    }
+
+    fn cancel_active_session(&mut self) {
+        self.session_registry.end_session();
+        self._active_connection = None;
+        self.connection_view_state = ConnectionViewState::Disconnected;
     }
 
     fn reject_exec_plugin_trust(&mut self, cx: &mut Context<Self>) {
@@ -629,6 +637,10 @@ impl AxiomLensPrototype {
     ) {
         self._active_connection = None;
         self.connection_view_state = ConnectionViewState::Connecting;
+        let Some(cancellation) = self.session_registry.cancellation_for(&target) else {
+            self.connection_view_state = ConnectionViewState::Disconnected;
+            return;
+        };
         let preferences = &self.settings.preferences;
         let policy = ConnectionPolicy::from_seconds(
             preferences.connect_timeout_seconds,
@@ -648,6 +660,7 @@ impl AxiomLensPrototype {
         }
 
         let target_for_completion = target.clone();
+        let task_cancellation = cancellation;
         let trusted_exec_plugins = self.settings.trusted_exec_plugins.clone();
         let diagnostics = self.diagnostics.clone();
         let executor = cx.background_executor().clone();
@@ -655,7 +668,14 @@ impl AxiomLensPrototype {
         cx.spawn(async move |_, cx| {
             let result = executor
                 .spawn(async move {
-                    connection::connect(imported, target, policy, trusted_exec_plugins).await
+                    connection::connect(
+                        imported,
+                        target,
+                        policy,
+                        trusted_exec_plugins,
+                        task_cancellation,
+                    )
+                    .await
                 })
                 .await;
             if let (Some(diagnostics), Err(error)) = (&diagnostics, &result) {
@@ -1322,13 +1342,33 @@ impl AxiomLensPrototype {
                                     .child(format!("{connection_status} · sample data only")),
                             )
                             .child(
-                                Button::new("import-another-kubeconfig")
-                                    .label("Import another")
-                                    .compact()
-                                    .ghost()
-                                    .on_click(cx.listener(|app, _, window, cx| {
-                                        app.open_kubeconfig_import(window, cx);
-                                    })),
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(if self.selected_context_name.is_some() {
+                                        div().child(
+                                            Button::new("disconnect-selected-context")
+                                                .label("Disconnect")
+                                                .compact()
+                                                .ghost()
+                                                .on_click(cx.listener(|app, _, _, cx| {
+                                                    app.cancel_active_session();
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    } else {
+                                        div()
+                                    })
+                                    .child(
+                                        Button::new("import-another-kubeconfig")
+                                            .label("Import another")
+                                            .compact()
+                                            .ghost()
+                                            .on_click(cx.listener(|app, _, window, cx| {
+                                                app.open_kubeconfig_import(window, cx);
+                                            })),
+                                    ),
                             ),
                     ),
             )
@@ -1719,6 +1759,12 @@ impl Render for AxiomLensPrototype {
         } else {
             workspace
         }
+    }
+}
+
+impl Drop for AxiomLensPrototype {
+    fn drop(&mut self) {
+        self.cancel_active_session();
     }
 }
 
