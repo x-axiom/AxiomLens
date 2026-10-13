@@ -1341,14 +1341,16 @@ impl AxiomLensPrototype {
                             ApiResourceDiscoveryState::Served {
                                 scope,
                                 list_supported,
+                                watch_supported,
                                 access,
                             } => format!(
-                                "SERVED / {} / LIST {} / RBAC {}",
+                                "SERVED / {} / LIST {} / WATCH {} / LIST RBAC {}",
                                 match scope {
                                     connection::ApiResourceScope::Namespaced => "NAMESPACE",
                                     connection::ApiResourceScope::Cluster => "CLUSTER",
                                 },
                                 if list_supported { "YES" } else { "NO" },
+                                if watch_supported { "YES" } else { "NO" },
                                 match access {
                                     connection::ApiResourceAccessAssessment::Allowed => "ALLOWED",
                                     connection::ApiResourceAccessAssessment::Denied => "DENIED",

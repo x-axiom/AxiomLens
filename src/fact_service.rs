@@ -6,11 +6,13 @@ use crate::{
     target::{CacheScope, NamespaceName, ResourceIdentity, ResourceRef, TargetBinding},
 };
 use async_channel::Receiver;
+use futures::StreamExt;
 use kube::{
     Api, Client,
     api::{DynamicObject, ListParams},
     core::gvk::GroupVersionKind,
     discovery::ApiResource,
+    runtime::watcher::{self, Event as WatchEvent},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -30,6 +32,10 @@ const DEFAULT_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_CACHE_ENTRY_BYTES: usize = 1024 * 1024;
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
 const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WATCH_PAGE_SIZE: usize = 500;
+const MAX_WATCH_RETRIES: u8 = 3;
+const WATCH_BATCH_INTERVAL: Duration = Duration::from_millis(100);
+const WATCH_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactErrorKind {
@@ -37,6 +43,8 @@ pub enum FactErrorKind {
     DiscoveryDenied,
     CapabilityUnavailable,
     ListNotSupported,
+    WatchUnsupported,
+    WatchReconnectExhausted,
     NamespaceRequired,
     NamespaceOutsideTarget,
     NamespaceOnClusterResource,
@@ -78,6 +86,8 @@ impl FactError {
             FactErrorKind::DiscoveryDenied => "discovery_denied",
             FactErrorKind::CapabilityUnavailable => "capability_unavailable",
             FactErrorKind::ListNotSupported => "resource_list_unsupported",
+            FactErrorKind::WatchUnsupported => "resource_watch_unsupported",
+            FactErrorKind::WatchReconnectExhausted => "watch_reconnect_exhausted",
             FactErrorKind::NamespaceRequired => "namespace_required",
             FactErrorKind::NamespaceOutsideTarget => "namespace_outside_target",
             FactErrorKind::NamespaceOnClusterResource => "namespace_on_cluster_resource",
@@ -106,6 +116,8 @@ impl FactError {
             FactErrorKind::DiscoveryDenied => "API discovery permission is unavailable for this resource group.",
             FactErrorKind::CapabilityUnavailable => "Resource capability could not be determined.",
             FactErrorKind::ListNotSupported => "The API does not support listing this resource.",
+            FactErrorKind::WatchUnsupported => "The API does not support watching this resource.",
+            FactErrorKind::WatchReconnectExhausted => "Watch recovery stopped after bounded retries.",
             FactErrorKind::NamespaceRequired => "Choose one authorized Namespace for this request.",
             FactErrorKind::NamespaceOutsideTarget => "Requested Namespace is outside the selected target scope.",
             FactErrorKind::NamespaceOnClusterResource => "Cluster-scoped resource cannot be queried in a Namespace.",
@@ -346,6 +358,61 @@ impl SharedFactCache {
         self.len() == 0
     }
 
+    fn mark_watch_scope_stale(
+        &self,
+        target: &TargetBinding,
+        api_resource: &ApiResource,
+        scope: ApiResourceScope,
+        namespace: Option<&str>,
+    ) {
+        let cache_scope = target.cache_scope();
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (key, entry) in &mut inner.entries {
+            if cache_key_matches_watch(key, &cache_scope, api_resource, scope, namespace) {
+                entry.expires_at = Instant::now();
+            }
+        }
+    }
+
+    fn finish_watch_snapshot(
+        &self,
+        target: &TargetBinding,
+        api_resource: &ApiResource,
+        scope: ApiResourceScope,
+        namespace: Option<&str>,
+    ) {
+        let cache_scope = target.cache_scope();
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stale_keys = inner
+            .entries
+            .iter()
+            .filter(|(key, entry)| {
+                entry.expires_at <= now
+                    && cache_key_matches_watch(
+                        key,
+                        &cache_scope,
+                        api_resource,
+                        scope,
+                        namespace,
+                    )
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in stale_keys {
+            remove_cache_entry(&mut inner, &key);
+        }
+    }
+
+    fn remove_resource(&self, target: &TargetBinding, identity: &ResourceIdentity) {
+        let key = FactCacheKey {
+            scope: target.cache_scope(),
+            identity: identity.clone(),
+        };
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        remove_cache_entry(&mut inner, &key);
+    }
+
     fn insert(&self, mut fact: ResourceFact, bytes: usize) -> ResourceFact {
         if bytes > self.config.max_entry_bytes || bytes > self.config.max_bytes {
             fact.completeness = FactCompleteness::RawDataNotCached;
@@ -392,6 +459,32 @@ impl Default for SharedFactCache {
 struct FactCacheKey {
     scope: CacheScope,
     identity: ResourceIdentity,
+}
+
+fn cache_key_matches_watch(
+    key: &FactCacheKey,
+    cache_scope: &CacheScope,
+    api_resource: &ApiResource,
+    resource_scope: ApiResourceScope,
+    namespace: Option<&str>,
+) -> bool {
+    if &key.scope != cache_scope
+        || key.identity.api_group() != api_resource.group
+        || key.identity.api_version() != api_resource.version
+        || key.identity.kind() != api_resource.kind
+    {
+        return false;
+    }
+    match resource_scope {
+        ApiResourceScope::Cluster => key.identity.namespace().is_none(),
+        ApiResourceScope::Namespaced => match namespace {
+            Some(namespace) => key
+                .identity
+                .namespace()
+                .is_some_and(|identity_namespace| identity_namespace.as_str() == namespace),
+            None => key.identity.namespace().is_some(),
+        },
+    }
 }
 
 impl PartialEq for FactCacheKey {
@@ -452,11 +545,24 @@ impl CachedRawFact {
 #[derive(Debug, Clone)]
 pub enum FactStreamEvent {
     Batch(Vec<ResourceFact>),
+    WatchBatch(Vec<FactWatchEvent>),
     Complete {
         collection_resource_version: Option<String>,
         collected_at: SystemTime,
         possibly_truncated: bool,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum FactWatchEvent {
+    SnapshotStarted,
+    ResyncStarted,
+    Applied(ResourceFact),
+    Deleted(ResourceRef),
+    SnapshotComplete {
+        last_object_resource_version: Option<String>,
+    },
+    Reconnecting { error_code: &'static str, attempt: u8 },
 }
 
 pub struct FactBatchStream {
@@ -591,6 +697,67 @@ impl ReadOnlyFactService {
         })
     }
 
+    pub fn watch_stream(
+        &self,
+        gvk: GroupVersionKind,
+        namespace: Option<String>,
+        page_size: usize,
+    ) -> Result<FactBatchStream, FactError> {
+        if page_size == 0 || page_size > MAX_WATCH_PAGE_SIZE {
+            return Err(FactError::new(FactErrorKind::InvalidLimit));
+        }
+        let capability = self
+            .capabilities
+            .resource_gvk(&gvk)
+            .ok_or(FactError::new(FactErrorKind::UnsupportedResource))?;
+        match capability.state() {
+            ApiResourceDiscoveryState::DiscoveryDenied => {
+                return Err(FactError::new(FactErrorKind::DiscoveryDenied));
+            }
+            ApiResourceDiscoveryState::Unsupported => {
+                return Err(FactError::new(FactErrorKind::UnsupportedResource));
+            }
+            ApiResourceDiscoveryState::TimedOut | ApiResourceDiscoveryState::Unavailable => {
+                return Err(FactError::new(FactErrorKind::CapabilityUnavailable));
+            }
+            ApiResourceDiscoveryState::Served { .. } => {}
+        }
+        if !capability.is_list_supported() {
+            return Err(FactError::new(FactErrorKind::ListNotSupported));
+        }
+        if !capability.is_watch_supported() {
+            return Err(FactError::new(FactErrorKind::WatchUnsupported));
+        }
+        let (api_resource, scope) = self.resolve_resource(&gvk)?;
+        let namespace = self.resolve_namespace(scope, namespace.as_deref())?;
+        let api: Api<DynamicObject> = match &namespace {
+            Some(namespace) => Api::namespaced_with(self.client.clone(), namespace, &api_resource),
+            None => Api::all_with(self.client.clone(), &api_resource),
+        };
+        let (sender, receiver) = async_channel::bounded(FACT_BATCH_CHANNEL_CAPACITY);
+        let request_cancellation = CancellationToken::new();
+        let worker_cancellation = request_cancellation.clone();
+        let service = self.clone();
+        let task = self.runtime.spawn(async move {
+            service
+                .run_watch_stream(
+                    api,
+                    page_size as u32,
+                    api_resource,
+                    scope,
+                    namespace,
+                    worker_cancellation,
+                    sender,
+                )
+                .await;
+        });
+        Ok(FactBatchStream {
+            receiver,
+            cancellation: request_cancellation,
+            task: Some(task),
+        })
+    }
+
     pub async fn get(
         &self,
         gvk: GroupVersionKind,
@@ -706,6 +873,287 @@ impl ReadOnlyFactService {
             .len();
         fact = self.cache.insert(fact, bytes);
         Ok(fact)
+    }
+
+    async fn run_watch_stream(
+        &self,
+        api: Api<DynamicObject>,
+        page_size: u32,
+        api_resource: ApiResource,
+        scope: ApiResourceScope,
+        namespace: Option<String>,
+        request_cancellation: CancellationToken,
+        sender: async_channel::Sender<Result<FactStreamEvent, FactError>>,
+    ) {
+        let mut pending = Vec::with_capacity(FACT_BATCH_SIZE);
+        let mut last_resource_version = None;
+        let mut retry_count = 0_u8;
+        let mut stream = build_watch_stream(
+            api.clone(),
+            page_size,
+            self.request_timeout.as_secs().min(295) as u32,
+        );
+        let mut flush_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + WATCH_BATCH_INTERVAL,
+            WATCH_BATCH_INTERVAL,
+        );
+        loop {
+            let next = tokio::select! {
+                _ = self.cancellation.cancelled() => return,
+                _ = request_cancellation.cancelled() => return,
+                _ = flush_timer.tick(), if !pending.is_empty() => {
+                    if !send_watch_batch(&sender, &mut pending, &self.cancellation, &request_cancellation).await {
+                        return;
+                    }
+                    continue;
+                }
+                next = stream.next() => next,
+            };
+
+            match next {
+                Some(Ok(WatchEvent::Init)) => {
+                    self.cache.mark_watch_scope_stale(
+                        &self.target,
+                        &api_resource,
+                        scope,
+                        namespace.as_deref(),
+                    );
+                    last_resource_version = None;
+                    pending.push(FactWatchEvent::SnapshotStarted);
+                }
+                Some(Ok(WatchEvent::InitApply(object))) => {
+                    match self.fact_from_watch_object(
+                        &api_resource,
+                        scope,
+                        namespace.as_deref(),
+                        object,
+                    ) {
+                        Ok((fact, resource_version)) => {
+                            last_resource_version = resource_version.or(last_resource_version);
+                            let fact = self.cache_fact(fact);
+                            pending.push(FactWatchEvent::Applied(fact));
+                        }
+                        Err(error) => {
+                            let _ = send_watch_terminal_error(
+                                &sender,
+                                &mut pending,
+                                error,
+                                &self.cancellation,
+                                &request_cancellation,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                Some(Ok(WatchEvent::InitDone)) => {
+                    self.cache.finish_watch_snapshot(
+                        &self.target,
+                        &api_resource,
+                        scope,
+                        namespace.as_deref(),
+                    );
+                    pending.push(FactWatchEvent::SnapshotComplete {
+                        last_object_resource_version: last_resource_version.clone(),
+                    });
+                }
+                Some(Ok(WatchEvent::Apply(object))) => {
+                    match self.fact_from_watch_object(
+                        &api_resource,
+                        scope,
+                        namespace.as_deref(),
+                        object,
+                    ) {
+                        Ok((fact, resource_version)) => {
+                            last_resource_version = resource_version.or(last_resource_version);
+                            pending.push(FactWatchEvent::Applied(self.cache_fact(fact)));
+                            retry_count = 0;
+                        }
+                        Err(error) => {
+                            let _ = send_watch_terminal_error(
+                                &sender,
+                                &mut pending,
+                                error,
+                                &self.cancellation,
+                                &request_cancellation,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                Some(Ok(WatchEvent::Delete(object))) => {
+                    match self.fact_from_watch_object(
+                        &api_resource,
+                        scope,
+                        namespace.as_deref(),
+                        object,
+                    ) {
+                        Ok((fact, resource_version)) => {
+                            last_resource_version = resource_version.or(last_resource_version);
+                            self.cache.remove_resource(&self.target, fact.resource.identity());
+                            pending.push(FactWatchEvent::Deleted(fact.resource));
+                            retry_count = 0;
+                        }
+                        Err(error) => {
+                            let _ = send_watch_terminal_error(
+                                &sender,
+                                &mut pending,
+                                error,
+                                &self.cancellation,
+                                &request_cancellation,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                Some(Err(error)) if watch_resource_version_expired(&error) => {
+                    self.cache.mark_watch_scope_stale(
+                        &self.target,
+                        &api_resource,
+                        scope,
+                        namespace.as_deref(),
+                    );
+                    retry_count = retry_count.saturating_add(1);
+                    if retry_count > MAX_WATCH_RETRIES {
+                        let _ = send_watch_terminal_error(
+                            &sender,
+                            &mut pending,
+                            FactError::new(FactErrorKind::WatchReconnectExhausted),
+                            &self.cancellation,
+                            &request_cancellation,
+                        )
+                        .await;
+                        return;
+                    }
+                    pending.push(FactWatchEvent::ResyncStarted);
+                    stream = build_watch_stream(
+                        api.clone(),
+                        page_size,
+                        self.request_timeout.as_secs().min(295) as u32,
+                    );
+                }
+                Some(Err(error)) => {
+                    let fact_error = map_watcher_error(&error);
+                    self.cache.mark_watch_scope_stale(
+                        &self.target,
+                        &api_resource,
+                        scope,
+                        namespace.as_deref(),
+                    );
+                    if matches!(
+                        fact_error.kind(),
+                        FactErrorKind::PermissionDenied
+                            | FactErrorKind::CredentialsRejected
+                            | FactErrorKind::WatchUnsupported
+                            | FactErrorKind::UnsupportedResource
+                    ) {
+                        let _ = send_watch_terminal_error(
+                            &sender,
+                            &mut pending,
+                            fact_error,
+                            &self.cancellation,
+                            &request_cancellation,
+                        )
+                        .await;
+                        return;
+                    }
+                    retry_count = retry_count.saturating_add(1);
+                    if retry_count > MAX_WATCH_RETRIES {
+                        let _ = send_watch_terminal_error(
+                            &sender,
+                            &mut pending,
+                            FactError::new(FactErrorKind::WatchReconnectExhausted),
+                            &self.cancellation,
+                            &request_cancellation,
+                        )
+                        .await;
+                        return;
+                    }
+                    pending.push(FactWatchEvent::Reconnecting {
+                        error_code: fact_error.error_code(),
+                        attempt: retry_count,
+                    });
+                    tokio::select! {
+                        _ = self.cancellation.cancelled() => return,
+                        _ = request_cancellation.cancelled() => return,
+                        _ = tokio::time::sleep(watch_retry_delay(retry_count)) => {}
+                    }
+                    stream = build_watch_stream(
+                        api.clone(),
+                        page_size,
+                        self.request_timeout.as_secs().min(295) as u32,
+                    );
+                }
+                None => {
+                    self.cache.mark_watch_scope_stale(
+                        &self.target,
+                        &api_resource,
+                        scope,
+                        namespace.as_deref(),
+                    );
+                    retry_count = retry_count.saturating_add(1);
+                    if retry_count > MAX_WATCH_RETRIES {
+                        let _ = send_watch_terminal_error(
+                            &sender,
+                            &mut pending,
+                            FactError::new(FactErrorKind::WatchReconnectExhausted),
+                            &self.cancellation,
+                            &request_cancellation,
+                        )
+                        .await;
+                        return;
+                    }
+                    pending.push(FactWatchEvent::Reconnecting {
+                        error_code: "watch_stream_closed",
+                        attempt: retry_count,
+                    });
+                    tokio::select! {
+                        _ = self.cancellation.cancelled() => return,
+                        _ = request_cancellation.cancelled() => return,
+                        _ = tokio::time::sleep(watch_retry_delay(retry_count)) => {}
+                    }
+                    stream = build_watch_stream(
+                        api.clone(),
+                        page_size,
+                        self.request_timeout.as_secs().min(295) as u32,
+                    );
+                }
+            }
+
+            if pending.len() >= FACT_BATCH_SIZE
+                && !send_watch_batch(&sender, &mut pending, &self.cancellation, &request_cancellation).await
+            {
+                return;
+            }
+        }
+    }
+
+    fn fact_from_watch_object(
+        &self,
+        api_resource: &ApiResource,
+        scope: ApiResourceScope,
+        namespace: Option<&str>,
+        object: DynamicObject,
+    ) -> Result<(ResourceFact, Option<String>), FactError> {
+        let resource_version = object.metadata.resource_version.clone();
+        let fact = self.make_fact(
+            api_resource,
+            scope,
+            namespace,
+            object,
+            SystemTime::now(),
+        )?;
+        Ok((fact, resource_version))
+    }
+
+    fn cache_fact(&self, mut fact: ResourceFact) -> ResourceFact {
+        let bytes = serde_json::to_vec(fact.object.as_ref())
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        fact = self.cache.insert(fact, bytes);
+        fact
     }
 
     fn resolve_resource(
@@ -833,6 +1281,99 @@ impl ReadOnlyFactService {
     }
 }
 
+fn build_watch_stream(
+    api: Api<DynamicObject>,
+    page_size: u32,
+    timeout_seconds: u32,
+) -> futures::stream::BoxStream<'static, watcher::Result<WatchEvent<DynamicObject>>> {
+    let config = watcher::Config::default()
+        .page_size(page_size)
+        .timeout(timeout_seconds);
+    Box::pin(watcher::watcher(api, config))
+}
+
+async fn send_watch_batch(
+    sender: &async_channel::Sender<Result<FactStreamEvent, FactError>>,
+    pending: &mut Vec<FactWatchEvent>,
+    session_cancellation: &CancellationToken,
+    request_cancellation: &CancellationToken,
+) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    let batch = std::mem::take(pending);
+    tokio::select! {
+        _ = session_cancellation.cancelled() => false,
+        _ = request_cancellation.cancelled() => false,
+        result = sender.send(Ok(FactStreamEvent::WatchBatch(batch))) => result.is_ok(),
+    }
+}
+
+async fn send_watch_terminal_error(
+    sender: &async_channel::Sender<Result<FactStreamEvent, FactError>>,
+    pending: &mut Vec<FactWatchEvent>,
+    error: FactError,
+    session_cancellation: &CancellationToken,
+    request_cancellation: &CancellationToken,
+) -> bool {
+    if !send_watch_batch(sender, pending, session_cancellation, request_cancellation).await {
+        return false;
+    }
+    tokio::select! {
+        _ = session_cancellation.cancelled() => false,
+        _ = request_cancellation.cancelled() => false,
+        result = sender.send(Err(error)) => result.is_ok(),
+    }
+}
+
+fn watch_resource_version_expired(error: &watcher::Error) -> bool {
+    match error {
+        watcher::Error::WatchError(status) => status.code == 410,
+        watcher::Error::InitialListFailed(error)
+        | watcher::Error::WatchStartFailed(error)
+        | watcher::Error::WatchFailed(error) => {
+            matches!(error, kube::Error::Api(status) if status.code == 410)
+        }
+        watcher::Error::NoResourceVersion => false,
+    }
+}
+
+fn watch_retry_delay(attempt: u8) -> Duration {
+    WATCH_RETRY_BACKOFF * u32::from(attempt.min(MAX_WATCH_RETRIES))
+}
+
+fn map_watcher_error(error: &watcher::Error) -> FactError {
+    match error {
+        watcher::Error::InitialListFailed(error)
+        | watcher::Error::WatchStartFailed(error)
+        | watcher::Error::WatchFailed(error) => map_api_error_ref(error),
+        watcher::Error::WatchError(status) => map_watch_status(status.code),
+        watcher::Error::NoResourceVersion => FactError::new(FactErrorKind::InvalidObject),
+    }
+}
+
+fn map_api_error_ref(error: &kube::Error) -> FactError {
+    let kind = match error {
+        kube::Error::Api(status) => return map_watch_status(status.code),
+        kube::Error::RustlsTls(_) => FactErrorKind::ApiUnavailable,
+        kube::Error::HyperError(error) => map_transport_error(error),
+        kube::Error::Service(error) => map_transport_error(error.as_ref()),
+        _ => FactErrorKind::Internal,
+    };
+    FactError::new(kind)
+}
+
+fn map_watch_status(code: u16) -> FactError {
+    FactError::new(match code {
+        401 => FactErrorKind::CredentialsRejected,
+        403 => FactErrorKind::PermissionDenied,
+        404 => FactErrorKind::WatchUnsupported,
+        408 | 504 => FactErrorKind::RequestTimedOut,
+        429 | 500..=599 => FactErrorKind::ServerUnavailable,
+        _ => FactErrorKind::Internal,
+    })
+}
+
 fn known_scope(gvk: &GroupVersionKind) -> Option<ApiResourceScope> {
     match (gvk.group.as_str(), gvk.version.as_str(), gvk.kind.as_str()) {
         ("", "v1", "Namespace" | "Node") => Some(ApiResourceScope::Cluster),
@@ -880,4 +1421,108 @@ fn map_transport_error(error: &(dyn Error + 'static)) -> FactErrorKind {
         current = error.source();
     }
     FactErrorKind::ApiUnavailable
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    #[test]
+    fn watch_batch_send_waits_for_channel_capacity() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (sender, receiver) = async_channel::bounded(1);
+            sender
+                .send(Ok(FactStreamEvent::WatchBatch(Vec::new())))
+                .await
+                .unwrap();
+            let session_cancellation = CancellationToken::new();
+            let request_cancellation = CancellationToken::new();
+            let task_sender = sender.clone();
+            let task_session_cancellation = session_cancellation.clone();
+            let task_request_cancellation = request_cancellation.clone();
+            let task = tokio::spawn(async move {
+                let mut pending = vec![FactWatchEvent::ResyncStarted];
+                send_watch_batch(
+                    &task_sender,
+                    &mut pending,
+                    &task_session_cancellation,
+                    &task_request_cancellation,
+                )
+                .await
+            });
+
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            receiver.recv().await.unwrap().unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+            assert!(matches!(
+                receiver.recv().await.unwrap(),
+                Ok(FactStreamEvent::WatchBatch(batch))
+                    if matches!(batch.as_slice(), [FactWatchEvent::ResyncStarted])
+            ));
+        });
+    }
+
+    #[test]
+    fn watch_batch_send_cancels_while_channel_is_full() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for cancel_session in [false, true] {
+                let (sender, receiver) = async_channel::bounded(1);
+                sender
+                    .send(Ok(FactStreamEvent::WatchBatch(Vec::new())))
+                    .await
+                    .unwrap();
+                let session_cancellation = CancellationToken::new();
+                let request_cancellation = CancellationToken::new();
+                let task_sender = sender.clone();
+                let task_session_cancellation = session_cancellation.clone();
+                let task_request_cancellation = request_cancellation.clone();
+                let task = tokio::spawn(async move {
+                    let mut pending = vec![FactWatchEvent::ResyncStarted];
+                    send_watch_batch(
+                        &task_sender,
+                        &mut pending,
+                        &task_session_cancellation,
+                        &task_request_cancellation,
+                    )
+                    .await
+                });
+
+                tokio::task::yield_now().await;
+                assert!(!task.is_finished());
+                if cancel_session {
+                    session_cancellation.cancel();
+                } else {
+                    request_cancellation.cancel();
+                }
+                assert!(
+                    !tokio::time::timeout(Duration::from_secs(1), task)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                );
+                assert_eq!(receiver.len(), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn watch_retry_delay_is_bounded() {
+        assert_eq!(watch_retry_delay(1), WATCH_RETRY_BACKOFF);
+        assert_eq!(watch_retry_delay(MAX_WATCH_RETRIES), WATCH_RETRY_BACKOFF * 3);
+        assert_eq!(watch_retry_delay(u8::MAX), WATCH_RETRY_BACKOFF * 3);
+    }
 }

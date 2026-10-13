@@ -120,6 +120,7 @@ pub enum ApiResourceDiscoveryState {
     Served {
         scope: ApiResourceScope,
         list_supported: bool,
+        watch_supported: bool,
         access: ApiResourceAccessAssessment,
     },
     Unsupported,
@@ -167,6 +168,16 @@ impl ApiResourceCapability {
             self.state,
             ApiResourceDiscoveryState::Served {
                 list_supported: true,
+                ..
+            }
+        )
+    }
+
+    pub fn is_watch_supported(&self) -> bool {
+        matches!(
+            self.state,
+            ApiResourceDiscoveryState::Served {
+                watch_supported: true,
                 ..
             }
         )
@@ -702,6 +713,7 @@ async fn discover_api_capabilities(
                                 Scope::Cluster => ApiResourceScope::Cluster,
                             },
                             list_supported: capabilities.supports_operation(verbs::LIST),
+                            watch_supported: capabilities.supports_operation(verbs::WATCH),
                             access: ApiResourceAccessAssessment::NotChecked,
                         })
                         .unwrap_or(ApiResourceDiscoveryState::Unsupported);
@@ -766,6 +778,7 @@ async fn discover_api_capabilities(
         let ApiResourceDiscoveryState::Served {
             scope,
             list_supported: true,
+            watch_supported,
             access: ApiResourceAccessAssessment::NotChecked,
         } = capability.state
         else {
@@ -775,6 +788,7 @@ async fn discover_api_capabilities(
             capability.state = ApiResourceDiscoveryState::Served {
                 scope,
                 list_supported: true,
+                watch_supported,
                 access: ApiResourceAccessAssessment::Unavailable,
             };
             continue;
@@ -810,6 +824,7 @@ async fn discover_api_capabilities(
         capability.state = ApiResourceDiscoveryState::Served {
             scope,
             list_supported: true,
+            watch_supported,
             access,
         };
     }
@@ -1082,7 +1097,7 @@ mod tests {
     use super::*;
     use crate::fact_service::{
         FactCacheConfig, FactCompleteness, FactErrorKind, FactFreshness, FactSource,
-        FactStreamEvent, FactStreamReceiveError, SharedFactCache,
+        FactStreamEvent, FactStreamReceiveError, FactWatchEvent, SharedFactCache,
     };
     use std::{
         fs,
@@ -1096,7 +1111,19 @@ mod tests {
 
     const TEST_TOKEN: &str = "CONNECTION_TEST_TOKEN_NEVER_LOG";
     const POD_LIST_WITH_ITEM: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-4"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-23"},"spec":{}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"worker-1","namespace":"payments","uid":"uid-pod-124","resourceVersion":"rv-24"},"spec":{}}]}"#;
+    const POD_RELIST_WITH_ITEM: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-5"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-27"},"spec":{}}]}"#;
+    const POD_FINAL_STATE_LIST: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-6"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-26"},"spec":{"nodeName":"node-2"}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"queue-2","namespace":"payments","uid":"uid-pod-125","resourceVersion":"rv-1"},"spec":{}}]}"#;
     const POD_DETAIL: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-23"},"spec":{}}"#;
+    const POD_WATCH_EVENTS: &str = concat!(
+        r#"{"type":"MODIFIED","object":{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-25"},"spec":{"nodeName":"node-1"}}}"#,
+        "\n",
+        r#"{"type":"MODIFIED","object":{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-26"},"spec":{"nodeName":"node-2"}}}"#,
+        "\n",
+        r#"{"type":"DELETED","object":{"apiVersion":"v1","kind":"Pod","metadata":{"name":"worker-1","namespace":"payments","uid":"uid-pod-124","resourceVersion":"rv-25"},"spec":{}}}"#,
+        "\n",
+        r#"{"type":"ADDED","object":{"apiVersion":"v1","kind":"Pod","metadata":{"name":"queue-2","namespace":"payments","uid":"uid-pod-125","resourceVersion":"rv-1"},"spec":{}}}"#,
+        "\n"
+    );
 
     struct MockApi {
         address: String,
@@ -1116,6 +1143,8 @@ mod tests {
             let captured = requests.clone();
             let statuses = statuses.to_vec();
             let worker = thread::spawn(move || {
+                let mut serve_relist_snapshot = false;
+                let mut serve_final_snapshot = false;
                 for status in statuses {
                     let Ok((mut stream, _)) = listener.accept() else {
                         return;
@@ -1125,18 +1154,48 @@ mod tests {
                     if !response_delay.is_zero() {
                         thread::sleep(response_delay);
                     }
+                    let watch_request = request.contains("watch=true");
                     let body = match status {
+                        200 if watch_request => POD_WATCH_EVENTS,
+                        200 if serve_relist_snapshot
+                            && request.contains("/api/v1/namespaces/payments/pods?") =>
+                        {
+                            serve_relist_snapshot = false;
+                            POD_RELIST_WITH_ITEM
+                        }
+                        200 if serve_final_snapshot
+                            && request.contains("/api/v1/namespaces/payments/pods?") =>
+                        {
+                            serve_final_snapshot = false;
+                            POD_FINAL_STATE_LIST
+                        }
                         200 => mock_success_body(&request),
                         401 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Unauthorized","message":"expired token detail","code":401}"#,
                         403 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","message":"permission denied","code":403}"#,
                         404 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"api version unavailable","code":404}"#,
+                        410 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Expired","message":"resource version expired","code":410}"#,
                         _ => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"ServiceUnavailable","message":"temporary failure","code":503}"#,
                     };
-                    let response = format!(
-                        "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
+                    let is_watch_stream = status == 200 && watch_request;
+                    let response = if is_watch_stream {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
                     let _ = stream.write_all(response.as_bytes());
+                    if is_watch_stream {
+                        let mut buffer = [0_u8; 1];
+                        let _ = stream.read(&mut buffer);
+                        serve_final_snapshot = true;
+                    }
+                    if status == 410 {
+                        serve_relist_snapshot = true;
+                    }
                 }
             });
             Self {
@@ -1178,8 +1237,8 @@ mod tests {
     }
 
     fn mock_success_body(request: &str) -> &'static str {
-        const CORE: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"namespaces","singularName":"","namespaced":false,"kind":"Namespace","verbs":["get","list"]},{"name":"pods","singularName":"","namespaced":true,"kind":"Pod","verbs":["get","list"]},{"name":"services","singularName":"","namespaced":true,"kind":"Service","verbs":["get","list"]},{"name":"nodes","singularName":"","namespaced":false,"kind":"Node","verbs":["get","list"]}]}"#;
-        const NETWORKING: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"networking.k8s.io/v1","resources":[{"name":"ingresses","singularName":"","namespaced":true,"kind":"Ingress","verbs":["get","list"]}]}"#;
+        const CORE: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"namespaces","singularName":"","namespaced":false,"kind":"Namespace","verbs":["get","list","watch"]},{"name":"pods","singularName":"","namespaced":true,"kind":"Pod","verbs":["get","list","watch"]},{"name":"services","singularName":"","namespaced":true,"kind":"Service","verbs":["get","list","watch"]},{"name":"nodes","singularName":"","namespaced":false,"kind":"Node","verbs":["get","list","watch"]}]}"#;
+        const NETWORKING: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"networking.k8s.io/v1","resources":[{"name":"ingresses","singularName":"","namespaced":true,"kind":"Ingress","verbs":["get","list","watch"]}]}"#;
         const ACCESS_REVIEW: &str = r#"{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","metadata":{},"spec":{},"status":{"allowed":true,"denied":false}}"#;
         const PODS: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"1"},"items":[]}"#;
         let request_target = request.split_whitespace().nth(1).unwrap_or_default();
@@ -1257,6 +1316,27 @@ mod tests {
         ))
     }
 
+    fn connection_with_discovery(
+        mock: &MockApi,
+    ) -> (ActiveConnection, TargetBinding, Runtime, ApiCapabilitySnapshot) {
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target(&path);
+        let connection = run_connect(imported, target.clone(), policy(0)).unwrap();
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let capabilities = runtime
+            .block_on(connection.discover_capabilities(
+                CancellationToken::new(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+        (connection, target, runtime, capabilities)
+    }
+
     #[test]
     fn valid_bearer_token_connects_with_read_only_namespace_probe() {
         let mock = MockApi::start(&[200]);
@@ -1331,6 +1411,7 @@ mod tests {
             ApiResourceDiscoveryState::Served {
                 scope: ApiResourceScope::Cluster,
                 list_supported: true,
+                watch_supported: true,
                 access: ApiResourceAccessAssessment::Allowed,
             }
         );
@@ -1347,6 +1428,7 @@ mod tests {
             ApiResourceDiscoveryState::Served {
                 scope: ApiResourceScope::Namespaced,
                 list_supported: true,
+                watch_supported: true,
                 access: ApiResourceAccessAssessment::Allowed,
             }
         );
@@ -1400,6 +1482,7 @@ mod tests {
             loop {
                 match stream.recv().await.unwrap() {
                     FactStreamEvent::Batch(batch) => facts.extend(batch),
+                    FactStreamEvent::WatchBatch(_) => panic!("list stream must not emit watch batches"),
                     FactStreamEvent::Complete {
                         collection_resource_version,
                         possibly_truncated,
@@ -1461,6 +1544,407 @@ mod tests {
             "{requests:?}"
         );
         assert!(requests[11].contains("/api/v1/namespaces/payments/pods/api-0"));
+    }
+
+    #[test]
+    fn watch_batches_snapshot_and_merges_duplicate_updates_and_deletes() {
+        let mock = MockApi::start(&[200; 12]);
+        let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
+        let cache = SharedFactCache::default();
+        let service = connection
+            .read_only_facts(capabilities, cache.clone())
+            .unwrap();
+        let stream = service
+            .watch_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
+            .unwrap();
+
+        let events = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut events = Vec::new();
+                loop {
+                    match stream.recv().await.unwrap() {
+                        FactStreamEvent::WatchBatch(batch) => events.extend(batch),
+                        _ => panic!("watch stream must emit watch batches"),
+                    }
+                    let saw_queue_pod = events.iter().any(|event| {
+                        matches!(event, FactWatchEvent::Applied(fact)
+                            if fact.resource().identity().uid() == "uid-pod-125")
+                    });
+                    let saw_worker_delete = events.iter().any(|event| {
+                        matches!(event, FactWatchEvent::Deleted(resource)
+                            if resource.identity().uid() == "uid-pod-124")
+                    });
+                    if saw_queue_pod && saw_worker_delete {
+                        break events;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        });
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, FactWatchEvent::SnapshotStarted)));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            FactWatchEvent::SnapshotComplete {
+                last_object_resource_version: Some(version)
+            } if version == "rv-24"
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, FactWatchEvent::Applied(fact)
+                    if fact.resource().identity().uid() == "uid-pod-123"))
+                .count(),
+            3
+        );
+        assert_eq!(cache.len(), 2);
+
+        let stale_deleted_reference = events
+            .iter()
+            .find_map(|event| match event {
+                FactWatchEvent::Applied(fact)
+                    if fact.resource().identity().uid() == "uid-pod-124" =>
+                {
+                    fact.raw_reference().cloned()
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            cache.read_raw(&target, &stale_deleted_reference),
+            Err(error) if error.kind() == FactErrorKind::RawReferenceExpired
+        ));
+
+        let latest_api_pod = events
+            .iter()
+            .filter_map(|event| match event {
+                FactWatchEvent::Applied(fact)
+                    if fact.resource().identity().uid() == "uid-pod-123" =>
+                {
+                    Some(fact)
+                }
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        let latest_reference = latest_api_pod.raw_reference().unwrap();
+        let cached = cache.read_raw(&target, latest_reference).unwrap();
+        assert_eq!(cached.freshness(), FactFreshness::Fresh);
+        assert_eq!(cached.fact().resource().resource_version(), Some("rv-26"));
+
+        let mut other_sessions = crate::target::SessionRegistry::default();
+        let other_target = other_sessions.begin_session(
+            target.connection().clone(),
+            target.context_name().clone(),
+            crate::target::NamespaceScope::single("payments").unwrap(),
+        );
+        assert_eq!(
+            cache
+                .read_raw(&other_target, latest_reference)
+                .unwrap_err()
+                .kind(),
+            FactErrorKind::CacheScopeMismatch
+        );
+
+        drop(stream);
+        let requests = mock.requests();
+        mock.join();
+        assert_eq!(requests.len(), 12);
+        assert!(requests[10].contains("/api/v1/namespaces/payments/pods"));
+        assert!(requests[11].contains("watch=true"));
+    }
+
+    #[test]
+    fn watch_resource_version_expiration_relists_and_restores_fresh_facts() {
+        let mut statuses = vec![200; 11];
+        statuses.extend([410, 200, 200, 200]);
+        let mock = MockApi::start(&statuses);
+        let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
+        let cache = SharedFactCache::default();
+        let service = connection
+            .read_only_facts(capabilities, cache.clone())
+            .unwrap();
+        let stream = service
+            .watch_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
+            .unwrap();
+
+        let events = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut events = Vec::new();
+                loop {
+                    match stream.recv().await.unwrap() {
+                        FactStreamEvent::WatchBatch(batch) => events.extend(batch),
+                        _ => panic!("watch stream must emit watch batches"),
+                    }
+                    let resyncs = events
+                        .iter()
+                        .filter(|event| matches!(event, FactWatchEvent::ResyncStarted))
+                        .count();
+                    let snapshots = events
+                        .iter()
+                        .filter(|event| matches!(event, FactWatchEvent::SnapshotComplete { .. }))
+                        .count();
+                    let saw_queue_pod = events.iter().any(|event| {
+                        matches!(event, FactWatchEvent::Applied(fact)
+                            if fact.resource().identity().uid() == "uid-pod-125")
+                    });
+                    if resyncs == 1 && snapshots >= 2 && saw_queue_pod {
+                        break events;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        });
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, FactWatchEvent::ResyncStarted))
+                .count(),
+            1
+        );
+        let latest_api_pod = events
+            .iter()
+            .filter_map(|event| match event {
+                FactWatchEvent::Applied(fact)
+                    if fact.resource().identity().uid() == "uid-pod-123" =>
+                {
+                    Some(fact)
+                }
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        assert_eq!(
+            cache
+                .read_raw(&target, latest_api_pod.raw_reference().unwrap())
+                .unwrap()
+                .freshness(),
+            FactFreshness::Fresh
+        );
+        assert_eq!(cache.len(), 2);
+        let old_worker_reference = events
+            .iter()
+            .find_map(|event| match event {
+                FactWatchEvent::Applied(fact)
+                    if fact.resource().identity().uid() == "uid-pod-124" =>
+                {
+                    fact.raw_reference().cloned()
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            cache.read_raw(&target, &old_worker_reference),
+            Err(error) if error.kind() == FactErrorKind::RawReferenceExpired
+        ));
+
+        let mut watch_state = std::collections::BTreeMap::new();
+        for event in &events {
+            match event {
+                FactWatchEvent::SnapshotStarted => watch_state.clear(),
+                FactWatchEvent::Applied(fact) => {
+                    watch_state.insert(
+                        fact.resource().identity().uid().to_owned(),
+                        fact.resource().resource_version().map(str::to_owned),
+                    );
+                }
+                FactWatchEvent::Deleted(resource) => {
+                    watch_state.remove(resource.identity().uid());
+                }
+                _ => {}
+            }
+        }
+        drop(stream);
+
+        let list_stream = service
+            .list_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
+            .unwrap();
+        let independent_facts = runtime.block_on(async {
+            let mut facts = Vec::new();
+            loop {
+                match list_stream.recv().await.unwrap() {
+                    FactStreamEvent::Batch(batch) => facts.extend(batch),
+                    FactStreamEvent::Complete { .. } => break facts,
+                    FactStreamEvent::WatchBatch(_) => {
+                        panic!("independent list must not emit watch batches")
+                    }
+                }
+            }
+        });
+        let independent_state = independent_facts
+            .iter()
+            .map(|fact| {
+                (
+                    fact.resource().identity().uid().to_owned(),
+                    fact.resource().resource_version().map(str::to_owned),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(watch_state, independent_state);
+
+        let requests = mock.requests();
+        mock.join();
+        assert_eq!(requests.len(), 15);
+        assert!(requests[11].contains("watch=true"));
+        assert!(requests[12].contains("/api/v1/namespaces/payments/pods?&limit=10"));
+        assert!(requests[13].contains("watch=true"), "request 13 must restart Watch");
+        assert!(requests[14].contains("/api/v1/namespaces/payments/pods?&limit=10"));
+    }
+
+    #[test]
+    fn watch_bounds_repeated_resource_version_relists() {
+        let mut statuses = vec![200; 11];
+        statuses.extend([410, 200, 410, 200, 410, 200, 410]);
+        let mock = MockApi::start(&statuses);
+        let (connection, _target, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let stream = service
+            .watch_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
+            .unwrap();
+
+        let (error_kind, resync_count) = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut resync_count = 0;
+                loop {
+                    match stream.recv().await {
+                        Ok(FactStreamEvent::WatchBatch(batch)) => {
+                            resync_count += batch
+                                .iter()
+                                .filter(|event| matches!(event, FactWatchEvent::ResyncStarted))
+                                .count();
+                        }
+                        Ok(_) => panic!("watch stream must emit watch batches"),
+                        Err(FactStreamReceiveError::Service(error)) => {
+                            break (error.kind(), resync_count);
+                        }
+                        Err(FactStreamReceiveError::Closed) => {
+                            panic!("watch stream closed without a service error")
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        });
+
+        assert_eq!(error_kind, FactErrorKind::WatchReconnectExhausted);
+        assert_eq!(resync_count, 3);
+        assert_eq!(mock.request_count(), 18);
+        mock.join();
+    }
+
+    fn watch_error_for_status(status: u16) -> (FactErrorKind, bool, usize) {
+        let mut statuses = vec![200; 11];
+        statuses.push(status);
+        let mock = MockApi::start(&statuses);
+        let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
+        let cache = SharedFactCache::default();
+        let service = connection
+            .read_only_facts(capabilities, cache.clone())
+            .unwrap();
+        let stream = service
+            .watch_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
+            .unwrap();
+
+        let (kind, raw_reference) = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut raw_reference = None;
+                loop {
+                    match stream.recv().await {
+                        Ok(FactStreamEvent::WatchBatch(batch)) => {
+                            for event in batch {
+                                if let FactWatchEvent::Applied(fact) = event {
+                                    raw_reference.get_or_insert_with(|| {
+                                        fact.raw_reference().cloned().unwrap()
+                                    });
+                                }
+                            }
+                        }
+                        Ok(_) => panic!("watch stream must emit watch batches"),
+                        Err(FactStreamReceiveError::Service(error)) => {
+                            break (error.kind(), raw_reference);
+                        }
+                        Err(FactStreamReceiveError::Closed) => {
+                            panic!("watch stream closed without a service error")
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        });
+        let cache_is_stale = raw_reference.is_some_and(|reference| {
+            cache
+                .read_raw(&target, &reference)
+                .is_ok_and(|cached| cached.freshness() == FactFreshness::Stale)
+        });
+        drop(stream);
+        let request_count = mock.request_count();
+        mock.join();
+        (kind, cache_is_stale, request_count)
+    }
+
+    #[test]
+    fn watch_permission_and_api_limitations_are_terminal_and_mark_cache_stale() {
+        assert_eq!(
+            watch_error_for_status(403),
+            (FactErrorKind::PermissionDenied, true, 12)
+        );
+        assert_eq!(
+            watch_error_for_status(404),
+            (FactErrorKind::WatchUnsupported, true, 12)
+        );
+    }
+
+    #[test]
+    fn watch_bounds_transient_retries_even_when_relist_succeeds() {
+        let mut statuses = vec![200; 11];
+        statuses.extend([503, 200, 503, 200, 503, 200, 503]);
+        let mock = MockApi::start(&statuses);
+        let (connection, _target, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let stream = service
+            .watch_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
+            .unwrap();
+
+        let (error_kind, attempts) = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut attempts = Vec::new();
+                loop {
+                    match stream.recv().await {
+                        Ok(FactStreamEvent::WatchBatch(batch)) => {
+                            attempts.extend(batch.into_iter().filter_map(|event| match event {
+                                FactWatchEvent::Reconnecting { attempt, .. } => Some(attempt),
+                                _ => None,
+                            }));
+                        }
+                        Ok(_) => panic!("watch stream must emit watch batches"),
+                        Err(FactStreamReceiveError::Service(error)) => {
+                            break (error.kind(), attempts);
+                        }
+                        Err(FactStreamReceiveError::Closed) => {
+                            panic!("watch stream closed without a service error")
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        });
+
+        assert_eq!(error_kind, FactErrorKind::WatchReconnectExhausted);
+        assert_eq!(attempts, vec![1, 2, 3]);
+        assert_eq!(mock.request_count(), 18);
+        mock.join();
     }
 
     #[test]

@@ -9,6 +9,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "directories",
+ "futures",
  "gpui-kit",
  "jiff",
  "k8s-openapi",
