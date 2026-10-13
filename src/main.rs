@@ -3,6 +3,7 @@ pub mod cancellation;
 pub mod connection;
 pub mod diagnostics;
 pub mod exec_plugin;
+pub mod fact_service;
 pub mod kubeconfig;
 mod simulated_data;
 mod simulation;

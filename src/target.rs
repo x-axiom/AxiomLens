@@ -213,6 +213,10 @@ impl NamespaceScope {
         }
     }
 
+    pub fn includes(&self, namespace: &NamespaceName) -> bool {
+        self.contains(namespace)
+    }
+
     fn contains(&self, namespace: &NamespaceName) -> bool {
         match &self.0 {
             NamespaceScopeKind::Single(selected) => selected == namespace,

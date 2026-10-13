@@ -1,6 +1,7 @@
 use crate::{
     cancellation::CancellationToken,
     exec_plugin::{self, ExecPluginFailureKind},
+    fact_service::{FactError, ReadOnlyFactService, SharedFactCache},
     kubeconfig::{
         ImportedKubeconfig, KubeconfigImportError, KubeconfigReferenceKind,
     },
@@ -14,7 +15,7 @@ use kube::{
     Api, Client,
     api::{ListParams, PostParams},
     config::{Config, ExecAuthCluster, KubeConfigOptions, Kubeconfig, KubeconfigError},
-    core::gvk::GroupVersion,
+    core::gvk::{GroupVersion, GroupVersionKind},
     discovery::{self, ApiResource, Scope, verbs},
 };
 use jiff::Timestamp;
@@ -161,6 +162,16 @@ impl ApiResourceCapability {
         self.state
     }
 
+    pub fn is_list_supported(&self) -> bool {
+        matches!(
+            self.state,
+            ApiResourceDiscoveryState::Served {
+                list_supported: true,
+                ..
+            }
+        )
+    }
+
     pub fn api_resource(&self) -> Option<&ApiResource> {
         self.resource.as_ref()
     }
@@ -178,6 +189,14 @@ impl ApiCapabilitySnapshot {
 
     pub fn resource(&self, kind: &str) -> Option<&ApiResourceCapability> {
         self.resources.iter().find(|resource| resource.kind == kind)
+    }
+
+    pub fn resource_gvk(&self, gvk: &GroupVersionKind) -> Option<&ApiResourceCapability> {
+        self.resources.iter().find(|resource| {
+            resource.kind == gvk.kind
+                && resource.api_group == gvk.group
+                && resource.api_version == gvk.version
+        })
     }
 
     pub fn served_count(&self) -> usize {
@@ -408,6 +427,8 @@ pub struct ActiveConnection {
     target: TargetBinding,
     client: Client,
     _runtime: Option<Runtime>,
+    cancellation: CancellationToken,
+    request_timeout: Duration,
     attempts: u8,
 }
 
@@ -422,6 +443,26 @@ impl ActiveConnection {
 
     pub fn attempts(&self) -> u8 {
         self.attempts
+    }
+
+    pub fn read_only_facts(
+        &self,
+        capabilities: ApiCapabilitySnapshot,
+        cache: SharedFactCache,
+    ) -> Result<ReadOnlyFactService, FactError> {
+        let runtime = self
+            ._runtime
+            .as_ref()
+            .ok_or_else(|| FactError::new(crate::fact_service::FactErrorKind::Internal))?;
+        Ok(ReadOnlyFactService::new(
+            self.client.clone(),
+            self.target.clone(),
+            capabilities,
+            self.cancellation.clone(),
+            runtime.handle().clone(),
+            cache,
+            self.request_timeout,
+        ))
     }
 
     pub async fn discover_capabilities(
@@ -534,6 +575,8 @@ pub async fn connect(
                 .build()
                 .map_err(|_| ConnectionFailure::new(ConnectionFailureKind::Internal))
                 .and_then(|runtime| {
+                            let active_cancellation = worker_cancellation.clone();
+                            let request_timeout = policy.request_timeout;
                     let result = runtime.block_on(connect_and_probe(
                         kubeconfig,
                         context_name,
@@ -546,6 +589,8 @@ pub async fn connect(
                         target,
                         client,
                         _runtime: Some(runtime),
+                        cancellation: active_cancellation,
+                        request_timeout,
                         attempts,
                     })
                 }));
@@ -1035,6 +1080,10 @@ fn classify_error_chain(error: &(dyn Error + 'static)) -> ConnectionFailureKind 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fact_service::{
+        FactCacheConfig, FactCompleteness, FactErrorKind, FactFreshness, FactSource,
+        FactStreamEvent, FactStreamReceiveError, SharedFactCache,
+    };
     use std::{
         fs,
         io::{Read, Write},
@@ -1046,6 +1095,8 @@ mod tests {
     use tempfile::TempDir;
 
     const TEST_TOKEN: &str = "CONNECTION_TEST_TOKEN_NEVER_LOG";
+    const POD_LIST_WITH_ITEM: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-4"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-23"},"spec":{}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"worker-1","namespace":"payments","uid":"uid-pod-124","resourceVersion":"rv-24"},"spec":{}}]}"#;
+    const POD_DETAIL: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-23"},"spec":{}}"#;
 
     struct MockApi {
         address: String,
@@ -1141,6 +1192,8 @@ mod tests {
             "/api/v1" => CORE,
             "/apis/networking.k8s.io/v1" => NETWORKING,
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" => ACCESS_REVIEW,
+            "/api/v1/namespaces/payments/pods" => POD_LIST_WITH_ITEM,
+            "/api/v1/namespaces/payments/pods/api-0" => POD_DETAIL,
             _ => PODS,
         }
     }
@@ -1312,6 +1365,207 @@ mod tests {
         assert!(requests[5..]
             .iter()
             .all(|request| request.contains("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews")));
+    }
+
+    #[test]
+    fn facts_service_lists_gets_and_caches_target_bound_resources() {
+        let mock = MockApi::start(&[200; 12]);
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target(&path);
+        let connection = run_connect(imported, target.clone(), policy(0)).unwrap();
+        let caller_runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let capabilities = caller_runtime
+            .block_on(connection.discover_capabilities(
+                CancellationToken::new(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+        let cache = SharedFactCache::new(
+            FactCacheConfig::new(1, 1024 * 1024, 512 * 1024, Duration::from_millis(30))
+                .unwrap(),
+        );
+        let service = connection
+            .read_only_facts(capabilities, cache.clone())
+            .unwrap();
+        let stream = service
+            .list_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
+            .unwrap();
+        let (facts, list_version, truncated) = caller_runtime.block_on(async {
+            let mut facts = Vec::new();
+            loop {
+                match stream.recv().await.unwrap() {
+                    FactStreamEvent::Batch(batch) => facts.extend(batch),
+                    FactStreamEvent::Complete {
+                        collection_resource_version,
+                        possibly_truncated,
+                        ..
+                    } => break (facts, collection_resource_version, possibly_truncated),
+                }
+            }
+        });
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(list_version.as_deref(), Some("list-rv-4"));
+        assert!(!truncated);
+        assert_eq!(facts[0].resource().identity().uid(), "uid-pod-123");
+        assert_eq!(facts[0].resource().resource_version(), Some("rv-23"));
+        assert_eq!(facts[0].completeness(), FactCompleteness::Complete);
+        assert_eq!(facts[0].source(), FactSource::ApiServer);
+        assert!(facts[0].raw_reference().is_some());
+        assert_eq!(cache.len(), 1);
+
+        let raw_reference = facts[1].raw_reference().unwrap();
+        let cached = cache.read_raw(&target, raw_reference).unwrap();
+        assert_eq!(cached.freshness(), FactFreshness::Fresh);
+        assert_eq!(cached.fact().resource().identity().uid(), "uid-pod-124");
+        assert!(matches!(
+            cache.read_raw(&target, facts[0].raw_reference().unwrap()),
+            Err(error) if error.kind() == FactErrorKind::RawReferenceExpired
+        ));
+
+        let mut other_sessions = crate::target::SessionRegistry::default();
+        let other_target = other_sessions.begin_session(
+            target.connection().clone(),
+            target.context_name().clone(),
+            crate::target::NamespaceScope::single("other-team").unwrap(),
+        );
+        assert_eq!(
+            cache.read_raw(&other_target, raw_reference).unwrap_err().kind(),
+            FactErrorKind::CacheScopeMismatch
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            cache.read_raw(&target, raw_reference).unwrap().freshness(),
+            FactFreshness::Stale
+        );
+
+        let detail = caller_runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("", "v1", "Pod"),
+                None,
+                "api-0".to_owned(),
+            ))
+            .unwrap();
+        assert_eq!(detail.resource().identity().uid(), "uid-pod-123");
+        assert_eq!(detail.source(), FactSource::ApiServer);
+
+        let requests = mock.requests();
+        mock.join();
+        assert!(
+            requests[10].contains("/api/v1/namespaces/payments/pods?&limit=10"),
+            "{requests:?}"
+        );
+        assert!(requests[11].contains("/api/v1/namespaces/payments/pods/api-0"));
+    }
+
+    #[test]
+    fn facts_service_rejects_namespace_escape_before_api_request() {
+        let mock = MockApi::start(&[200, 200, 200, 200, 200, 200, 200, 200, 200, 200]);
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target(&path);
+        let connection = run_connect(imported, target, policy(0)).unwrap();
+        let caller_runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let capabilities = caller_runtime
+            .block_on(connection.discover_capabilities(
+                CancellationToken::new(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let stream = service
+            .list_stream(
+                GroupVersionKind::gvk("", "v1", "Pod"),
+                Some("team-b".to_owned()),
+                10,
+            )
+            .unwrap();
+        let error = caller_runtime.block_on(stream.recv()).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::fact_service::FactStreamReceiveError::Service(fact_error)
+                if fact_error.kind() == FactErrorKind::NamespaceOutsideTarget
+        ));
+        assert_eq!(mock.request_count(), 10);
+        mock.join();
+    }
+
+    #[test]
+    fn facts_service_preserves_forbidden_read_as_error_not_empty_page() {
+        let mock = MockApi::start(&[200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 403]);
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target(&path);
+        let connection = run_connect(imported, target, policy(0)).unwrap();
+        let caller_runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let capabilities = caller_runtime
+            .block_on(connection.discover_capabilities(
+                CancellationToken::new(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let stream = service
+            .list_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
+            .unwrap();
+        let error = caller_runtime.block_on(stream.recv()).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::fact_service::FactStreamReceiveError::Service(fact_error)
+                if fact_error.kind() == FactErrorKind::PermissionDenied
+        ));
+        assert_eq!(mock.request_count(), 11);
+        mock.join();
+    }
+
+    #[test]
+    fn facts_service_reports_forbidden_read_instead_of_empty_success() {
+        let mock = MockApi::start(&[200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 403]);
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target(&path);
+        let connection = run_connect(imported, target, policy(0)).unwrap();
+        let caller_runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let capabilities = caller_runtime
+            .block_on(connection.discover_capabilities(
+                CancellationToken::new(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let stream = service
+            .list_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
+            .unwrap();
+        let message = caller_runtime.block_on(stream.recv());
+        assert!(matches!(
+            message,
+            Err(FactStreamReceiveError::Service(error))
+                if error.kind() == FactErrorKind::PermissionDenied
+        ));
+        mock.join();
     }
 
     #[test]
