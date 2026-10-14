@@ -702,6 +702,10 @@ impl ContainerLogStream {
             .map_err(FactStreamReceiveError::Service)
     }
 
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     pub fn target(&self) -> &TargetBinding {
         &self.target
     }

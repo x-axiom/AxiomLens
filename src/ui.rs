@@ -29,8 +29,9 @@ use crate::connection::{
     ConnectionPolicy,
 };
 use crate::fact_service::{
-    FactErrorKind, FactStreamEvent, FactStreamReceiveError, ResourceFact, SharedFactCache,
-    MAX_FACTS_PER_LIST,
+    ContainerLogLine, ContainerLogMode, ContainerLogRequest, ContainerLogSince,
+    ContainerLogStreamEvent, FactErrorKind, FactStreamEvent, FactStreamReceiveError, ResourceFact,
+    SharedFactCache, MAX_FACTS_PER_LIST,
 };
 use crate::kubeconfig::{ExecPluginSummary, ImportedKubeconfig, KubeconfigImportError};
 use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
@@ -38,7 +39,7 @@ use crate::resource_browser::{ResourceBrowser, ResourceCollectionStatus, Resourc
 use crate::resource_details::{ResourceDetails, to_readonly_yaml};
 use crate::resource_relations::collect_related_facts;
 use crate::resource_events::{EventCollectionStatus, EventWindow, MAX_CACHED_EVENTS};
-use crate::target::{ContextName, SessionRegistry, TargetBinding};
+use crate::target::{ContextName, ResourceIdentity, SessionRegistry, TargetBinding};
 use crate::diagnostics::{DiagnosticEvent, Diagnostics, next_correlation_id};
 
 const BG: u32 = 0x0b0e13;
@@ -223,6 +224,10 @@ pub struct AxiomLensPrototype {
     event_stream_cancellation: Option<CancellationToken>,
     event_stream_generation: u64,
     event_stream_epoch: Option<u64>,
+    log_stream_cancellation: Option<CancellationToken>,
+    log_stream_generation: u64,
+    log_stream_epoch: Option<u64>,
+    log_stream_source: Option<(TargetBinding, ResourceIdentity)>,
     previous_focus: Option<FocusHandle>,
     theme_mode: ThemeMode,
     settings_store: Option<SettingsStore>,
@@ -258,7 +263,7 @@ impl AxiomLensPrototype {
         let search_navigation = navigation.clone();
         let layout_dock_area = dock_area.clone();
         let navigation_subscription = cx.observe(&navigation, |app, navigation, cx| {
-            let (selected_kind, request_epoch, selected_fact, event_request) = {
+            let (selected_kind, request_epoch, selected_fact, event_request, log_request) = {
                 let navigation = navigation.read(cx);
                 let selected_fact = navigation
                     .live_browser
@@ -269,6 +274,10 @@ impl AxiomLensPrototype {
                             .active_fact()
                             .map(|fact| (browser.target().clone(), fact.clone()))
                     });
+                let log_request = navigation
+                    .log_request
+                    .as_ref()
+                    .map(|request| (navigation.log_request_epoch, request.clone()));
                 (
                     navigation
                         .live_browser
@@ -280,12 +289,25 @@ impl AxiomLensPrototype {
                         navigation.event_query_epoch,
                         navigation.event_query_force,
                     )),
+                    log_request,
                 )
             };
             if let Some(kind) = selected_kind {
                 app.start_live_resource_stream(kind, request_epoch, cx);
             }
-            app.start_live_relation_query(selected_fact, cx);
+            app.start_live_relation_query(selected_fact.clone(), cx);
+            app.cancel_log_stream_for_changed_selection(
+                selected_fact.as_ref().map(|(_, fact)| fact),
+                cx,
+            );
+            if let Some((log_epoch, request)) = log_request {
+                app.start_live_container_log_stream(
+                    log_epoch,
+                    request,
+                    selected_fact.as_ref().map(|(_, fact)| fact),
+                    cx,
+                );
+            }
             if let Some((event_epoch, force)) = event_request {
                 app.start_live_event_query(event_epoch, force, cx);
             }
@@ -307,7 +329,11 @@ impl AxiomLensPrototype {
             &layout_dock_area,
             |app, area, event: &DockEvent, cx| {
                 if matches!(event, DockEvent::LayoutChanged) {
+                    let bottom_dock_open = area.read(cx).is_dock_open(DockPlacement::Bottom);
                     app.persist_dock_layout(area, cx);
+                    if !bottom_dock_open {
+                        app.cancel_hidden_log_stream(cx);
+                    }
                 }
             },
         );
@@ -349,6 +375,10 @@ impl AxiomLensPrototype {
             event_stream_cancellation: None,
             event_stream_generation: 0,
             event_stream_epoch: None,
+            log_stream_cancellation: None,
+            log_stream_generation: 0,
+            log_stream_epoch: None,
+            log_stream_source: None,
             previous_focus: None,
             theme_mode,
             settings_store,
@@ -644,6 +674,7 @@ impl AxiomLensPrototype {
         self.cancel_live_resource_stream();
         self.cancel_live_relation_query();
         self.cancel_live_event_stream();
+        self.cancel_live_log_stream();
         self.session_registry.end_session();
         self._active_connection = None;
         self.resource_capabilities = None;
@@ -653,7 +684,9 @@ impl AxiomLensPrototype {
     fn end_live_resource_browser(&mut self, cx: &mut Context<Self>) {
         self.cancel_live_resource_stream();
         self.cancel_live_relation_query();
+        self.cancel_live_log_stream();
         self.navigation.update(cx, |navigation, cx| {
+            navigation.mark_container_logs_stale();
             navigation.live_browser = None;
             navigation.live_request_epoch = navigation.live_request_epoch.wrapping_add(1);
             cx.notify();
@@ -754,6 +787,7 @@ impl AxiomLensPrototype {
         self.cancel_live_resource_stream();
         self.cancel_live_relation_query();
         self.cancel_live_event_stream();
+        self.cancel_live_log_stream();
         self._active_connection = None;
         self.connection_view_state = ConnectionViewState::Connecting;
         self.resource_capabilities = None;
@@ -774,6 +808,7 @@ impl AxiomLensPrototype {
                 .map(|namespace| namespace.as_str().to_owned()),
         );
         self.navigation.update(cx, |navigation, cx| {
+            navigation.mark_container_logs_stale();
             navigation.live_browser = Some(browser);
             navigation.live_request_epoch = navigation.live_request_epoch.wrapping_add(1);
             cx.notify();
@@ -1194,7 +1229,223 @@ impl AxiomLensPrototype {
         .detach();
     }
 
-    fn cancel_live_event_stream(&mut self) {
+            fn cancel_live_log_stream(&mut self) {
+                self.log_stream_generation = self.log_stream_generation.wrapping_add(1);
+                if let Some(cancellation) = self.log_stream_cancellation.take() {
+                    cancellation.cancel();
+                }
+                self.log_stream_epoch = None;
+                self.log_stream_source = None;
+            }
+
+            fn cancel_log_stream_for_changed_selection(
+                &mut self,
+                selected_fact: Option<&ResourceFact>,
+                cx: &mut Context<Self>,
+            ) {
+                let stale = self
+                    .navigation
+                    .read(cx)
+                    .log_view
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| {
+                        selected_fact.is_none_or(|fact| {
+                            fact.resource().target() != &request.target
+                                || fact.resource().identity() != &request.pod_identity
+                        })
+                    });
+                if stale {
+                    self.cancel_live_log_stream();
+                    self.navigation.update(cx, |navigation, cx| {
+                        if navigation.log_view.status != LiveContainerLogStatus::Stale {
+                            navigation.mark_container_logs_stale();
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+
+            fn cancel_hidden_log_stream(&mut self, cx: &mut Context<Self>) {
+                if self.log_stream_cancellation.is_none() {
+                    return;
+                }
+                self.cancel_live_log_stream();
+                self.navigation.update(cx, |navigation, cx| {
+                    navigation.mark_container_logs_stale();
+                    cx.notify();
+                });
+            }
+
+            fn start_live_container_log_stream(
+                &mut self,
+                request_epoch: u64,
+                bound_request: BoundContainerLogRequest,
+                selected_fact: Option<&ResourceFact>,
+                cx: &mut Context<Self>,
+            ) {
+                if self.log_stream_epoch == Some(request_epoch) {
+                    return;
+                }
+                let Some(pod) = selected_fact.filter(|fact| {
+                    fact.resource().target() == &bound_request.target
+                        && fact.resource().identity() == &bound_request.pod_identity
+                        && fact.resource().identity().kind() == "Pod"
+                }) else {
+                    return;
+                };
+                if !self.dock_area.read(cx).is_dock_open(DockPlacement::Bottom) {
+                    return;
+                }
+                self.cancel_live_log_stream();
+                self.log_stream_epoch = Some(request_epoch);
+                self.log_stream_source = Some((
+                    bound_request.target.clone(),
+                    bound_request.pod_identity.clone(),
+                ));
+
+                let Some(capabilities) = self.resource_capabilities.clone() else {
+                    self.navigation.update(cx, |navigation, cx| {
+                        navigation.fail_container_log_request(
+                            request_epoch,
+                            FactErrorKind::CapabilityUnavailable,
+                        );
+                        cx.notify();
+                    });
+                    return;
+                };
+                let service_result = self
+                    ._active_connection
+                    .as_ref()
+                    .filter(|connection| connection.target() == &bound_request.target)
+                    .map(|connection| {
+                        connection.read_only_facts(capabilities, self.fact_cache.clone())
+                    });
+                let service = match service_result {
+                    Some(Ok(service)) => service,
+                    Some(Err(error)) => {
+                        self.navigation.update(cx, |navigation, cx| {
+                            navigation.fail_container_log_request(request_epoch, error.kind());
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    None => {
+                        self.navigation.update(cx, |navigation, cx| {
+                            navigation.fail_container_log_request(
+                                request_epoch,
+                                FactErrorKind::SessionCancelled,
+                            );
+                            cx.notify();
+                        });
+                        return;
+                    }
+                };
+                let stream = match service.container_log_stream(pod, bound_request.request.clone()) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        self.navigation.update(cx, |navigation, cx| {
+                            navigation.fail_container_log_request(request_epoch, error.kind());
+                            cx.notify();
+                        });
+                        return;
+                    }
+                };
+                self.log_stream_cancellation = Some(stream.cancellation_token());
+                let generation = self.log_stream_generation;
+                let target = bound_request.target;
+                let pod_identity = bound_request.pod_identity;
+                let app = cx.weak_entity();
+                cx.spawn(async move |_, cx| {
+                    loop {
+                        match stream.recv().await {
+                            Ok(ContainerLogStreamEvent::Batch(lines)) => {
+                                let active = app
+                                    .update(cx, |app, cx| {
+                                        if app.log_stream_generation != generation
+                                            || app.log_stream_epoch != Some(request_epoch)
+                                            || !app.session_registry.is_current(&target)
+                                        {
+                                            return false;
+                                        }
+                                        app.navigation.update(cx, |navigation, cx| {
+                                            if let Some(request) = &navigation.log_view.request
+                                                && request.target == target
+                                                && request.pod_identity == pod_identity
+                                            {
+                                                navigation.append_container_log_batch(request_epoch, &lines);
+                                            }
+                                            cx.notify();
+                                        });
+                                        true
+                                    })
+                                    .unwrap_or(false);
+                                if !active {
+                                    break;
+                                }
+                            }
+                            Ok(ContainerLogStreamEvent::Complete {
+                                possibly_truncated,
+                                ..
+                            }) => {
+                                let _ = app.update(cx, |app, cx| {
+                                    if app.log_stream_generation == generation
+                                        && app.log_stream_epoch == Some(request_epoch)
+                                        && app.session_registry.is_current(&target)
+                                    {
+                                        app.navigation.update(cx, |navigation, cx| {
+                                            navigation.finish_container_log_request(
+                                                request_epoch,
+                                                possibly_truncated,
+                                            );
+                                            cx.notify();
+                                        });
+                                        app.log_stream_cancellation = None;
+                                    }
+                                });
+                                break;
+                            }
+                            Err(FactStreamReceiveError::Service(error)) => {
+                                let error_kind = error.kind();
+                                let _ = app.update(cx, |app, cx| {
+                                    if app.log_stream_generation == generation
+                                        && app.log_stream_epoch == Some(request_epoch)
+                                        && app.session_registry.is_current(&target)
+                                    {
+                                        app.navigation.update(cx, |navigation, cx| {
+                                            navigation.fail_container_log_request(request_epoch, error_kind);
+                                            cx.notify();
+                                        });
+                                        app.log_stream_cancellation = None;
+                                    }
+                                });
+                                break;
+                            }
+                            Err(FactStreamReceiveError::Closed) => {
+                                let _ = app.update(cx, |app, cx| {
+                                    if app.log_stream_generation == generation
+                                        && app.log_stream_epoch == Some(request_epoch)
+                                        && app.session_registry.is_current(&target)
+                                    {
+                                        app.navigation.update(cx, |navigation, cx| {
+                                            navigation.fail_container_log_request(
+                                                request_epoch,
+                                                FactErrorKind::LogStreamInterrupted,
+                                            );
+                                            cx.notify();
+                                        });
+                                        app.log_stream_cancellation = None;
+                                    }
+                                });
+                                break;
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+
+            fn cancel_live_event_stream(&mut self) {
         self.event_stream_generation = self.event_stream_generation.wrapping_add(1);
         if let Some(cancellation) = self.event_stream_cancellation.take() {
             cancellation.cancel();
@@ -2822,6 +3073,184 @@ struct ResourceScope {
     resources: Rc<Vec<ResourceEntry>>,
 }
 
+const MAX_DISPLAY_LOG_LINES: usize = 2_000;
+const MAX_DISPLAY_LOG_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogTimeWindow {
+    Last15Minutes,
+    LastHour,
+    Last6Hours,
+    LastDay,
+    All,
+}
+
+impl LogTimeWindow {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Last15Minutes => "15m",
+            Self::LastHour => "1h",
+            Self::Last6Hours => "6h",
+            Self::LastDay => "24h",
+            Self::All => "All",
+        }
+    }
+
+    fn since(self) -> Option<ContainerLogSince> {
+        match self {
+            Self::Last15Minutes => Some(ContainerLogSince::Seconds(15 * 60)),
+            Self::LastHour => Some(ContainerLogSince::Seconds(60 * 60)),
+            Self::Last6Hours => Some(ContainerLogSince::Seconds(6 * 60 * 60)),
+            Self::LastDay => Some(ContainerLogSince::Seconds(24 * 60 * 60)),
+            Self::All => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveContainerLogStatus {
+    Idle,
+    Loading,
+    Streaming,
+    Complete,
+    Truncated,
+    Stale,
+    Failed(FactErrorKind),
+}
+
+impl LiveContainerLogStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::Loading => "LOADING",
+            Self::Streaming => "STREAMING",
+            Self::Complete => "COMPLETE",
+            Self::Truncated => "TRUNCATED",
+            Self::Stale => "STALE / SOURCE CHANGED",
+            Self::Failed(FactErrorKind::PermissionDenied) => "RBAC DENIED",
+            Self::Failed(FactErrorKind::CredentialsRejected) => "CREDENTIALS REJECTED",
+            Self::Failed(FactErrorKind::RequestTimedOut) => "TIMED OUT",
+            Self::Failed(FactErrorKind::ApiUnavailable) => "API UNAVAILABLE",
+            Self::Failed(FactErrorKind::LogStreamInterrupted) => "STREAM INTERRUPTED",
+            Self::Failed(FactErrorKind::PreviousLogsUnavailable) => "PREVIOUS LOGS UNAVAILABLE",
+            Self::Failed(FactErrorKind::ContainerNotFound) => "CONTAINER NOT FOUND",
+            Self::Failed(FactErrorKind::PodRecreated) => "POD RECREATED",
+            Self::Failed(_) => "READ FAILED",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BoundContainerLogRequest {
+    target: TargetBinding,
+    pod_identity: ResourceIdentity,
+    request: ContainerLogRequest,
+}
+
+#[derive(Clone)]
+struct LiveContainerLogView {
+    request: Option<BoundContainerLogRequest>,
+    status: LiveContainerLogStatus,
+    lines: VecDeque<ContainerLogLine>,
+    paused_snapshot: Option<VecDeque<ContainerLogLine>>,
+    retained_bytes: usize,
+    truncated: bool,
+}
+
+impl Default for LiveContainerLogView {
+    fn default() -> Self {
+        Self {
+            request: None,
+            status: LiveContainerLogStatus::Idle,
+            lines: VecDeque::new(),
+            paused_snapshot: None,
+            retained_bytes: 0,
+            truncated: false,
+        }
+    }
+}
+
+impl LiveContainerLogView {
+    fn begin(&mut self, request: BoundContainerLogRequest) {
+        self.request = Some(request);
+        self.status = LiveContainerLogStatus::Loading;
+        self.lines.clear();
+        self.paused_snapshot = None;
+        self.retained_bytes = 0;
+        self.truncated = false;
+    }
+
+    fn append(&mut self, lines: &[ContainerLogLine]) {
+        for line in lines {
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_add(container_log_line_bytes(line));
+            self.lines.push_back(line.clone());
+            while self.lines.len() > MAX_DISPLAY_LOG_LINES
+                || self.retained_bytes > MAX_DISPLAY_LOG_BYTES
+            {
+                if let Some(removed) = self.lines.pop_front() {
+                    self.retained_bytes = self
+                        .retained_bytes
+                        .saturating_sub(container_log_line_bytes(&removed));
+                    self.truncated = true;
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, possibly_truncated: bool) {
+        self.truncated |= possibly_truncated;
+        self.status = if self.truncated {
+            LiveContainerLogStatus::Truncated
+        } else {
+            LiveContainerLogStatus::Complete
+        };
+    }
+
+    fn fail(&mut self, error: FactErrorKind) {
+        self.status = LiveContainerLogStatus::Failed(error);
+    }
+
+    fn mark_stale(&mut self) {
+        if self.request.is_some() {
+            self.status = LiveContainerLogStatus::Stale;
+        }
+    }
+
+    fn pause_follow(&mut self) {
+        if self.paused_snapshot.is_none() {
+            self.paused_snapshot = Some(self.lines.clone());
+        }
+    }
+
+    fn continue_follow(&mut self) {
+        self.paused_snapshot = None;
+    }
+
+    fn is_follow_paused(&self) -> bool {
+        self.paused_snapshot.is_some()
+    }
+
+    fn visible_lines(&self) -> &VecDeque<ContainerLogLine> {
+        self.paused_snapshot.as_ref().unwrap_or(&self.lines)
+    }
+}
+
+fn container_log_line_bytes(line: &ContainerLogLine) -> usize {
+    line.message.len() + line.timestamp.as_ref().map_or(0, String::len)
+}
+
+fn container_log_matches_filter(line: &ContainerLogLine, filter: &str) -> bool {
+    let filter = filter.trim();
+    filter.is_empty()
+        || line.message.to_lowercase().contains(&filter.to_lowercase())
+        || line
+            .timestamp
+            .as_ref()
+            .is_some_and(|timestamp| timestamp.to_lowercase().contains(&filter.to_lowercase()))
+}
+
 struct ResourceNavigation {
     scopes: Vec<ResourceScope>,
     active_context: usize,
@@ -2834,6 +3263,9 @@ struct ResourceNavigation {
     events_requested: bool,
     event_query_epoch: u64,
     event_query_force: bool,
+    log_request: Option<BoundContainerLogRequest>,
+    log_request_epoch: u64,
+    log_view: LiveContainerLogView,
 }
 
 impl ResourceNavigation {
@@ -2871,6 +3303,9 @@ impl ResourceNavigation {
             events_requested: false,
             event_query_epoch: 0,
             event_query_force: false,
+            log_request: None,
+            log_request_epoch: 0,
+            log_view: LiveContainerLogView::default(),
         };
         navigation.refresh_filter();
         navigation
@@ -2887,6 +3322,54 @@ impl ResourceNavigation {
         self.events_requested = true;
         self.event_query_force = force;
         self.event_query_epoch = self.event_query_epoch.wrapping_add(1);
+    }
+
+    fn request_container_logs(
+        &mut self,
+        target: TargetBinding,
+        pod_identity: ResourceIdentity,
+        request: ContainerLogRequest,
+    ) {
+        let bound_request = BoundContainerLogRequest {
+            target,
+            pod_identity,
+            request,
+        };
+        self.log_view.begin(bound_request.clone());
+        self.log_request = Some(bound_request);
+        self.log_request_epoch = self.log_request_epoch.wrapping_add(1);
+    }
+
+    fn append_container_log_batch(
+        &mut self,
+        request_epoch: u64,
+        lines: &[ContainerLogLine],
+    ) -> bool {
+        if self.log_request_epoch != request_epoch || self.log_request.is_none() {
+            return false;
+        }
+        self.log_view.status = LiveContainerLogStatus::Streaming;
+        self.log_view.append(lines);
+        true
+    }
+
+    fn finish_container_log_request(&mut self, request_epoch: u64, truncated: bool) {
+        if self.log_request_epoch == request_epoch {
+            self.log_view.finish(truncated);
+            self.log_request = None;
+        }
+    }
+
+    fn fail_container_log_request(&mut self, request_epoch: u64, error: FactErrorKind) {
+        if self.log_request_epoch == request_epoch {
+            self.log_view.fail(error);
+            self.log_request = None;
+        }
+    }
+
+    fn mark_container_logs_stale(&mut self) {
+        self.log_request = None;
+        self.log_view.mark_stale();
     }
 
     #[cfg(test)]
@@ -3005,6 +3488,12 @@ struct WorkspacePanel {
         Option<String>,
     )>,
     event_window: EventWindow,
+    log_filter_input: Option<Entity<InputState>>,
+    _log_filter_subscription: Option<Subscription>,
+    log_filter: String,
+    log_mode: ContainerLogMode,
+    log_time_window: LogTimeWindow,
+    selected_log_container: Option<(TargetBinding, ResourceIdentity, String)>,
     _navigation_subscription: Option<Subscription>,
     activity_events: VecDeque<SimulatedTaskMessage>,
     activity_status: SharedString,
@@ -3029,7 +3518,10 @@ impl WorkspacePanel {
         let yaml_editor = matches!(kind, PanelKind::Details).then(|| {
             cx.new(|cx| EditorState::new(window, cx).default_value("").language("yaml"))
         });
+        let log_filter_input = matches!(kind, PanelKind::Activity)
+            .then(|| cx.new(|cx| InputState::new(window, cx)));
         let observed_navigation = navigation.clone();
+        let observed_log_filter = log_filter_input.clone();
         let panel = cx.new(|cx| Self {
             panel_id,
             title,
@@ -3042,6 +3534,12 @@ impl WorkspacePanel {
             yaml_tab: None,
             live_yaml_key: None,
             event_window: EventWindow::LastDay,
+            log_filter_input,
+            _log_filter_subscription: None,
+            log_filter: String::new(),
+            log_mode: ContainerLogMode::Current,
+            log_time_window: LogTimeWindow::LastHour,
+            selected_log_container: None,
             _navigation_subscription: None,
             activity_events: VecDeque::new(),
             activity_status: SharedString::from("IDLE / LOCAL FAKE TASK"),
@@ -3056,6 +3554,12 @@ impl WorkspacePanel {
             panel._navigation_subscription = Some(cx.observe(&observed_navigation, |_, _, cx| {
                 cx.notify();
             }));
+            if let Some(input) = &observed_log_filter {
+                panel._log_filter_subscription = Some(cx.observe(input, |panel, input, cx| {
+                    panel.log_filter = input.read(cx).value().to_string();
+                    cx.notify();
+                }));
+            }
         });
         panel
     }
@@ -3382,6 +3886,450 @@ impl WorkspacePanel {
     }
 
     fn render_activity(&mut self, cx: &mut Context<Self>) -> Div {
+        if self.navigation.read(cx).live_browser.is_some() {
+            return self.render_live_container_logs(cx);
+        }
+        self.render_simulated_activity(cx)
+    }
+
+    fn render_live_container_logs(&mut self, cx: &mut Context<Self>) -> Div {
+        let (selected_fact, namespace, log_view) = {
+            let navigation = self.navigation.read(cx);
+            let browser = navigation
+                .live_browser
+                .as_ref()
+                .expect("live browser checked before Logs view");
+            (
+                browser.active_fact().cloned(),
+                browser.namespace().unwrap_or("ALL NAMESPACES").to_owned(),
+                navigation.log_view.clone(),
+            )
+        };
+        let selected_pod = selected_fact
+            .as_ref()
+            .filter(|fact| fact.resource().identity().kind() == "Pod");
+        let pod_containers = selected_pod.map_or_else(Vec::new, |fact| {
+            ResourceDetails::from_object("Pod", fact.object()).containers
+        });
+        let selected_container = selected_pod.and_then(|fact| {
+            self.selected_log_container
+                .as_ref()
+                .filter(|(target, identity, _)| {
+                    target == fact.resource().target()
+                        && identity == fact.resource().identity()
+                })
+                .map(|(_, _, name)| name.clone())
+                .or_else(|| pod_containers.first().map(|container| container.name.clone()))
+        });
+        let container_buttons = if let Some(fact) = selected_pod {
+            let target = fact.resource().target().clone();
+            let identity = fact.resource().identity().clone();
+            pod_containers
+                .iter()
+                .enumerate()
+                .map(|(index, container)| {
+                    let name = container.name.clone();
+                    let label = if container.role == "Container" {
+                        name.clone()
+                    } else {
+                        format!("{}: {name}", container.role)
+                    };
+                    let active = selected_container.as_deref() == Some(name.as_str());
+                    let target = target.clone();
+                    let identity = identity.clone();
+                    let button = Button::new(format!("log-container-{index}"))
+                        .label(label)
+                        .compact();
+                    let button = if active {
+                        button.secondary()
+                    } else {
+                        button.ghost()
+                    };
+                    button.on_click(cx.listener(move |panel, _, _, cx| {
+                        panel.selected_log_container = Some((
+                            target.clone(),
+                            identity.clone(),
+                            name.clone(),
+                        ));
+                        let request = ContainerLogRequest {
+                            container: name.clone(),
+                            mode: panel.log_mode,
+                            since: panel.log_time_window.since(),
+                            tail_lines: Some(MAX_DISPLAY_LOG_LINES),
+                        };
+                        panel.navigation.update(cx, |navigation, cx| {
+                            navigation.request_container_logs(
+                                target.clone(),
+                                identity.clone(),
+                                request,
+                            );
+                            cx.notify();
+                        });
+                        cx.notify();
+                    }))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mode_buttons = [
+            (ContainerLogMode::Current, "Current"),
+            (ContainerLogMode::Follow, "Follow"),
+            (ContainerLogMode::Previous, "Previous"),
+        ]
+        .into_iter()
+        .map(|(mode, label)| {
+                let button = Button::new(format!("log-mode-{}", label.to_lowercase()))
+                    .label(label)
+                    .compact();
+                let button = if self.log_mode == mode {
+                    button.secondary()
+                } else {
+                    button.ghost()
+                };
+                button.on_click(cx.listener(move |panel, _, _, cx| {
+                    panel.log_mode = mode;
+                    cx.notify();
+                }))
+        })
+        .collect::<Vec<_>>();
+        let time_buttons = [
+            LogTimeWindow::Last15Minutes,
+            LogTimeWindow::LastHour,
+            LogTimeWindow::Last6Hours,
+            LogTimeWindow::LastDay,
+            LogTimeWindow::All,
+        ]
+        .into_iter()
+        .map(|window| {
+            let button = Button::new(format!("log-window-{}", window.label()))
+                .label(window.label())
+                .compact();
+            let button = if self.log_time_window == window {
+                button.secondary()
+            } else {
+                button.ghost()
+            };
+            button.on_click(cx.listener(move |panel, _, _, cx| {
+                panel.log_time_window = window;
+                cx.notify();
+            }))
+        })
+        .collect::<Vec<_>>();
+        let read_button = selected_pod
+            .zip(selected_container.as_ref())
+            .map(|(fact, container)| {
+                let target = fact.resource().target().clone();
+                let identity = fact.resource().identity().clone();
+                let request = ContainerLogRequest {
+                    container: container.clone(),
+                    mode: self.log_mode,
+                    since: self.log_time_window.since(),
+                    tail_lines: Some(MAX_DISPLAY_LOG_LINES),
+                };
+                Button::new("read-container-logs")
+                    .label("Refresh")
+                    .compact()
+                    .secondary()
+                    .on_click(cx.listener(move |panel, _, _, cx| {
+                        panel.navigation.update(cx, |navigation, cx| {
+                            navigation.request_container_logs(
+                                target.clone(),
+                                identity.clone(),
+                                request.clone(),
+                            );
+                            cx.notify();
+                        });
+                    }))
+            });
+        let pause_button = (self.log_mode == ContainerLogMode::Follow
+            && log_view.status == LiveContainerLogStatus::Streaming)
+            .then(|| {
+                let resume = log_view.is_follow_paused();
+                Button::new("toggle-log-follow")
+                    .label(if resume { "Continue follow" } else { "Pause follow" })
+                    .compact()
+                    .ghost()
+                    .on_click(cx.listener(move |panel, _, _, cx| {
+                        panel.navigation.update(cx, |navigation, cx| {
+                            if resume {
+                                navigation.log_view.continue_follow();
+                            } else {
+                                navigation.log_view.pause_follow();
+                            }
+                            cx.notify();
+                        });
+                    }))
+            });
+        let status_label = if log_view.truncated
+            && log_view.status == LiveContainerLogStatus::Streaming
+        {
+            "STREAMING / DISPLAY TRUNCATED".to_owned()
+        } else {
+            log_view.status.label().to_owned()
+        };
+        let status_color = match log_view.status {
+            LiveContainerLogStatus::Streaming => OK,
+            LiveContainerLogStatus::Loading => INFO,
+            LiveContainerLogStatus::Stale | LiveContainerLogStatus::Truncated => WARN,
+            LiveContainerLogStatus::Failed(FactErrorKind::PermissionDenied)
+            | LiveContainerLogStatus::Failed(FactErrorKind::PreviousLogsUnavailable)
+            | LiveContainerLogStatus::Failed(FactErrorKind::ContainerNotFound) => WARN,
+            LiveContainerLogStatus::Failed(_) => DANGER,
+            _ => TEXT_5,
+        };
+        let source_summary = log_view.request.as_ref().map_or_else(
+            || {
+                selected_pod.map_or_else(
+                    || "Select a Pod to read container logs.".to_owned(),
+                    |fact| {
+                        let mode = match self.log_mode {
+                            ContainerLogMode::Current => "CURRENT",
+                            ContainerLogMode::Follow => "FOLLOW",
+                            ContainerLogMode::Previous => "PREVIOUS",
+                        };
+                        format!(
+                            "SELECTED / {}/{} / UID {} / {} / {}",
+                            namespace,
+                            fact.resource().identity().name(),
+                            fact.resource().identity().uid(),
+                            selected_container.as_deref().unwrap_or("NO CONTAINER"),
+                            format!("{mode} / {}", self.log_time_window.label())
+                        )
+                    },
+                )
+            },
+            |request| {
+                let identity = &request.pod_identity;
+                let mode = match request.request.mode {
+                    ContainerLogMode::Current => "CURRENT",
+                    ContainerLogMode::Follow => "FOLLOW",
+                    ContainerLogMode::Previous => "PREVIOUS",
+                };
+                let since = match request.request.since.as_ref() {
+                    Some(ContainerLogSince::Seconds(seconds)) => format!("{seconds}s"),
+                    Some(ContainerLogSince::Timestamp(timestamp)) => timestamp.to_string(),
+                    None => "ALL".to_owned(),
+                };
+                format!(
+                    "SOURCE / {}/{} / UID {} / {} / {} / SINCE {}",
+                    identity.namespace().map_or("CLUSTER", |namespace| namespace.as_str()),
+                    identity.name(),
+                    identity.uid(),
+                    request.request.container,
+                    mode,
+                    since
+                )
+            },
+        );
+        let filter_text = self.log_filter.clone();
+        let visible_lines = log_view.visible_lines();
+        let loaded_count = visible_lines.len();
+        let displayed_lines = visible_lines
+            .iter()
+            .filter(|line| container_log_matches_filter(line, &filter_text))
+            .cloned()
+            .collect::<Vec<_>>();
+        let empty_message = if displayed_lines.is_empty() {
+            Some(match (selected_pod, log_view.status) {
+                (None, _) => "Select a Pod resource to read logs.",
+                (Some(_), _) if pod_containers.is_empty() => "Selected Pod reports no containers.",
+                (_, LiveContainerLogStatus::Idle) => "Choose a container and refresh to read logs.",
+                (_, LiveContainerLogStatus::Loading) => "Opening the Kubernetes Pod/log stream...",
+                (_, LiveContainerLogStatus::Streaming) if filter_text.trim().is_empty() => {
+                    "Waiting for container log lines..."
+                }
+                (_, LiveContainerLogStatus::Streaming) => "No loaded log lines match this filter.",
+                (_, LiveContainerLogStatus::Complete | LiveContainerLogStatus::Truncated)
+                    if filter_text.trim().is_empty() => "No log lines were returned.",
+                (_, LiveContainerLogStatus::Complete | LiveContainerLogStatus::Truncated) => {
+                    "No loaded log lines match this filter."
+                }
+                (_, LiveContainerLogStatus::Stale) => {
+                    "Source changed. Displayed rows belong to the source shown above."
+                }
+                (_, LiveContainerLogStatus::Failed(_)) => "Log request failed; see status above.",
+            })
+        } else {
+            None
+        };
+        let log_rows = displayed_lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let timestamp = line.timestamp.as_deref().unwrap_or("NO TIMESTAMP");
+                let timestamp_color = if line.timestamp.is_some() { TEXT_4 } else { WARN };
+                div()
+                    .id(format!("container-log-line-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(if index % 2 == 0 { BG } else { RAISED }))
+                    .child(fixed_cell(timestamp, 190.0, timestamp_color, true))
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .font_family("Menlo")
+                            .text_xs()
+                            .text_color(rgb(TEXT_2))
+                            .child(line.message),
+                    )
+                    .child(if line.truncated {
+                        pill("LINE TRUNCATED", WARN, ACCENT_SOFT)
+                    } else {
+                        div()
+                    })
+            })
+            .collect::<Vec<_>>();
+        let filter_input = self.log_filter_input.as_ref().map(|input| {
+            Input::new(input)
+                .id("container-log-filter")
+                .aria_label("Filter already loaded container log lines")
+                .cleanable(true)
+                .appearance(false)
+                .bordered(false)
+                .focus_bordered(false)
+                .flex_1()
+        });
+        let error_detail = match log_view.status {
+            LiveContainerLogStatus::Failed(error) => {
+                Some(crate::fact_service::FactError::new(error).summary().to_owned())
+            }
+            _ => None,
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(RAISED))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(RAISED))
+                    .child(div().text_xs().text_color(rgb(TEXT_4)).child("CONTAINER LOGS"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(rgb(status_color))
+                            .child(status_label),
+                    )
+                    .children(read_button)
+                    .children(pause_button),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(RAISED))
+                    .children(container_buttons)
+                    .overflow_x_scrollbar(),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(RAISED))
+                    .children(mode_buttons)
+                    .child(div().w(px(1.0)).h(px(18.0)).bg(rgb(BORDER)))
+                    .children(time_buttons)
+                    .child(div().w(px(8.0)))
+                    .children(filter_input)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_5))
+                            .child("LOADED LINES ONLY"),
+                    ),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(rgb(TEXT_5))
+                            .child(source_summary),
+                    ),
+            )
+            .child(if let Some(error) = error_detail {
+                div()
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .child(div().text_xs().text_color(rgb(WARN)).child(error))
+            } else if log_view.truncated {
+                div()
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(WARN))
+                            .child("DISPLAY IS BOUNDED; OLDEST LOADED ROWS WERE DROPPED"),
+                    )
+            } else {
+                div()
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .bg(rgb(BG))
+                    .children(if let Some(message) = empty_message {
+                        vec![
+                            div()
+                                .id("container-log-empty-state")
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(div().text_sm().text_color(rgb(TEXT_4)).child(message)),
+                        ]
+                    } else {
+                        log_rows
+                    })
+                    .overflow_y_scrollbar(),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(rgb(TEXT_5))
+                            .child(format!(
+                                "{} SHOWN / {loaded_count} RETAINED / LIMIT {MAX_DISPLAY_LOG_LINES} ROWS / 2 MiB",
+                                log_view.visible_lines().iter().filter(|line| container_log_matches_filter(line, &self.log_filter)).count()
+                            )),
+                    ),
+            )
+    }
+
+    fn render_simulated_activity(&mut self, cx: &mut Context<Self>) -> Div {
         let success_button = Button::new("simulate-success")
             .label("Delay success")
             .compact()
@@ -6264,6 +7212,139 @@ mod tests {
     use super::*;
     use gpui_kit::{TestAppContext, test::TestWindowExt};
 
+    fn log_test_target() -> (TargetBinding, ResourceIdentity) {
+        let fingerprint = crate::target::ConnectionFingerprint::from_non_secret_identity(
+            "https://127.0.0.1:6443",
+            None,
+            Some("test-user"),
+        )
+        .unwrap();
+        let connection = crate::target::ConnectionIdentity::new(
+            crate::target::ClusterKey::generate(),
+            fingerprint,
+        );
+        let mut sessions = SessionRegistry::default();
+        let target = sessions.begin_session(
+            connection,
+            ContextName::new("local").unwrap(),
+            crate::target::NamespaceScope::single("payments").unwrap(),
+        );
+        let identity = ResourceIdentity::new(
+            "",
+            "v1",
+            "Pod",
+            Some(crate::target::NamespaceName::new("payments").unwrap()),
+            "api-0",
+            "pod-uid-1",
+        )
+        .unwrap();
+        (target, identity)
+    }
+
+    #[test]
+    fn navigation_rejects_late_log_batches_and_keeps_source_stale() {
+        let (target, identity) = log_test_target();
+        let mut navigation = ResourceNavigation::new(crate::simulated_data::initial_snapshot());
+        let request = ContainerLogRequest {
+            container: "api".to_owned(),
+            mode: ContainerLogMode::Follow,
+            since: Some(ContainerLogSince::Seconds(3600)),
+            tail_lines: Some(MAX_DISPLAY_LOG_LINES),
+        };
+        navigation.request_container_logs(target.clone(), identity.clone(), request.clone());
+        let first_epoch = navigation.log_request_epoch;
+        assert_eq!(navigation.log_view.status, LiveContainerLogStatus::Loading);
+
+        navigation.request_container_logs(target.clone(), identity.clone(), request);
+        let second_epoch = navigation.log_request_epoch;
+        assert_ne!(first_epoch, second_epoch);
+        let line = ContainerLogLine {
+            timestamp: Some("2026-10-14T12:00:00Z".to_owned()),
+            message: "old response".to_owned(),
+            truncated: false,
+        };
+        assert!(!navigation.append_container_log_batch(first_epoch, &[line.clone()]));
+        assert!(navigation.log_view.lines.is_empty());
+        assert!(navigation.append_container_log_batch(second_epoch, &[line]));
+        navigation.finish_container_log_request(second_epoch, true);
+        assert_eq!(navigation.log_view.status, LiveContainerLogStatus::Truncated);
+
+        navigation.mark_container_logs_stale();
+        assert_eq!(navigation.log_view.status, LiveContainerLogStatus::Stale);
+        assert!(navigation.log_request.is_none());
+        assert_eq!(
+            navigation.log_view.request.as_ref().unwrap().pod_identity,
+            identity
+        );
+    }
+
+    #[test]
+    fn live_log_view_bounds_rows_and_pauses_visible_snapshot() {
+        let mut view = LiveContainerLogView::default();
+        let lines = (0..=MAX_DISPLAY_LOG_LINES)
+            .map(|index| ContainerLogLine {
+                timestamp: Some(format!("2026-10-14T12:00:{:02}Z", index % 60)),
+                message: format!("line {index}"),
+                truncated: false,
+            })
+            .collect::<Vec<_>>();
+        view.append(&lines);
+        assert_eq!(view.lines.len(), MAX_DISPLAY_LOG_LINES);
+        assert!(view.truncated);
+
+        view.pause_follow();
+        let frozen_count = view.visible_lines().len();
+        view.append(&[ContainerLogLine {
+            timestamp: None,
+            message: "arrived while display paused".to_owned(),
+            truncated: false,
+        }]);
+        assert_eq!(view.visible_lines().len(), frozen_count);
+        assert!(view.is_follow_paused());
+
+        view.continue_follow();
+        assert!(!view.is_follow_paused());
+        assert_eq!(view.visible_lines().len(), view.lines.len());
+        assert_eq!(
+            view.visible_lines().back().unwrap().message,
+            "arrived while display paused"
+        );
+    }
+
+    #[test]
+    fn log_text_filter_only_matches_loaded_lines() {
+        let line = ContainerLogLine {
+            timestamp: Some("2026-10-14T12:00:00Z".to_owned()),
+            message: "Payment upstream timed out".to_owned(),
+            truncated: false,
+        };
+        assert!(container_log_matches_filter(&line, "UPSTREAM"));
+        assert!(container_log_matches_filter(&line, "2026-10-14"));
+        assert!(!container_log_matches_filter(&line, "not loaded"));
+        assert!(container_log_matches_filter(&line, "  "));
+    }
+
+    #[test]
+    fn log_time_windows_map_to_bounded_server_time_filters() {
+        assert_eq!(
+            LogTimeWindow::Last15Minutes.since(),
+            Some(ContainerLogSince::Seconds(900))
+        );
+        assert_eq!(
+            LogTimeWindow::LastHour.since(),
+            Some(ContainerLogSince::Seconds(3600))
+        );
+        assert_eq!(
+            LogTimeWindow::Last6Hours.since(),
+            Some(ContainerLogSince::Seconds(21600))
+        );
+        assert_eq!(
+            LogTimeWindow::LastDay.since(),
+            Some(ContainerLogSince::Seconds(86400))
+        );
+        assert_eq!(LogTimeWindow::All.since(), None);
+    }
+
     fn relative_luminance(color: u32) -> f64 {
         let [_, red, green, blue] = color.to_be_bytes();
         let linear = |channel: u8| {
@@ -6360,6 +7441,54 @@ mod tests {
             )
             .unwrap()
         })
+    }
+
+    #[gpui_kit::test]
+    fn connected_activity_panel_renders_container_log_controls(cx: &mut TestAppContext) {
+        let (window_handle, app) = open_test_workbench(cx);
+        let (target, _) = log_test_target();
+        cx.update_window(window_handle, |_, window, cx| {
+            let navigation_entity = app.read(cx).navigation.clone();
+            navigation_entity.update(cx, |navigation, cx| {
+                navigation.live_browser = Some(ResourceBrowser::new(
+                    target.clone(),
+                    "mock-cluster".to_owned(),
+                    "local".to_owned(),
+                    Some("payments".to_owned()),
+                ));
+                cx.notify();
+            });
+            let dock_area = app.read(cx).dock_area.clone();
+            if !dock_area.read(cx).is_dock_open(DockPlacement::Bottom) {
+                dock_area.update(cx, |area, cx| {
+                    area.toggle_dock(DockPlacement::Bottom, window, cx);
+                });
+            }
+            assert!(dock_area.read(cx).is_dock_open(DockPlacement::Bottom));
+        })
+        .unwrap();
+
+        cx.update_window(window_handle, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            for id in [
+                "log-mode-current",
+                "log-mode-follow",
+                "log-mode-previous",
+                "log-window-15m",
+                "log-window-1h",
+                "log-window-6h",
+                "log-window-24h",
+                "log-window-All",
+                "container-log-filter",
+            ] {
+                let _ = window.find(id).bounds();
+            }
+            window.click("log-mode-follow", cx);
+            window.click("log-window-15m", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
     }
 
     fn primary_modifier() -> Modifiers {
