@@ -1117,7 +1117,7 @@ mod tests {
         FactStreamReceiveError, FactWatchEvent, ReadOnlyFactService, ResourceFact,
         SharedFactCache,
     };
-    use crate::resource_browser::{ResourceBrowser, ResourceKind};
+    use crate::resource_browser::{ResourceBrowser, ResourceCollectionStatus, ResourceKind};
     use std::{
         fs,
         io::{Read, Write},
@@ -3146,6 +3146,124 @@ mod tests {
     }
 
     #[test]
+    fn one_hundred_context_switches_reject_delayed_old_cluster_data() {
+        let mock = MockApi::start(&[200; 20]);
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let imported = ImportedKubeconfig::import_path(&path).unwrap();
+        let mut sessions = crate::target::SessionRegistry::default();
+        let old_target = imported.select_context("local", &mut sessions).unwrap();
+        let old_session_cancellation = sessions.cancellation_for(&old_target).unwrap();
+        let connection = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(connect(
+                imported,
+                old_target.clone(),
+                policy(0),
+                BTreeSet::new(),
+                old_session_cancellation,
+            ))
+            .unwrap();
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let capabilities = runtime
+            .block_on(connection.discover_capabilities(
+                CancellationToken::new(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let old_pod = runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("", "v1", "Pod"),
+                Some("payments".to_owned()),
+                "api-0".to_owned(),
+            ))
+            .unwrap();
+        let old_request = crate::target::BoundRequest::new(old_target.clone(), old_pod.clone());
+        let old_evidence = crate::target::BoundEvidence::new(
+            old_target.clone(),
+            old_request.run_id(),
+            Some(old_pod.resource().identity().clone()),
+            "late old-cluster observation",
+        );
+        let delayed_response = std::thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            crate::target::BoundResponse::new(
+                old_request.target().clone(),
+                old_request.run_id(),
+                old_request.payload().clone(),
+            )
+        });
+
+        let cluster_a = crate::target::ConnectionIdentity::new(
+            crate::target::ClusterKey::generate(),
+            crate::target::ConnectionFingerprint::from_non_secret_identity(
+                "https://cluster-a.example",
+                None,
+                Some("user-a"),
+            )
+            .unwrap(),
+        );
+        let cluster_b = crate::target::ConnectionIdentity::new(
+            crate::target::ClusterKey::generate(),
+            crate::target::ConnectionFingerprint::from_non_secret_identity(
+                "https://cluster-b.example",
+                None,
+                Some("user-b"),
+            )
+            .unwrap(),
+        );
+        let mut current_target = old_target.clone();
+        for switch_index in 1..=100 {
+            let previous_cancellation = sessions.cancellation_for(&current_target).unwrap();
+            let (connection, context) = if switch_index % 2 == 0 {
+                (cluster_a.clone(), "local")
+            } else {
+                (cluster_b.clone(), "staging")
+            };
+            current_target = sessions.begin_session(
+                connection,
+                crate::target::ContextName::new(context).unwrap(),
+                crate::target::NamespaceScope::single("payments").unwrap(),
+            );
+            assert!(previous_cancellation.is_cancelled());
+        }
+
+        let delayed_response = delayed_response.join().unwrap();
+        assert_eq!(delayed_response.target(), &old_target);
+        assert!(!sessions.accepts_response(&delayed_response));
+        assert_ne!(old_evidence.target(), &current_target);
+
+        let mut new_browser = ResourceBrowser::new(
+            current_target.clone(),
+            "cluster-b".to_owned(),
+            current_target.context_name().as_str().to_owned(),
+            Some("payments".to_owned()),
+        );
+        new_browser.select_kind(ResourceKind::Pod);
+        new_browser.begin_request(ResourceKind::Pod);
+        assert!(!new_browser.apply_stream_event(
+            &delayed_response.target().clone(),
+            ResourceKind::Pod,
+            FactStreamEvent::Batch(vec![delayed_response.payload().clone()]),
+        ));
+        assert_eq!(new_browser.count(ResourceKind::Pod), 0);
+        assert_eq!(
+            new_browser.status(ResourceKind::Pod),
+            ResourceCollectionStatus::Loading
+        );
+        mock.join();
+    }
+
+    #[test]
     fn exec_plugin_is_rejected_before_any_process_or_request() {
         let directory = TempDir::new().unwrap();
         let path = config_file(
@@ -3272,6 +3390,13 @@ mod tests {
         assert_eq!(
             classify_transport_message("invalid peer certificate: unknown issuer"),
             ConnectionFailureKind::CertificateProblem
+        );
+        let api_unavailable = classify_transport_message("connection refused by API endpoint");
+        assert_eq!(api_unavailable, ConnectionFailureKind::ApiUnavailable);
+        assert!(
+            ConnectionFailure::new(api_unavailable)
+                .next_step()
+                .contains("API endpoint")
         );
     }
 
