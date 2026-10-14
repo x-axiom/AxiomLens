@@ -15,7 +15,7 @@ use kube::{
     runtime::watcher::{self, Event as WatchEvent},
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt,
     sync::{Arc, Mutex},
@@ -25,6 +25,7 @@ use tokio::{runtime::Handle, task::JoinHandle};
 use uuid::Uuid;
 
 pub const MAX_FACTS_PER_LIST: usize = 100;
+pub const MAX_FACTS_PER_PAGINATED_LIST: usize = 10_000;
 pub const FACT_BATCH_SIZE: usize = 16;
 const FACT_BATCH_CHANNEL_CAPACITY: usize = 4;
 const DEFAULT_CACHE_ENTRIES: usize = 512;
@@ -32,6 +33,8 @@ const DEFAULT_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_CACHE_ENTRY_BYTES: usize = 1024 * 1024;
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
 const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PAGINATED_LIST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PAGINATED_LIST_PAGES: usize = MAX_FACTS_PER_PAGINATED_LIST / MAX_FACTS_PER_LIST;
 const MAX_WATCH_PAGE_SIZE: usize = 500;
 const MAX_WATCH_RETRIES: u8 = 3;
 const WATCH_BATCH_INTERVAL: Duration = Duration::from_millis(100);
@@ -701,6 +704,64 @@ impl ReadOnlyFactService {
         })
     }
 
+    pub fn list_paginated_stream(
+        &self,
+        gvk: GroupVersionKind,
+        namespace: Option<String>,
+        limit: usize,
+    ) -> Result<FactBatchStream, FactError> {
+        if limit == 0 || limit > MAX_FACTS_PER_PAGINATED_LIST {
+            return Err(FactError::new(FactErrorKind::InvalidLimit));
+        }
+        let capability = self
+            .capabilities
+            .resource_gvk(&gvk)
+            .ok_or(FactError::new(FactErrorKind::UnsupportedResource))?;
+        match capability.state() {
+            ApiResourceDiscoveryState::DiscoveryDenied => {
+                return Err(FactError::new(FactErrorKind::DiscoveryDenied));
+            }
+            ApiResourceDiscoveryState::Unsupported => {
+                return Err(FactError::new(FactErrorKind::UnsupportedResource));
+            }
+            ApiResourceDiscoveryState::TimedOut | ApiResourceDiscoveryState::Unavailable => {
+                return Err(FactError::new(FactErrorKind::CapabilityUnavailable));
+            }
+            ApiResourceDiscoveryState::Served { .. } => {}
+        }
+        if !capability.is_list_supported() {
+            return Err(FactError::new(FactErrorKind::ListNotSupported));
+        }
+        let (api_resource, scope) = self.resolve_resource(&gvk)?;
+        let namespace = self.resolve_namespace(scope, namespace.as_deref())?;
+        let api: Api<DynamicObject> = match &namespace {
+            Some(namespace) => Api::namespaced_with(self.client.clone(), namespace, &api_resource),
+            None => Api::all_with(self.client.clone(), &api_resource),
+        };
+        let (sender, receiver) = async_channel::bounded(FACT_BATCH_CHANNEL_CAPACITY);
+        let request_cancellation = CancellationToken::new();
+        let worker_cancellation = request_cancellation.clone();
+        let service = self.clone();
+        let task = self.runtime.spawn(async move {
+            service
+                .run_paginated_list_stream(
+                    api,
+                    api_resource,
+                    scope,
+                    namespace,
+                    limit,
+                    worker_cancellation,
+                    sender,
+                )
+                .await;
+        });
+        Ok(FactBatchStream {
+            receiver,
+            cancellation: request_cancellation,
+            task: Some(task),
+        })
+    }
+
     pub fn watch_stream(
         &self,
         gvk: GroupVersionKind,
@@ -835,6 +896,159 @@ impl ReadOnlyFactService {
             possibly_truncated,
             source: FactSource::ApiServer,
         })
+    }
+
+    async fn run_paginated_list_stream(
+        &self,
+        api: Api<DynamicObject>,
+        api_resource: ApiResource,
+        scope: ApiResourceScope,
+        namespace: Option<String>,
+        limit: usize,
+        request_cancellation: CancellationToken,
+        sender: async_channel::Sender<Result<FactStreamEvent, FactError>>,
+    ) {
+        let mut count = 0_usize;
+        let mut total_bytes = 0_usize;
+        let mut collection_resource_version = None;
+        let mut continuation: Option<String> = None;
+        let mut seen_continuations = HashSet::new();
+        let mut possibly_truncated = false;
+
+        for _ in 0..MAX_PAGINATED_LIST_PAGES {
+            if count >= limit {
+                possibly_truncated = continuation.is_some();
+                break;
+            }
+            let page_limit = (limit - count).min(MAX_FACTS_PER_LIST);
+            let mut params = ListParams::default().limit(page_limit as u32);
+            if let Some(token) = &continuation {
+                params = params.continue_token(token);
+            }
+            let page = tokio::select! {
+                _ = self.cancellation.cancelled() => return,
+                _ = request_cancellation.cancelled() => return,
+                result = tokio::time::timeout(self.request_timeout, api.list(&params)) => {
+                    match result {
+                        Ok(Ok(page)) => page,
+                        Ok(Err(error)) => {
+                            let _ = send_paginated_error(
+                                &sender,
+                                map_api_error(error),
+                                &self.cancellation,
+                                &request_cancellation,
+                            ).await;
+                            return;
+                        }
+                        Err(_) => {
+                            let _ = send_paginated_error(
+                                &sender,
+                                FactError::new(FactErrorKind::RequestTimedOut),
+                                &self.cancellation,
+                                &request_cancellation,
+                            ).await;
+                            return;
+                        }
+                    }
+                }
+            };
+            if collection_resource_version.is_none() {
+                collection_resource_version = page.metadata.resource_version.clone();
+            }
+            let next_continuation = page.metadata.continue_.clone();
+            let mut batch = Vec::with_capacity(FACT_BATCH_SIZE);
+            for object in page.items {
+                if count >= limit {
+                    possibly_truncated = true;
+                    break;
+                }
+                let fact = match self.make_fact(
+                    &api_resource,
+                    scope,
+                    namespace.as_deref(),
+                    object,
+                    SystemTime::now(),
+                ) {
+                    Ok(fact) => fact,
+                    Err(error) => {
+                        let _ = send_paginated_error(
+                            &sender,
+                            error,
+                            &self.cancellation,
+                            &request_cancellation,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let bytes = match serde_json::to_vec(fact.object.as_ref()) {
+                    Ok(bytes) => bytes.len(),
+                    Err(_) => {
+                        let _ = send_paginated_error(
+                            &sender,
+                            FactError::new(FactErrorKind::SerializationFailed),
+                            &self.cancellation,
+                            &request_cancellation,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                if total_bytes.saturating_add(bytes) > MAX_PAGINATED_LIST_BYTES {
+                    possibly_truncated = true;
+                    break;
+                }
+                total_bytes += bytes;
+                count += 1;
+                batch.push(self.cache.insert(fact, bytes));
+                if batch.len() == FACT_BATCH_SIZE
+                    && !send_paginated_batch(
+                        &sender,
+                        &mut batch,
+                        &self.cancellation,
+                        &request_cancellation,
+                    )
+                    .await
+                {
+                    return;
+                }
+            }
+            if !send_paginated_batch(
+                &sender,
+                &mut batch,
+                &self.cancellation,
+                &request_cancellation,
+            )
+            .await
+            {
+                return;
+            }
+            let Some(next) = next_continuation else {
+                continuation = None;
+                break;
+            };
+            if possibly_truncated {
+                break;
+            }
+            if !seen_continuations.insert(next.clone()) {
+                possibly_truncated = true;
+                break;
+            }
+            continuation = Some(next);
+        }
+
+        if continuation.is_some() {
+            possibly_truncated = true;
+        }
+        tokio::select! {
+            _ = self.cancellation.cancelled() => return,
+            _ = request_cancellation.cancelled() => return,
+            _ = sender.send(Ok(FactStreamEvent::Complete {
+                collection_resource_version,
+                collected_at: SystemTime::now(),
+                possibly_truncated,
+            })) => {}
+        }
     }
 
     async fn get_one(
@@ -1285,6 +1499,36 @@ impl ReadOnlyFactService {
     }
 }
 
+async fn send_paginated_batch(
+    sender: &async_channel::Sender<Result<FactStreamEvent, FactError>>,
+    pending: &mut Vec<ResourceFact>,
+    session_cancellation: &CancellationToken,
+    request_cancellation: &CancellationToken,
+) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    let batch = std::mem::take(pending);
+    tokio::select! {
+        _ = session_cancellation.cancelled() => false,
+        _ = request_cancellation.cancelled() => false,
+        result = sender.send(Ok(FactStreamEvent::Batch(batch))) => result.is_ok(),
+    }
+}
+
+async fn send_paginated_error(
+    sender: &async_channel::Sender<Result<FactStreamEvent, FactError>>,
+    error: FactError,
+    session_cancellation: &CancellationToken,
+    request_cancellation: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = session_cancellation.cancelled() => false,
+        _ = request_cancellation.cancelled() => false,
+        result = sender.send(Err(error)) => result.is_ok(),
+    }
+}
+
 fn build_watch_stream(
     api: Api<DynamicObject>,
     page_size: u32,
@@ -1381,7 +1625,7 @@ fn map_watch_status(code: u16) -> FactError {
 fn known_scope(gvk: &GroupVersionKind) -> Option<ApiResourceScope> {
     match (gvk.group.as_str(), gvk.version.as_str(), gvk.kind.as_str()) {
         ("", "v1", "Namespace" | "Node") => Some(ApiResourceScope::Cluster),
-        ("", "v1", "Pod" | "Service" | "Endpoints")
+        ("", "v1", "Pod" | "Service" | "Endpoints" | "Event")
         | ("apps", "v1", "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet")
         | ("batch", "v1", "Job")
         | ("networking.k8s.io", "v1", "Ingress")

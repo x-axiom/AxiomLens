@@ -33,7 +33,11 @@ const MAX_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 const MAX_RETRY_LIMIT: u8 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const DISCOVERY_GROUPS: &[(&str, &str, &[&str])] = &[
-    ("", "v1", &["Namespace", "Pod", "Service", "Endpoints", "Node"]),
+    (
+        "",
+        "v1",
+        &["Namespace", "Pod", "Service", "Endpoints", "Event", "Node"],
+    ),
     (
         "apps",
         "v1",
@@ -1121,6 +1125,9 @@ mod tests {
     const POD_RELIST_WITH_ITEM: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-5"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-27"},"spec":{}}]}"#;
     const POD_FINAL_STATE_LIST: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-6"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-26"},"spec":{"nodeName":"node-2"}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"queue-2","namespace":"payments","uid":"uid-pod-125","resourceVersion":"rv-1"},"spec":{}}]}"#;
     const POD_DETAIL: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-23"},"spec":{}}"#;
+    const EVENT_LIST_PAGE_ONE: &str = r#"{"apiVersion":"v1","kind":"EventList","metadata":{"resourceVersion":"events-rv-1","continue":"event-next"},"items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"api-backoff-1","namespace":"payments","uid":"uid-event-1","resourceVersion":"event-rv-1"},"involvedObject":{"apiVersion":"v1","kind":"Pod","name":"api-0","namespace":"payments","uid":"uid-pod-123"},"type":"Warning","reason":"BackOff","message":"container restart back-off","count":3,"firstTimestamp":"2026-10-14T10:00:00Z","lastTimestamp":"2026-10-14T11:20:00Z"}]}"#;
+    const EVENT_LIST_PAGE_TWO: &str = r#"{"apiVersion":"v1","kind":"EventList","metadata":{"resourceVersion":"events-rv-1"},"items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"api-backoff-2","namespace":"payments","uid":"uid-event-2","resourceVersion":"event-rv-2"},"involvedObject":{"apiVersion":"v1","kind":"Pod","name":"api-0","namespace":"payments","uid":"uid-pod-123"},"type":"Warning","reason":"BackOff","message":"container restart back-off","count":2,"firstTimestamp":"2026-10-14T11:20:00Z","lastTimestamp":"2026-10-14T11:50:00Z"},{"apiVersion":"v1","kind":"Event","metadata":{"name":"api-old-uid","namespace":"payments","uid":"uid-event-3","resourceVersion":"event-rv-3"},"involvedObject":{"apiVersion":"v1","kind":"Pod","name":"api-0","namespace":"payments","uid":"uid-pod-recreated"},"type":"Warning","reason":"BackOff","message":"container restart back-off","count":9,"firstTimestamp":"2026-10-14T11:30:00Z","lastTimestamp":"2026-10-14T11:55:00Z"}]}"#;
+    const EMPTY_EVENT_LIST: &str = r#"{"apiVersion":"v1","kind":"EventList","metadata":{"resourceVersion":"empty-events-rv"},"items":[]}"#;
     const RELATION_DEPLOYMENT: &str = r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"checkout","namespace":"relations-test","uid":"uid-deploy","resourceVersion":"rv-deploy","generation":4},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"checkout"}}},"status":{"replicas":2,"readyReplicas":2}}"#;
     const RELATION_SERVICE: &str = r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"checkout","namespace":"relations-test","uid":"uid-service","resourceVersion":"rv-service"},"spec":{"selector":{"app":"checkout"},"ports":[{"port":80,"targetPort":8080}]}}"#;
     const RELATION_REPLICASETS: &str = r#"{"apiVersion":"apps/v1","kind":"ReplicaSetList","metadata":{"resourceVersion":"rv-rs-list"},"items":[{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"checkout-7f8","namespace":"relations-test","uid":"uid-rs","resourceVersion":"rv-rs","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"checkout","uid":"uid-deploy","controller":true}]} ,"spec":{"replicas":2}},{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"other-123","namespace":"relations-test","uid":"uid-rs-other","resourceVersion":"rv-rs-other","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"other","uid":"uid-deploy-other","controller":true}]},"spec":{"replicas":1}}]}"#;
@@ -1251,7 +1258,7 @@ mod tests {
     }
 
     fn mock_success_body(request: &str) -> &'static str {
-        const CORE: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"namespaces","singularName":"","namespaced":false,"kind":"Namespace","verbs":["get","list","watch"]},{"name":"pods","singularName":"","namespaced":true,"kind":"Pod","verbs":["get","list","watch"]},{"name":"services","singularName":"","namespaced":true,"kind":"Service","verbs":["get","list","watch"]},{"name":"endpoints","singularName":"","namespaced":true,"kind":"Endpoints","verbs":["get","list"]},{"name":"nodes","singularName":"","namespaced":false,"kind":"Node","verbs":["get","list","watch"]}]}"#;
+        const CORE: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"namespaces","singularName":"","namespaced":false,"kind":"Namespace","verbs":["get","list","watch"]},{"name":"pods","singularName":"","namespaced":true,"kind":"Pod","verbs":["get","list","watch"]},{"name":"services","singularName":"","namespaced":true,"kind":"Service","verbs":["get","list","watch"]},{"name":"endpoints","singularName":"","namespaced":true,"kind":"Endpoints","verbs":["get","list"]},{"name":"events","singularName":"","namespaced":true,"kind":"Event","verbs":["get","list","watch"]},{"name":"nodes","singularName":"","namespaced":false,"kind":"Node","verbs":["get","list","watch"]}]}"#;
         const APPS: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"apps/v1","resources":[{"name":"deployments","singularName":"","namespaced":true,"kind":"Deployment","verbs":["get","list","watch"]},{"name":"statefulsets","singularName":"","namespaced":true,"kind":"StatefulSet","verbs":["get","list","watch"]},{"name":"daemonsets","singularName":"","namespaced":true,"kind":"DaemonSet","verbs":["get","list","watch"]},{"name":"replicasets","singularName":"","namespaced":true,"kind":"ReplicaSet","verbs":["get","list","watch"]}]}"#;
         const BATCH: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"batch/v1","resources":[{"name":"jobs","singularName":"","namespaced":true,"kind":"Job","verbs":["get","list","watch"]}]}"#;
         const NETWORKING: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"networking.k8s.io/v1","resources":[{"name":"ingresses","singularName":"","namespaced":true,"kind":"Ingress","verbs":["get","list","watch"]}]}"#;
@@ -1264,6 +1271,16 @@ mod tests {
             .split('?')
             .next()
             .unwrap_or_default();
+        if path == "/api/v1/namespaces/payments/events" {
+            return if request.contains("continue=event-next") {
+                EVENT_LIST_PAGE_TWO
+            } else {
+                EVENT_LIST_PAGE_ONE
+            };
+        }
+        if path == "/api/v1/namespaces/empty-events/events" {
+            return EMPTY_EVENT_LIST;
+        }
         match path {
             "/api/v1" => CORE,
             "/apis/apps/v1" => APPS,
@@ -1439,7 +1456,7 @@ mod tests {
     #[test]
     fn discovery_preserves_supported_unsupported_and_forbidden_group_states() {
         let mock = MockApi::start(&[
-            200, 200, 403, 404, 200, 200, 200, 200, 200, 200, 200, 200, 200,
+            200, 200, 403, 404, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200,
         ]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
@@ -1506,13 +1523,22 @@ mod tests {
                 access: ApiResourceAccessAssessment::Allowed,
             }
         );
-        assert_eq!(capabilities.served_count(), 7);
+        assert_eq!(
+            capabilities.resource("Event").unwrap().state(),
+            ApiResourceDiscoveryState::Served {
+                scope: ApiResourceScope::Namespaced,
+                list_supported: true,
+                watch_supported: true,
+                access: ApiResourceAccessAssessment::Allowed,
+            }
+        );
+        assert_eq!(capabilities.served_count(), 8);
         assert_eq!(capabilities.denied_count(), 4);
         assert_eq!(capabilities.unsupported_count(), 1);
 
         let requests = mock.requests();
         mock.join();
-        assert_eq!(requests.len(), 13);
+        assert_eq!(requests.len(), 14);
         assert!(requests[0].contains("/api/v1/namespaces/payments/pods"));
         assert!(requests[1].contains("/api/v1"));
         assert!(requests[2].contains("/apis/apps/v1"));
@@ -1526,7 +1552,7 @@ mod tests {
 
     #[test]
     fn facts_service_lists_gets_and_caches_target_bound_resources() {
-        let mock = MockApi::start(&[200; 20]);
+        let mock = MockApi::start(&[200; 21]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -1665,15 +1691,218 @@ mod tests {
         let requests = mock.requests();
         mock.join();
         assert!(
-            requests[18].contains("/api/v1/namespaces/payments/pods?&limit=10"),
+            requests[19].contains("/api/v1/namespaces/payments/pods?&limit=10"),
             "{requests:?}"
         );
-        assert!(requests[19].contains("/api/v1/namespaces/payments/pods/api-0"));
+        assert!(requests[20].contains("/api/v1/namespaces/payments/pods/api-0"));
+    }
+
+    #[test]
+    fn events_page_with_continue_token_associates_by_uid_and_aggregates_repeats() {
+        let mock = MockApi::start(&[200; 22]);
+        let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let mut cache = crate::resource_events::ResourceEventCache::new(
+            target,
+            "payments".to_owned(),
+        );
+        cache.begin_query();
+        let stream = service
+            .list_paginated_stream(
+                GroupVersionKind::gvk("", "v1", "Event"),
+                Some("payments".to_owned()),
+                crate::resource_events::MAX_CACHED_EVENTS,
+            )
+            .unwrap();
+        let (batch_count, truncated) = runtime.block_on(async {
+            let mut batch_count = 0;
+            loop {
+                match stream.recv().await.unwrap() {
+                    FactStreamEvent::Batch(batch) => {
+                        batch_count += 1;
+                        for fact in &batch {
+                            cache.ingest_fact(fact);
+                        }
+                    }
+                    FactStreamEvent::Complete {
+                        possibly_truncated,
+                        ..
+                    } => break (batch_count, possibly_truncated),
+                    FactStreamEvent::WatchBatch(_) => {
+                        panic!("paginated Event LIST must not emit Watch events")
+                    }
+                }
+            }
+        });
+        cache.finish_query(truncated);
+        let selected_pod = runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("", "v1", "Pod"),
+                Some("payments".to_owned()),
+                "api-0".to_owned(),
+            ))
+            .unwrap();
+        let now = "2026-10-14T12:00:00Z".parse::<jiff::Timestamp>().unwrap().as_second();
+        let associated = cache.associated_events(
+            &selected_pod,
+            crate::resource_events::EventWindow::LastHour,
+            now,
+        );
+
+        assert_eq!(batch_count, 2);
+        assert!(!truncated);
+        assert_eq!(
+            cache.state(now).status,
+            crate::resource_events::EventCollectionStatus::Loaded
+        );
+        assert_eq!(cache.state(now).count, 3);
+        assert_eq!(associated.len(), 1);
+        assert_eq!(associated[0].association, crate::resource_events::EventAssociation::Uid);
+        assert_eq!(associated[0].count, 5);
+        assert_eq!(
+            associated[0].first_timestamp.as_deref(),
+            Some("2026-10-14T10:00:00Z")
+        );
+        assert_eq!(
+            associated[0].latest_timestamp.as_deref(),
+            Some("2026-10-14T11:50:00Z")
+        );
+
+        let requests = mock.requests();
+        mock.join();
+        assert_eq!(requests.len(), 22);
+        assert!(requests[19].contains("/api/v1/namespaces/payments/events?&limit=100"));
+        assert!(requests[20].contains("continue=event-next"));
+        assert!(requests[21].contains("/api/v1/namespaces/payments/pods/api-0"));
+    }
+
+    #[test]
+    fn event_refresh_forbidden_is_not_empty_and_preserves_stale_cache() {
+        let mut statuses = vec![200; 21];
+        statuses.push(403);
+        let mock = MockApi::start(&statuses);
+        let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let mut cache = crate::resource_events::ResourceEventCache::new(
+            target,
+            "payments".to_owned(),
+        );
+        cache.begin_query();
+        let initial = service
+            .list_paginated_stream(
+                GroupVersionKind::gvk("", "v1", "Event"),
+                Some("payments".to_owned()),
+                crate::resource_events::MAX_CACHED_EVENTS,
+            )
+            .unwrap();
+        let (_, truncated) = runtime.block_on(async {
+            let mut count = 0;
+            loop {
+                match initial.recv().await.unwrap() {
+                    FactStreamEvent::Batch(batch) => {
+                        count += batch.len();
+                        for fact in &batch {
+                            cache.ingest_fact(fact);
+                        }
+                    }
+                    FactStreamEvent::Complete {
+                        possibly_truncated,
+                        ..
+                    } => break (count, possibly_truncated),
+                    FactStreamEvent::WatchBatch(_) => {
+                        panic!("paginated Event LIST must not emit Watch batches")
+                    }
+                }
+            }
+        });
+        cache.finish_query(truncated);
+        assert_eq!(cache.state(0).status, crate::resource_events::EventCollectionStatus::Loaded);
+        assert_eq!(cache.state(0).count, 3);
+
+        cache.begin_query();
+        let refresh = service
+            .list_paginated_stream(
+                GroupVersionKind::gvk("", "v1", "Event"),
+                Some("payments".to_owned()),
+                crate::resource_events::MAX_CACHED_EVENTS,
+            )
+            .unwrap();
+        let error = runtime.block_on(refresh.recv()).unwrap_err();
+        assert!(matches!(
+            error,
+            FactStreamReceiveError::Service(error)
+                if error.kind() == FactErrorKind::PermissionDenied
+        ));
+        cache.mark_failed(FactErrorKind::PermissionDenied);
+        assert_eq!(
+            cache.state(0).status,
+            crate::resource_events::EventCollectionStatus::Failed(
+                FactErrorKind::PermissionDenied
+            )
+        );
+        assert!(cache.state(0).stale);
+        assert_eq!(cache.state(0).count, 3);
+
+        mock.join();
+    }
+
+    #[test]
+    fn empty_event_list_has_distinct_empty_state() {
+        let mock = MockApi::start(&[200; 20]);
+        let (connection, target, runtime, capabilities) =
+            connection_with_discovery_in_namespace(&mock, "empty-events");
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let mut cache = crate::resource_events::ResourceEventCache::new(
+            target,
+            "empty-events".to_owned(),
+        );
+        cache.begin_query();
+        let stream = service
+            .list_paginated_stream(
+                GroupVersionKind::gvk("", "v1", "Event"),
+                Some("empty-events".to_owned()),
+                crate::resource_events::MAX_CACHED_EVENTS,
+            )
+            .unwrap();
+        runtime.block_on(async {
+            loop {
+                match stream.recv().await.unwrap() {
+                    FactStreamEvent::Batch(batch) => {
+                        for fact in &batch {
+                            cache.ingest_fact(fact);
+                        }
+                    }
+                    FactStreamEvent::Complete {
+                        possibly_truncated,
+                        ..
+                    } => {
+                        cache.finish_query(possibly_truncated);
+                        break;
+                    }
+                    FactStreamEvent::WatchBatch(_) => {
+                        panic!("paginated Event LIST must not emit Watch batches")
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            cache.state(0).status,
+            crate::resource_events::EventCollectionStatus::Empty
+        );
+        assert_eq!(cache.state(0).count, 0);
+        mock.join();
     }
 
     #[test]
     fn same_name_pod_recreation_keeps_uid_and_detail_tabs_distinct() {
-        let mock = MockApi::start(&[200; 19]);
+        let mock = MockApi::start(&[200; 20]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -1753,7 +1982,7 @@ mod tests {
 
     #[test]
     fn relation_query_resolves_owner_chain_by_uid_and_excludes_unrelated_objects() {
-        let mock = MockApi::start(&[200; 21]);
+        let mock = MockApi::start(&[200; 22]);
         let (connection, target, runtime, capabilities) =
             connection_with_discovery_in_namespace(&mock, "relations-test");
         let service = connection
@@ -1833,7 +2062,7 @@ mod tests {
 
     #[test]
     fn service_relationships_match_selectors_backends_and_namespace_scope() {
-        let mock = MockApi::start(&[200; 22]);
+        let mock = MockApi::start(&[200; 23]);
         let (connection, target, runtime, capabilities) =
             connection_with_discovery_in_namespace(&mock, "relations-test");
         let service = connection
@@ -1901,7 +2130,7 @@ mod tests {
 
     #[test]
     fn endpoint_slices_use_endpoints_only_when_discovery_reports_unsupported() {
-        let mut statuses = vec![200; 21];
+        let mut statuses = vec![200; 22];
         statuses[5] = 404;
         let mock = MockApi::start(&statuses);
         let (connection, _target, runtime, capabilities) =
@@ -1945,7 +2174,7 @@ mod tests {
 
     #[test]
     fn denied_owner_kind_keeps_relationship_source_state_visible() {
-        let mut statuses = vec![200; 15];
+        let mut statuses = vec![200; 16];
         statuses[2] = 403;
         statuses[3] = 404;
         let mock = MockApi::start(&statuses);
@@ -1994,8 +2223,8 @@ mod tests {
 
     #[test]
     fn forbidden_related_list_is_distinct_from_empty_relationships() {
-        let mut statuses = vec![200; 21];
-        statuses[19] = 403;
+        let mut statuses = vec![200; 22];
+        statuses[20] = 403;
         let mock = MockApi::start(&statuses);
         let (connection, _target, runtime, capabilities) =
             connection_with_discovery_in_namespace(&mock, "relations-test");
@@ -2038,7 +2267,7 @@ mod tests {
 
     #[test]
     fn watch_batches_snapshot_and_merges_duplicate_updates_and_deletes() {
-        let mock = MockApi::start(&[200; 20]);
+        let mock = MockApi::start(&[200; 21]);
         let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
         let browser_capabilities = capabilities.clone();
         let cache = SharedFactCache::default();
@@ -2226,14 +2455,14 @@ mod tests {
         drop(stream);
         let requests = mock.requests();
         mock.join();
-        assert_eq!(requests.len(), 20);
-        assert!(requests[18].contains("/api/v1/namespaces/payments/pods"));
-        assert!(requests[19].contains("watch=true"));
+        assert_eq!(requests.len(), 21);
+        assert!(requests[19].contains("/api/v1/namespaces/payments/pods"));
+        assert!(requests[20].contains("watch=true"));
     }
 
     #[test]
     fn watch_resource_version_expiration_relists_and_restores_fresh_facts() {
-        let mut statuses = vec![200; 19];
+        let mut statuses = vec![200; 20];
         statuses.extend([410, 200, 200, 200]);
         let mock = MockApi::start(&statuses);
         let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -2363,16 +2592,16 @@ mod tests {
 
         let requests = mock.requests();
         mock.join();
-        assert_eq!(requests.len(), 23);
-        assert!(requests[19].contains("watch=true"));
-        assert!(requests[20].contains("/api/v1/namespaces/payments/pods?&limit=10"));
-        assert!(requests[21].contains("watch=true"), "request 21 must restart Watch");
-        assert!(requests[22].contains("/api/v1/namespaces/payments/pods?&limit=10"));
+        assert_eq!(requests.len(), 24);
+        assert!(requests[20].contains("watch=true"));
+        assert!(requests[21].contains("/api/v1/namespaces/payments/pods?&limit=10"));
+        assert!(requests[22].contains("watch=true"), "request 22 must restart Watch");
+        assert!(requests[23].contains("/api/v1/namespaces/payments/pods?&limit=10"));
     }
 
     #[test]
     fn watch_bounds_repeated_resource_version_relists() {
-        let mut statuses = vec![200; 19];
+        let mut statuses = vec![200; 20];
         statuses.extend([410, 200, 410, 200, 410, 200, 410]);
         let mock = MockApi::start(&statuses);
         let (connection, _target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -2410,12 +2639,12 @@ mod tests {
 
         assert_eq!(error_kind, FactErrorKind::WatchReconnectExhausted);
         assert_eq!(resync_count, 3);
-        assert_eq!(mock.request_count(), 26);
+        assert_eq!(mock.request_count(), 27);
         mock.join();
     }
 
     fn watch_error_for_status(status: u16) -> (FactErrorKind, bool, usize) {
-        let mut statuses = vec![200; 19];
+        let mut statuses = vec![200; 20];
         statuses.push(status);
         let mock = MockApi::start(&statuses);
         let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -2469,17 +2698,17 @@ mod tests {
     fn watch_permission_and_api_limitations_are_terminal_and_mark_cache_stale() {
         assert_eq!(
             watch_error_for_status(403),
-            (FactErrorKind::PermissionDenied, true, 20)
+            (FactErrorKind::PermissionDenied, true, 21)
         );
         assert_eq!(
             watch_error_for_status(404),
-            (FactErrorKind::WatchUnsupported, true, 20)
+            (FactErrorKind::WatchUnsupported, true, 21)
         );
     }
 
     #[test]
     fn watch_bounds_transient_retries_even_when_relist_succeeds() {
-        let mut statuses = vec![200; 19];
+        let mut statuses = vec![200; 20];
         statuses.extend([503, 200, 503, 200, 503, 200, 503]);
         let mock = MockApi::start(&statuses);
         let (connection, _target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -2517,13 +2746,13 @@ mod tests {
 
         assert_eq!(error_kind, FactErrorKind::WatchReconnectExhausted);
         assert_eq!(attempts, vec![1, 2, 3]);
-        assert_eq!(mock.request_count(), 26);
+        assert_eq!(mock.request_count(), 27);
         mock.join();
     }
 
     #[test]
     fn facts_service_rejects_namespace_escape_before_api_request() {
-        let mock = MockApi::start(&[200; 17]);
+        let mock = MockApi::start(&[200; 18]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -2555,13 +2784,13 @@ mod tests {
             crate::fact_service::FactStreamReceiveError::Service(fact_error)
                 if fact_error.kind() == FactErrorKind::NamespaceOutsideTarget
         ));
-        assert_eq!(mock.request_count(), 17);
+        assert_eq!(mock.request_count(), 18);
         mock.join();
     }
 
     #[test]
     fn facts_service_preserves_forbidden_read_as_error_not_empty_page() {
-        let mut statuses = vec![200; 18];
+        let mut statuses = vec![200; 19];
         statuses.push(403);
         let mock = MockApi::start(&statuses);
         let directory = TempDir::new().unwrap();
@@ -2591,13 +2820,13 @@ mod tests {
             crate::fact_service::FactStreamReceiveError::Service(fact_error)
                 if fact_error.kind() == FactErrorKind::PermissionDenied
         ));
-        assert_eq!(mock.request_count(), 19);
+        assert_eq!(mock.request_count(), 20);
         mock.join();
     }
 
     #[test]
     fn facts_service_reports_forbidden_read_instead_of_empty_success() {
-        let mut statuses = vec![200; 18];
+        let mut statuses = vec![200; 19];
         statuses.push(403);
         let mock = MockApi::start(&statuses);
         let directory = TempDir::new().unwrap();

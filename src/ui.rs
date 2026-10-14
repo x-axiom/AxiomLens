@@ -13,6 +13,7 @@ use gpui_kit::component::dock::{
 use gpui_kit::component::input::{Editor, EditorState, Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::v_virtual_list;
+use kube::core::gvk::GroupVersionKind;
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -36,6 +37,7 @@ use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
 use crate::resource_browser::{ResourceBrowser, ResourceCollectionStatus, ResourceKind};
 use crate::resource_details::{ResourceDetails, to_readonly_yaml};
 use crate::resource_relations::collect_related_facts;
+use crate::resource_events::{EventCollectionStatus, EventWindow, MAX_CACHED_EVENTS};
 use crate::target::{ContextName, SessionRegistry, TargetBinding};
 use crate::diagnostics::{DiagnosticEvent, Diagnostics, next_correlation_id};
 
@@ -218,6 +220,9 @@ pub struct AxiomLensPrototype {
     resource_stream_generation: u64,
     relation_query_cancellation: Option<CancellationToken>,
     relation_query_generation: u64,
+    event_stream_cancellation: Option<CancellationToken>,
+    event_stream_generation: u64,
+    event_stream_epoch: Option<u64>,
     previous_focus: Option<FocusHandle>,
     theme_mode: ThemeMode,
     settings_store: Option<SettingsStore>,
@@ -253,7 +258,7 @@ impl AxiomLensPrototype {
         let search_navigation = navigation.clone();
         let layout_dock_area = dock_area.clone();
         let navigation_subscription = cx.observe(&navigation, |app, navigation, cx| {
-            let (selected_kind, request_epoch, selected_fact) = {
+            let (selected_kind, request_epoch, selected_fact, event_request) = {
                 let navigation = navigation.read(cx);
                 let selected_fact = navigation
                     .live_browser
@@ -271,12 +276,19 @@ impl AxiomLensPrototype {
                         .map(ResourceBrowser::selected_kind),
                     navigation.live_request_epoch,
                     selected_fact,
+                    navigation.events_requested.then_some((
+                        navigation.event_query_epoch,
+                        navigation.event_query_force,
+                    )),
                 )
             };
             if let Some(kind) = selected_kind {
                 app.start_live_resource_stream(kind, request_epoch, cx);
             }
             app.start_live_relation_query(selected_fact, cx);
+            if let Some((event_epoch, force)) = event_request {
+                app.start_live_event_query(event_epoch, force, cx);
+            }
             cx.notify();
         });
         let search_subscription = cx.observe(&search_input, move |_, input, cx| {
@@ -334,6 +346,9 @@ impl AxiomLensPrototype {
             resource_stream_generation: 0,
             relation_query_cancellation: None,
             relation_query_generation: 0,
+            event_stream_cancellation: None,
+            event_stream_generation: 0,
+            event_stream_epoch: None,
             previous_focus: None,
             theme_mode,
             settings_store,
@@ -628,6 +643,7 @@ impl AxiomLensPrototype {
     fn cancel_active_session(&mut self) {
         self.cancel_live_resource_stream();
         self.cancel_live_relation_query();
+        self.cancel_live_event_stream();
         self.session_registry.end_session();
         self._active_connection = None;
         self.resource_capabilities = None;
@@ -737,6 +753,7 @@ impl AxiomLensPrototype {
     ) {
         self.cancel_live_resource_stream();
         self.cancel_live_relation_query();
+        self.cancel_live_event_stream();
         self._active_connection = None;
         self.connection_view_state = ConnectionViewState::Connecting;
         self.resource_capabilities = None;
@@ -1175,6 +1192,205 @@ impl AxiomLensPrototype {
             });
         })
         .detach();
+    }
+
+    fn cancel_live_event_stream(&mut self) {
+        self.event_stream_generation = self.event_stream_generation.wrapping_add(1);
+        if let Some(cancellation) = self.event_stream_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.event_stream_epoch = None;
+    }
+
+    fn start_live_event_query(
+        &mut self,
+        event_epoch: u64,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self._active_connection.is_none() || self.resource_capabilities.is_none() {
+            return;
+        }
+        if self.event_stream_epoch == Some(event_epoch) {
+            return;
+        }
+        let selection = self.navigation.read(cx).live_browser.as_ref().and_then(|browser| {
+            let namespace = browser.namespace()?.to_owned();
+            let target = browser.target().clone();
+            let state = browser.event_cache()?.state(jiff::Timestamp::now().as_second());
+            Some((target, namespace, state))
+        });
+        let Some((target, namespace, state)) = selection else {
+            return;
+        };
+        if !force
+            && !state.stale
+            && state.status != EventCollectionStatus::NotRequested
+        {
+            self.event_stream_epoch = Some(event_epoch);
+            return;
+        }
+        if !force && self.event_stream_cancellation.is_some() {
+            return;
+        }
+        self.cancel_live_event_stream();
+        self.event_stream_epoch = Some(event_epoch);
+        let generation = self.event_stream_generation;
+        self.navigation.update(cx, |navigation, cx| {
+            if let Some(browser) = &mut navigation.live_browser {
+                if let Some(cache) = browser.event_cache_mut() {
+                    cache.begin_query();
+                }
+            }
+            cx.notify();
+        });
+        let Some(capabilities) = self.resource_capabilities.clone() else {
+            self.set_live_event_status(
+                &target,
+                EventCollectionStatus::CapabilityUnavailable,
+                cx,
+            );
+            return;
+        };
+        let service_result = self
+            ._active_connection
+            .as_ref()
+            .expect("Events query requires an active connection")
+            .read_only_facts(capabilities, self.fact_cache.clone());
+        let service = match service_result {
+            Ok(service) => service,
+            Err(error) => {
+                self.set_live_event_failure(&target, error.kind(), cx);
+                return;
+            }
+        };
+        let stream = match service.list_paginated_stream(
+            GroupVersionKind::gvk("", "v1", "Event"),
+            Some(namespace),
+            MAX_CACHED_EVENTS,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let status = match error.kind() {
+                    FactErrorKind::UnsupportedResource | FactErrorKind::ResourceNotFound => {
+                        EventCollectionStatus::Unsupported
+                    }
+                    FactErrorKind::DiscoveryDenied => EventCollectionStatus::DiscoveryDenied,
+                    FactErrorKind::ListNotSupported => EventCollectionStatus::ListUnsupported,
+                    FactErrorKind::CapabilityUnavailable => {
+                        EventCollectionStatus::CapabilityUnavailable
+                    }
+                    other => EventCollectionStatus::Failed(other),
+                };
+                self.set_live_event_status(&target, status, cx);
+                return;
+            }
+        };
+        self.event_stream_cancellation = Some(stream.cancellation_token());
+        let app = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            loop {
+                match stream.recv().await {
+                    Ok(FactStreamEvent::Batch(batch)) => {
+                        let active = app
+                            .update(cx, |app, cx| {
+                                if app.event_stream_generation != generation
+                                    || !app.session_registry.is_current(&target)
+                                {
+                                    return false;
+                                }
+                                app.navigation.update(cx, |navigation, cx| {
+                                    if let Some(browser) = &mut navigation.live_browser
+                                        && browser.target() == &target
+                                        && let Some(cache) = browser.event_cache_mut()
+                                    {
+                                        for fact in &batch {
+                                            cache.ingest_fact(fact);
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !active {
+                            break;
+                        }
+                    }
+                    Ok(FactStreamEvent::Complete {
+                        possibly_truncated,
+                        ..
+                    }) => {
+                        let _ = app.update(cx, |app, cx| {
+                            if app.event_stream_generation == generation
+                                && app.session_registry.is_current(&target)
+                            {
+                                app.navigation.update(cx, |navigation, cx| {
+                                    if let Some(browser) = &mut navigation.live_browser
+                                        && browser.target() == &target
+                                        && let Some(cache) = browser.event_cache_mut()
+                                    {
+                                        cache.finish_query(possibly_truncated);
+                                    }
+                                    app.event_stream_cancellation = None;
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        break;
+                    }
+                    Ok(FactStreamEvent::WatchBatch(_)) => break,
+                    Err(FactStreamReceiveError::Service(error)) => {
+                        let error_kind = error.kind();
+                        let _ = app.update(cx, |app, cx| {
+                            if app.event_stream_generation == generation
+                                && app.session_registry.is_current(&target)
+                            {
+                                app.set_live_event_failure(&target, error_kind, cx);
+                            }
+                        });
+                        break;
+                    }
+                    Err(FactStreamReceiveError::Closed) => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn set_live_event_status(
+        &mut self,
+        target: &TargetBinding,
+        status: EventCollectionStatus,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigation.update(cx, |navigation, cx| {
+            if let Some(browser) = &mut navigation.live_browser
+                && browser.target() == target
+                && let Some(cache) = browser.event_cache_mut()
+            {
+                cache.mark_status(status);
+            }
+            cx.notify();
+        });
+    }
+
+    fn set_live_event_failure(
+        &mut self,
+        target: &TargetBinding,
+        error: FactErrorKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigation.update(cx, |navigation, cx| {
+            if let Some(browser) = &mut navigation.live_browser
+                && browser.target() == target
+                && let Some(cache) = browser.event_cache_mut()
+            {
+                cache.mark_failed(error);
+            }
+            self.event_stream_cancellation = None;
+            cx.notify();
+        });
     }
 
     fn adjust_connection_policy(
@@ -2414,6 +2630,7 @@ enum DetailView {
     Overview,
     Yaml,
     Relations,
+    Events,
     Diff,
 }
 
@@ -2614,6 +2831,9 @@ struct ResourceNavigation {
     filtered_resources: Vec<usize>,
     live_browser: Option<ResourceBrowser>,
     live_request_epoch: u64,
+    events_requested: bool,
+    event_query_epoch: u64,
+    event_query_force: bool,
 }
 
 impl ResourceNavigation {
@@ -2648,6 +2868,9 @@ impl ResourceNavigation {
             filtered_resources: Vec::new(),
             live_browser: None,
             live_request_epoch: 0,
+            events_requested: false,
+            event_query_epoch: 0,
+            event_query_force: false,
         };
         navigation.refresh_filter();
         navigation
@@ -2655,6 +2878,15 @@ impl ResourceNavigation {
 
     fn active_snapshot(&self) -> SimulatedSnapshot {
         self.scopes[self.active_context].snapshot
+    }
+
+    fn request_events(&mut self, force: bool) {
+        if self.live_browser.is_none() {
+            return;
+        }
+        self.events_requested = true;
+        self.event_query_force = force;
+        self.event_query_epoch = self.event_query_epoch.wrapping_add(1);
     }
 
     #[cfg(test)]
@@ -2772,6 +3004,7 @@ struct WorkspacePanel {
         crate::target::ResourceIdentity,
         Option<String>,
     )>,
+    event_window: EventWindow,
     _navigation_subscription: Option<Subscription>,
     activity_events: VecDeque<SimulatedTaskMessage>,
     activity_status: SharedString,
@@ -2808,6 +3041,7 @@ impl WorkspacePanel {
             yaml_editor,
             yaml_tab: None,
             live_yaml_key: None,
+            event_window: EventWindow::LastDay,
             _navigation_subscription: None,
             activity_events: VecDeque::new(),
             activity_status: SharedString::from("IDLE / LOCAL FAKE TASK"),
@@ -3817,6 +4051,12 @@ impl WorkspacePanel {
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
                     panel.detail_view = view;
+                    if view == DetailView::Events {
+                        panel.navigation.update(cx, |navigation, cx| {
+                            navigation.request_events(false);
+                            cx.notify();
+                        });
+                    }
                     cx.notify();
                 }),
             )
@@ -3861,6 +4101,7 @@ impl WorkspacePanel {
             DetailView::Relations => {
                 render_empty_detail("Relationship facts require a live target.")
             }
+            DetailView::Events => render_empty_detail("Events require a live target."),
             DetailView::Diff if selected_resource.is_some() => render_simulated_diff(),
             DetailView::Diff => render_empty_detail("Open a simulated resource to inspect Diff."),
         };
@@ -3997,6 +4238,7 @@ impl WorkspacePanel {
                 _ => render_empty_detail("Select a resource to inspect its object."),
             },
             DetailView::Relations => self.render_live_relations(cx),
+            DetailView::Events => self.render_live_events(cx),
             DetailView::Diff => render_empty_detail("No comparison snapshot is available."),
         };
         let status = if selected_deleted {
@@ -4077,6 +4319,7 @@ impl WorkspacePanel {
                     .child(self.detail_view_tab("Overview", DetailView::Overview, cx))
                     .child(self.detail_view_tab("YAML", DetailView::Yaml, cx))
                     .child(self.detail_view_tab("Relations", DetailView::Relations, cx))
+                    .child(self.detail_view_tab("Events", DetailView::Events, cx))
                     .child(self.detail_view_tab("Diff", DetailView::Diff, cx)),
             )
             .child(body)
@@ -4309,6 +4552,246 @@ impl WorkspacePanel {
                 vec![render_empty_detail(empty_message)]
             } else {
                 relation_rows
+            });
+        div().flex_1().child(content.overflow_y_scrollbar())
+    }
+
+    fn render_live_events(&mut self, cx: &mut Context<Self>) -> Div {
+        let now = jiff::Timestamp::now().as_second();
+        let (selected_fact, namespace, state, events) = {
+            let navigation = self.navigation.read(cx);
+            let browser = navigation
+                .live_browser
+                .as_ref()
+                .expect("live browser checked before Events view");
+            let cache = browser.event_cache();
+            let selected = browser.active_fact().cloned();
+            let state = cache.map(|cache| cache.state(now));
+            let events = match (cache, selected.as_ref()) {
+                (Some(cache), Some(selected)) => {
+                    cache.associated_events(selected, self.event_window, now)
+                }
+                _ => Vec::new(),
+            };
+            (
+                selected,
+                browser.namespace().map(str::to_owned),
+                state,
+                events,
+            )
+        };
+        let time_windows = [
+            EventWindow::LastHour,
+            EventWindow::LastDay,
+            EventWindow::LastWeek,
+            EventWindow::All,
+        ]
+        .into_iter()
+        .map(|window| {
+            div()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(if self.event_window == window { ACCENT_SOFT } else { RAISED }))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(if self.event_window == window {
+                            TEXT_1
+                        } else {
+                            TEXT_4
+                        }))
+                        .child(window.label()),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |panel, _, _, cx| {
+                        panel.event_window = window;
+                        cx.notify();
+                    }),
+                )
+        });
+        let refresh = Button::new("refresh-resource-events")
+            .label("Refresh")
+            .compact()
+            .ghost()
+            .on_click(cx.listener(|panel, _, _, cx| {
+                panel.navigation.update(cx, |navigation, cx| {
+                    navigation.request_events(true);
+                    cx.notify();
+                });
+            }));
+        let state_label = state.map_or("NAMESPACE REQUIRED", |state| {
+            if state.stale {
+                "STALE"
+            } else if state.truncated {
+                "TRUNCATED"
+            } else {
+                state.status.label()
+            }
+        });
+        let message = match (selected_fact.as_ref(), state) {
+            (None, _) => "Select a resource to view associated Events.".to_owned(),
+            (_, None) => "Select a Namespace to load Kubernetes Events.".to_owned(),
+            (Some(_), Some(state)) => match state.status {
+                EventCollectionStatus::NotRequested => "Events have not been loaded.".to_owned(),
+                EventCollectionStatus::Loading => "Loading Events for the selected Namespace...".to_owned(),
+                EventCollectionStatus::Empty => "No Events reported for this Namespace.".to_owned(),
+                EventCollectionStatus::Loaded | EventCollectionStatus::Truncated
+                    if events.is_empty() =>
+                {
+                    format!("No Events associated with this resource in {}.", self.event_window.label())
+                }
+                EventCollectionStatus::Unsupported => {
+                    "The Kubernetes API does not serve Events in this cluster.".to_owned()
+                }
+                EventCollectionStatus::DiscoveryDenied => {
+                    "Event API discovery permission is denied.".to_owned()
+                }
+                EventCollectionStatus::ListUnsupported => {
+                    "The Event API does not support LIST.".to_owned()
+                }
+                EventCollectionStatus::CapabilityUnavailable => {
+                    "Event API capability could not be determined.".to_owned()
+                }
+                EventCollectionStatus::Failed(error) => {
+                    crate::fact_service::FactError::new(error).summary().to_owned()
+                }
+                EventCollectionStatus::Loaded | EventCollectionStatus::Truncated => String::new(),
+            },
+        };
+        let event_rows = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let event_color = if event.event_type.eq_ignore_ascii_case("warning") {
+                    WARN
+                } else {
+                    INFO
+                };
+                let open_target = selected_fact.as_ref().and_then(|fact| {
+                    let kind = ResourceKind::from_api_kind(fact.resource().identity().kind())?;
+                    let fact = fact.clone();
+                    Some(
+                        Button::new(format!("open-event-object-{index}"))
+                            .label("Open resource")
+                            .compact()
+                            .ghost()
+                            .on_click(cx.listener(move |panel, _, _, cx| {
+                                panel.navigation.update(cx, |navigation, cx| {
+                                    let opened = if let Some(browser) =
+                                        &mut navigation.live_browser
+                                    {
+                                        browser.select_kind(kind);
+                                        browser.open_resource(kind, fact.clone());
+                                        true
+                                    } else {
+                                        false
+                                    };
+                                    if opened {
+                                        navigation.live_request_epoch =
+                                            navigation.live_request_epoch.wrapping_add(1);
+                                    }
+                                    cx.notify();
+                                });
+                            })),
+                    )
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(pill(event.event_type.clone(), event_color, ACCENT_SOFT))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_sm()
+                                    .text_color(rgb(TEXT_1))
+                                    .child(event.reason.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family("Menlo")
+                                    .text_color(rgb(TEXT_4))
+                                    .child(format!("COUNT {}", event.count)),
+                                    )
+                                    .children(open_target),
+                    )
+                    .child(info_row(
+                        "Object",
+                        format!(
+                            "{} / {} / UID {}",
+                            event.object_kind,
+                            event.object_name,
+                            event.object_uid.as_deref().unwrap_or("UID MISSING")
+                        ),
+                    ))
+                    .child(info_row("Association", event.association.label()))
+                    .child(info_row(
+                        "First / latest",
+                        format!(
+                            "{} / {}",
+                            event.first_timestamp.as_deref().unwrap_or("TIME UNKNOWN"),
+                            event.latest_timestamp.as_deref().unwrap_or("TIME UNKNOWN")
+                        ),
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_3))
+                            .child(event.message.clone()),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        let content = div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(rgb(BG))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .children(time_windows)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(rgb(TEXT_5))
+                            .child(state_label),
+                    )
+                    .child(refresh),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_5))
+                    .child(format!(
+                        "NAMESPACE / {} / CACHED {} / MAX {} / MESSAGES ARE UNTRUSTED",
+                        namespace.as_deref().unwrap_or("NOT SELECTED"),
+                        state.map_or(0, |state| state.count),
+                        MAX_CACHED_EVENTS
+                    )),
+            )
+            .children(if event_rows.is_empty() {
+                vec![render_empty_detail(message)]
+            } else {
+                event_rows
             });
         div().flex_1().child(content.overflow_y_scrollbar())
     }

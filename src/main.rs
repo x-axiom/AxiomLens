@@ -8,6 +8,7 @@ pub mod kubeconfig;
 pub mod resource_browser;
 pub mod resource_details;
 pub mod resource_relations;
+pub mod resource_events;
 mod simulated_data;
 mod simulation;
 pub mod settings;

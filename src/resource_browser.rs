@@ -1,6 +1,7 @@
 use crate::{
     connection::{ApiCapabilitySnapshot, ApiResourceCapability},
     fact_service::{FactErrorKind, FactStreamEvent, FactWatchEvent, ResourceFact},
+    resource_events::ResourceEventCache,
     resource_relations::ResourceRelationSnapshot,
     target::{ResourceIdentity, TargetBinding},
 };
@@ -206,6 +207,7 @@ pub struct ResourceBrowser {
     relation_query_key: Option<(ResourceIdentity, Option<String>)>,
     relation_query_status: RelationQueryStatus,
     relation_snapshot: Option<ResourceRelationSnapshot>,
+    event_cache: Option<ResourceEventCache>,
 }
 
 impl ResourceBrowser {
@@ -215,6 +217,9 @@ impl ResourceBrowser {
         context_name: String,
         namespace: Option<String>,
     ) -> Self {
+        let event_cache = namespace
+            .as_ref()
+            .map(|namespace| ResourceEventCache::new(target.clone(), namespace.clone()));
         Self {
             target,
             cluster_name,
@@ -229,6 +234,7 @@ impl ResourceBrowser {
             relation_query_key: None,
             relation_query_status: RelationQueryStatus::NotRequested,
             relation_snapshot: None,
+            event_cache,
         }
     }
 
@@ -613,6 +619,14 @@ impl ResourceBrowser {
         self.relation_query_key = None;
         self.relation_query_status = RelationQueryStatus::NotRequested;
         self.relation_snapshot = None;
+    }
+
+    pub fn event_cache(&self) -> Option<&ResourceEventCache> {
+        self.event_cache.as_ref()
+    }
+
+    pub fn event_cache_mut(&mut self) -> Option<&mut ResourceEventCache> {
+        self.event_cache.as_mut()
     }
 
     fn clear_relation_query(&mut self) {
