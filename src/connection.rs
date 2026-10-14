@@ -1146,6 +1146,8 @@ mod tests {
     const RELATION_SERVICE: &str = r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"checkout","namespace":"relations-test","uid":"uid-service","resourceVersion":"rv-service"},"spec":{"selector":{"app":"checkout"},"ports":[{"port":80,"targetPort":8080}]}}"#;
     const RELATION_REPLICASETS: &str = r#"{"apiVersion":"apps/v1","kind":"ReplicaSetList","metadata":{"resourceVersion":"rv-rs-list"},"items":[{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"checkout-7f8","namespace":"relations-test","uid":"uid-rs","resourceVersion":"rv-rs","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"checkout","uid":"uid-deploy","controller":true}]} ,"spec":{"replicas":2}},{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"other-123","namespace":"relations-test","uid":"uid-rs-other","resourceVersion":"rv-rs-other","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"other","uid":"uid-deploy-other","controller":true}]},"spec":{"replicas":1}}]}"#;
     const RELATION_PODS: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"rv-pod-list"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-7f8-a","namespace":"relations-test","uid":"uid-pod-child","resourceVersion":"rv-pod","labels":{"app":"checkout"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"checkout-7f8","uid":"uid-rs","controller":true}]},"spec":{"containers":[{"name":"api","image":"example/api:v1"}]}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"other-123-a","namespace":"relations-test","uid":"uid-pod-unrelated","resourceVersion":"rv-pod-other","labels":{"app":"other"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"other-123","uid":"uid-rs-other","controller":true}]},"spec":{"containers":[{"name":"api","image":"example/other:v1"}]}}]}"#;
+    const RELATION_POD_DETAIL: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-7f8-a","namespace":"relations-test","uid":"uid-pod-child","resourceVersion":"rv-pod","labels":{"app":"checkout"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"checkout-7f8","uid":"uid-rs","controller":true}]},"spec":{"containers":[{"name":"api","image":"example/api:v1"}]}}"#;
+    const RELATION_EVENT_LIST: &str = r#"{"apiVersion":"v1","kind":"EventList","metadata":{"resourceVersion":"rv-checkout-events"},"items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"checkout-backoff","namespace":"relations-test","uid":"uid-checkout-event","resourceVersion":"rv-checkout-event"},"involvedObject":{"apiVersion":"v1","kind":"Pod","name":"checkout-7f8-a","namespace":"relations-test","uid":"uid-pod-child"},"type":"Warning","reason":"BackOff","message":"container restarting","count":2,"firstTimestamp":"2026-10-14T11:00:00Z","lastTimestamp":"2026-10-14T11:55:00Z"}]}"#;
     const RELATION_ENDPOINT_SLICES: &str = r#"{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSliceList","metadata":{"resourceVersion":"rv-slices"},"items":[{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"checkout-a","namespace":"relations-test","uid":"uid-slice","resourceVersion":"rv-slice","labels":{"kubernetes.io/service-name":"checkout"}},"addressType":"IPv4","ports":[{"port":8080}],"endpoints":[{"addresses":["10.0.0.4"],"targetRef":{"apiVersion":"v1","kind":"Pod","name":"checkout-7f8-a","uid":"uid-pod-child"},"conditions":{"ready":true}}]}]}"#;
     const RELATION_ENDPOINTS: &str = r#"{"apiVersion":"v1","kind":"EndpointsList","metadata":{"resourceVersion":"rv-endpoints"},"items":[{"apiVersion":"v1","kind":"Endpoints","metadata":{"name":"checkout","namespace":"relations-test","uid":"uid-endpoints","resourceVersion":"rv-endpoint"},"subsets":[{"addresses":[{"ip":"10.0.0.4","targetRef":{"apiVersion":"v1","kind":"Pod","name":"checkout-7f8-a","uid":"uid-pod-child"}}]}]}]}"#;
     const RELATION_INGRESSES: &str = r#"{"apiVersion":"networking.k8s.io/v1","kind":"IngressList","metadata":{"resourceVersion":"rv-ingress-list"},"items":[{"apiVersion":"networking.k8s.io/v1","kind":"Ingress","metadata":{"name":"checkout-web","namespace":"relations-test","uid":"uid-ingress","resourceVersion":"rv-ingress"},"spec":{"rules":[{"host":"checkout.example.test","http":{"paths":[{"path":"/","pathType":"Prefix","backend":{"service":{"name":"checkout","port":{"number":80}}}}]}}]}}]}"#;
@@ -1319,6 +1321,9 @@ mod tests {
         if path == "/api/v1/namespaces/empty-events/events" {
             return EMPTY_EVENT_LIST;
         }
+        if path == "/api/v1/namespaces/relations-test/events" {
+            return RELATION_EVENT_LIST;
+        }
         match path {
             "/api/v1" => CORE,
             "/apis/apps/v1" => APPS,
@@ -1330,6 +1335,8 @@ mod tests {
             "/api/v1/namespaces/relations-test/services/checkout" => RELATION_SERVICE,
             "/apis/apps/v1/namespaces/relations-test/replicasets" => RELATION_REPLICASETS,
             "/api/v1/namespaces/relations-test/pods" => RELATION_PODS,
+            "/api/v1/namespaces/relations-test/pods/checkout-7f8-a" => RELATION_POD_DETAIL,
+            "/api/v1/namespaces/relations-test/pods/checkout-7f8-a/log" => LOG_STREAM_BODY,
             "/api/v1/namespaces/relations-test/endpoints" => RELATION_ENDPOINTS,
             "/apis/discovery.k8s.io/v1/namespaces/relations-test/endpointslices" => RELATION_ENDPOINT_SLICES,
             "/apis/networking.k8s.io/v1/namespaces/relations-test/ingresses" => RELATION_INGRESSES,
@@ -2097,6 +2104,117 @@ mod tests {
                 && relation.target().resource().identity().uid() != "uid-pod-unrelated"
         }));
 
+        mock.join();
+    }
+
+    #[test]
+    fn read_only_workbench_path_connects_workload_relations_events_and_container_logs() {
+        let mock = MockApi::start(&[200; 26]);
+        let (connection, target, runtime, capabilities) =
+            connection_with_discovery_in_namespace(&mock, "relations-test");
+        let service = connection
+            .read_only_facts(capabilities.clone(), SharedFactCache::default())
+            .unwrap();
+
+        let deployment = runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("apps", "v1", "Deployment"),
+                Some("relations-test".to_owned()),
+                "checkout".to_owned(),
+            ))
+            .unwrap();
+        let details = crate::resource_details::ResourceDetails::from_object(
+            "Deployment",
+            deployment.object(),
+        );
+        assert_eq!(details.workload.unwrap().desired_replicas, Some(2));
+
+        let relations = runtime.block_on(crate::resource_relations::collect_related_facts(
+            &service,
+            &capabilities,
+            &deployment,
+            CancellationToken::new(),
+        ));
+        assert!(relations.relations().iter().any(|relation| {
+            relation.kind() == crate::resource_relations::RelationKind::OwnerReference
+                && relation.source().resource().identity().uid() == "uid-deploy"
+                && relation.target().resource().identity().uid() == "uid-rs"
+        }));
+        let pod = relations
+            .collections()
+            .iter()
+            .find(|collection| collection.kind() == ResourceKind::Pod)
+            .unwrap()
+            .facts()
+            .iter()
+            .find(|fact| fact.resource().identity().uid() == "uid-pod-child")
+            .unwrap()
+            .clone();
+
+        let mut event_cache = crate::resource_events::ResourceEventCache::new(
+            target.clone(),
+            "relations-test".to_owned(),
+        );
+        event_cache.begin_query();
+        let event_stream = service
+            .list_paginated_stream(
+                GroupVersionKind::gvk("", "v1", "Event"),
+                Some("relations-test".to_owned()),
+                crate::resource_events::MAX_CACHED_EVENTS,
+            )
+            .unwrap();
+        let truncated = runtime.block_on(async {
+            loop {
+                match event_stream.recv().await.unwrap() {
+                    FactStreamEvent::Batch(batch) => {
+                        for fact in &batch {
+                            event_cache.ingest_fact(fact);
+                        }
+                    }
+                    FactStreamEvent::Complete {
+                        possibly_truncated,
+                        ..
+                    } => break possibly_truncated,
+                    FactStreamEvent::WatchBatch(_) => {
+                        panic!("Event read must use bounded LIST pagination")
+                    }
+                }
+            }
+        });
+        event_cache.finish_query(truncated);
+        let associated_events = event_cache.associated_events(
+            &pod,
+            crate::resource_events::EventWindow::All,
+            jiff::Timestamp::now().as_second(),
+        );
+        assert_eq!(associated_events.len(), 1);
+        assert_eq!(associated_events[0].object_uid.as_deref(), Some("uid-pod-child"));
+        assert_eq!(associated_events[0].count, 2);
+
+        let logs = service
+            .container_log_stream(&pod, log_request(ContainerLogMode::Current))
+            .unwrap();
+        assert_eq!(logs.target(), &target);
+        assert_eq!(logs.pod_identity().uid(), "uid-pod-child");
+        let (lines, line_count, _, possibly_truncated) = collect_log_stream(&runtime, &logs);
+        assert_eq!(line_count, 2);
+        assert!(!possibly_truncated);
+        assert_eq!(lines[0].message, "request accepted");
+
+        let requests = mock.requests();
+        assert!(requests.iter().all(|request| {
+            request.starts_with("GET ") || request.contains("/selfsubjectaccessreviews")
+        }));
+        assert!(requests.iter().any(|request| {
+            request.contains("/apis/apps/v1/namespaces/relations-test/deployments/checkout")
+        }));
+        assert!(requests.iter().any(|request| {
+            request.contains("/api/v1/namespaces/relations-test/events")
+        }));
+        assert!(requests.iter().any(|request| {
+            request.contains("/api/v1/namespaces/relations-test/pods/checkout-7f8-a/log?")
+        }));
+        drop(logs);
         mock.join();
     }
 

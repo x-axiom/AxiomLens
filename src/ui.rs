@@ -5789,7 +5789,7 @@ impl Render for WorkspacePanel {
             PanelKind::Resources => self.render_resources(cx),
             PanelKind::Details => self.render_details(window, cx),
             PanelKind::Activity => self.render_activity(cx),
-            PanelKind::Agent => render_agent(snapshot),
+            PanelKind::Agent => render_agent(),
         };
         panel.track_focus(&self.focus_handle)
     }
@@ -6706,18 +6706,10 @@ fn task_terminal_status(message: &SimulatedTaskMessage) -> Option<SharedString> 
     }
 }
 
-fn context_chip(label: &'static str) -> Div {
-    div()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(BORDER))
-        .bg(rgb(ELEVATED))
-        .child(div().text_xs().text_color(rgb(TEXT_2)).child(label))
-}
+const AGENT_NOT_CONFIGURED_NOTICE: &str =
+    "No Agent is configured. The read-only workbench remains available.";
 
-fn render_agent(snapshot: SimulatedSnapshot) -> Div {
+fn render_agent() -> Div {
     div()
         .size_full()
         .flex()
@@ -6744,90 +6736,31 @@ fn render_agent(snapshot: SimulatedSnapshot) -> Div {
                 )
                 .child(div().text_sm().text_color(rgb(TEXT_1)).child("AI Agent"))
                 .child(div().flex_1())
-                .child(pill("SIMULATED", 0x7fb4e6, ACCENT_SOFT)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .p_3()
-                .bg(rgb(BG))
-                .child(div().text_xs().text_color(rgb(TEXT_5)).child("CONTEXT / 4 ITEMS"))
-                .child(context_chip("payment-api / Deployment"))
-                .child(context_chip(snapshot.namespace))
-                .child(context_chip("2 sample Pods"))
-                .child(context_chip("3 sample Events")),
+                .child(pill("NOT CONFIGURED", WARN, ACCENT_SOFT)),
         )
         .child(
             div()
                 .flex_1()
                 .flex()
                 .flex_col()
-                .gap_3()
-                .p_3()
-                .bg(rgb(BG))
-                .child(div().text_xs().text_color(rgb(TEXT_4)).child("DIAGNOSTIC PREVIEW"))
-                .child(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .child(
-                            div()
-                                .max_w(px(284.0))
-                                .p_3()
-                                .rounded_lg()
-                                .bg(rgb(ACCENT_SOFT))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(TEXT_1))
-                                        .child("Why does the sample payment-api show 503?"),
-                                ),
-                        ),
-                )
-                .child(div().text_xs().text_color(rgb(TEXT_3)).child("SAMPLE RESPONSE / NOT GENERATED"))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .p_3()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(PANEL))
-                        .child(div().text_sm().text_color(rgb(TEXT_1)).child("Sample observations"))
-                        .child(div().text_xs().text_color(rgb(TEXT_2)).child("H1  EndpointSlice has no ready backend"))
-                        .child(div().text_xs().text_color(rgb(TEXT_2)).child("H2  Example upstream latency is elevated"))
-                        .child(div().text_xs().text_color(rgb(WARN)).child("H3  Readiness threshold needs validation")),
-                    )
-                    .overflow_y_scrollbar(),
-                )
-        .child(
-            div()
-                .flex()
                 .items_center()
+                .justify_center()
                 .gap_2()
                 .p_3()
-                .bg(rgb(RAISED))
+                .bg(rgb(BG))
+                .child(div().text_sm().text_color(rgb(TEXT_2)).child("NO DIAGNOSTIC OUTPUT"))
                 .child(
                     div()
-                        .flex_1()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(BG))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(TEXT_5))
-                                .child("Agent input disabled in Stage 1"),
-                        ),
-                )
-                .child(pill("DISABLED", TEXT_5, ELEVATED)),
+                        .text_xs()
+                        .text_color(rgb(TEXT_4))
+                        .child(AGENT_NOT_CONFIGURED_NOTICE),
+                ),
+        )
+        .child(
+            div()
+                .p_3()
+                .bg(rgb(RAISED))
+                .child(div().text_xs().text_color(rgb(TEXT_5)).child("AGENT UNAVAILABLE")),
         )
 }
 
@@ -7343,6 +7276,31 @@ mod tests {
             Some(ContainerLogSince::Seconds(86400))
         );
         assert_eq!(LogTimeWindow::All.since(), None);
+    }
+
+    #[test]
+    fn agent_placeholder_withholds_sample_findings() {
+        let notice = AGENT_NOT_CONFIGURED_NOTICE.to_ascii_lowercase();
+        assert!(notice.contains("no agent is configured"));
+        for fabricated_result in ["sample", "h1", "endpoint slice", "503"] {
+            assert!(!notice.contains(fabricated_result));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn unconfigured_agent_does_not_disable_workbench_navigation(cx: &mut TestAppContext) {
+        let (window_handle, app) = open_test_workbench(cx);
+        cx.update_window(window_handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("open-command-palette", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window_handle, |_, _, cx| {
+            assert!(app.read(cx).palette_open);
+            assert!(!app.read(cx).command_items(cx).is_empty());
+        })
+        .unwrap();
     }
 
     fn relative_luminance(color: u32) -> f64 {
