@@ -1117,6 +1117,7 @@ mod tests {
 
     const TEST_TOKEN: &str = "CONNECTION_TEST_TOKEN_NEVER_LOG";
     const POD_LIST_WITH_ITEM: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-4"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-23"},"spec":{}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"worker-1","namespace":"payments","uid":"uid-pod-124","resourceVersion":"rv-24"},"spec":{}}]}"#;
+    const POD_LIST_SAME_NAME_UIDS: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"uid-list-rv"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"uid-test","uid":"uid-pod-old","resourceVersion":"rv-old"},"spec":{"containers":[{"name":"api","image":"example/api:v1"}]}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"uid-test","uid":"uid-pod-new","resourceVersion":"rv-new"},"spec":{"containers":[{"name":"api","image":"example/api:v2"}]}}]}"#;
     const POD_RELIST_WITH_ITEM: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-5"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-27"},"spec":{}}]}"#;
     const POD_FINAL_STATE_LIST: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-6"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-26"},"spec":{"nodeName":"node-2"}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"queue-2","namespace":"payments","uid":"uid-pod-125","resourceVersion":"rv-1"},"spec":{}}]}"#;
     const POD_DETAIL: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-23"},"spec":{}}"#;
@@ -1263,6 +1264,7 @@ mod tests {
             "/apis/networking.k8s.io/v1" => NETWORKING,
             "/apis/discovery.k8s.io/v1" => DISCOVERY,
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" => ACCESS_REVIEW,
+            "/api/v1/namespaces/uid-test/pods" => POD_LIST_SAME_NAME_UIDS,
             "/api/v1/namespaces/payments/pods" => POD_LIST_WITH_ITEM,
             "/api/v1/namespaces/payments/pods/api-0" => POD_DETAIL,
             _ => PODS,
@@ -1552,6 +1554,30 @@ mod tests {
         assert_eq!(facts[0].completeness(), FactCompleteness::Complete);
         assert_eq!(facts[0].source(), FactSource::ApiServer);
         assert!(facts[0].raw_reference().is_some());
+        let yaml = crate::resource_details::to_readonly_yaml(facts[0].object()).unwrap();
+        let yaml_object: serde_json::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            yaml_object["metadata"]["uid"],
+            facts[0].resource().identity().uid()
+        );
+        assert_eq!(
+            yaml_object["metadata"]["resourceVersion"],
+            facts[0].resource().resource_version().unwrap()
+        );
+        assert_eq!(
+            crate::resource_details::ResourceDetails::from_object("Pod", facts[0].object())
+                .pod
+                .as_ref()
+                .unwrap()
+                .phase,
+            facts[0].object().data["status"]["phase"]
+                .as_str()
+                .map(str::to_owned)
+        );
+        assert_eq!(
+            facts[0].raw_reference().unwrap().as_str().len(),
+            36
+        );
         assert_eq!(cache.len(), 1);
 
         let raw_reference = facts[1].raw_reference().unwrap();
@@ -1596,6 +1622,86 @@ mod tests {
             "{requests:?}"
         );
         assert!(requests[18].contains("/api/v1/namespaces/payments/pods/api-0"));
+    }
+
+    #[test]
+    fn same_name_pod_recreation_keeps_uid_and_detail_tabs_distinct() {
+        let mock = MockApi::start(&[200; 18]);
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target_in_namespace(&path, "uid-test");
+        let connection = run_connect(imported, target.clone(), policy(0)).unwrap();
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let capabilities = runtime
+            .block_on(connection.discover_capabilities(
+                CancellationToken::new(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+        let service = connection
+            .read_only_facts(capabilities.clone(), SharedFactCache::default())
+            .unwrap();
+        let mut browser = ResourceBrowser::new(
+            target.clone(),
+            "mock-cluster".to_owned(),
+            "local".to_owned(),
+            Some("uid-test".to_owned()),
+        );
+        browser.set_capabilities(capabilities);
+        browser.select_kind(ResourceKind::Pod);
+        browser.begin_request(ResourceKind::Pod);
+        let stream = service
+            .list_stream(
+                GroupVersionKind::gvk("", "v1", "Pod"),
+                Some("uid-test".to_owned()),
+                10,
+            )
+            .unwrap();
+        let facts = runtime.block_on(async {
+            let mut facts = Vec::new();
+            loop {
+                match stream.recv().await.unwrap() {
+                    FactStreamEvent::Batch(batch) => {
+                        browser.apply_stream_event(
+                            &target,
+                            ResourceKind::Pod,
+                            FactStreamEvent::Batch(batch.clone()),
+                        );
+                        facts.extend(batch);
+                    }
+                    event @ FactStreamEvent::Complete { .. } => {
+                        browser.apply_stream_event(&target, ResourceKind::Pod, event);
+                        break facts;
+                    }
+                    FactStreamEvent::WatchBatch(_) => {
+                        panic!("list stream must not emit Watch events")
+                    }
+                }
+            }
+        });
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].resource().identity().name(), facts[1].resource().identity().name());
+        assert_ne!(facts[0].resource().identity().uid(), facts[1].resource().identity().uid());
+        assert_eq!(browser.count(ResourceKind::Pod), 2);
+        browser.open_resource(ResourceKind::Pod, facts[0].clone());
+        browser.open_resource(ResourceKind::Pod, facts[1].clone());
+        assert_eq!(browser.tabs().len(), 2);
+        assert_ne!(
+            browser.tabs()[0].identity().uid(),
+            browser.tabs()[1].identity().uid()
+        );
+        browser.select_tab(0);
+        assert_eq!(
+            browser.active_fact().unwrap().resource().identity().uid(),
+            "uid-pod-old"
+        );
+
+        mock.join();
     }
 
     #[test]

@@ -33,6 +33,7 @@ use crate::fact_service::{
 use crate::kubeconfig::{ExecPluginSummary, ImportedKubeconfig, KubeconfigImportError};
 use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
 use crate::resource_browser::{ResourceBrowser, ResourceCollectionStatus, ResourceKind};
+use crate::resource_details::{ResourceDetails, to_readonly_yaml};
 use crate::target::{ContextName, SessionRegistry, TargetBinding};
 use crate::diagnostics::{DiagnosticEvent, Diagnostics, next_correlation_id};
 
@@ -2651,6 +2652,7 @@ struct WorkspacePanel {
     yaml_editor: Option<Entity<EditorState>>,
     yaml_tab: Option<ResourceTab>,
     live_yaml_key: Option<(
+        TargetBinding,
         ResourceKind,
         crate::target::ResourceIdentity,
         Option<String>,
@@ -3807,6 +3809,7 @@ impl WorkspacePanel {
 
     fn render_live_details(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let (
+            target,
             cluster,
             context,
             target_namespace,
@@ -3822,6 +3825,7 @@ impl WorkspacePanel {
                 .expect("live browser checked before render");
             let active_tab = browser.active_tab();
             (
+                browser.target().clone(),
                 browser.cluster_name().to_owned(),
                 browser.context_name().to_owned(),
                 browser.namespace().unwrap_or("ALL NAMESPACES").to_owned(),
@@ -3834,20 +3838,24 @@ impl WorkspacePanel {
         self.yaml_tab = None;
         let detail_key = selected_fact.as_ref().map(|fact| {
             (
+                target.clone(),
                 selected_kind.expect("selected fact has a resource kind"),
                 fact.resource().identity().clone(),
                 fact.resource().resource_version().map(str::to_owned),
             )
         });
-        if self.live_yaml_key != detail_key {
+        if self.detail_view == DetailView::Yaml && self.live_yaml_key != detail_key {
             let yaml = selected_fact
                 .as_ref()
-                .and_then(|fact| serde_json::to_string_pretty(fact.object()).ok())
+                .map(|fact| {
+                    to_readonly_yaml(fact.object())
+                        .unwrap_or_else(|_| "Unable to serialize resource as YAML.".to_owned())
+                })
                 .unwrap_or_default();
             if let Some(editor) = &self.yaml_editor {
                 editor.update(cx, |editor, cx| editor.set_value(&yaml, window, cx));
             }
-            self.live_yaml_key = detail_key;
+            self.live_yaml_key = detail_key.clone();
         }
 
         let body = match self.detail_view {
@@ -4519,6 +4527,7 @@ fn render_live_detail_overview(
         return render_empty_detail("Select a resource to inspect its details.");
     };
     let identity = fact.resource().identity();
+    let details = ResourceDetails::from_object(identity.kind(), fact.object());
     let namespace = identity
         .namespace()
         .map(|namespace| namespace.as_str())
@@ -4540,6 +4549,175 @@ fn render_live_detail_overview(
     } else {
         "FRESH"
     };
+    let raw_reference = fact
+        .raw_reference()
+        .map(|reference| reference.as_str())
+        .unwrap_or("NOT RETAINED");
+    let display_count = |value: Option<i64>| {
+        value.map_or_else(|| "NOT REPORTED".to_owned(), |count| count.to_string())
+    };
+    let pod_rows = details.pod.as_ref().map_or_else(Vec::new, |pod| {
+        vec![
+            info_row(
+                "Phase",
+                pod.phase.as_deref().unwrap_or("NOT REPORTED").to_owned(),
+            ),
+            info_row(
+                "Reason",
+                pod.reason.as_deref().unwrap_or("NOT REPORTED").to_owned(),
+            ),
+            info_row(
+                "Ready condition",
+                pod.ready_condition
+                    .as_deref()
+                    .unwrap_or("NOT REPORTED")
+                    .to_owned(),
+            ),
+            info_row(
+                "Container restarts",
+                pod.restarts.map_or_else(
+                    || "NOT REPORTED".to_owned(),
+                    |count| count.to_string(),
+                ),
+            ),
+        ]
+    });
+    let workload_rows = details.workload.as_ref().map_or_else(Vec::new, |rollout| {
+        vec![
+            div().text_xs().text_color(rgb(TEXT_4)).child("REPLICA / ROLLOUT FACTS"),
+            info_row("Desired replicas", display_count(rollout.desired_replicas)),
+            info_row("Current replicas", display_count(rollout.current_replicas)),
+            info_row("Updated replicas", display_count(rollout.updated_replicas)),
+            info_row("Ready replicas", display_count(rollout.ready_replicas)),
+            info_row("Available replicas", display_count(rollout.available_replicas)),
+            info_row("Unavailable replicas", display_count(rollout.unavailable_replicas)),
+            info_row("Generation", display_count(rollout.generation)),
+            info_row("Observed generation", display_count(rollout.observed_generation)),
+        ]
+    });
+    let job_rows = details.job.as_ref().map_or_else(Vec::new, |job| {
+        vec![
+            div().text_xs().text_color(rgb(TEXT_4)).child("JOB PROGRESS FACTS"),
+            info_row("Active", display_count(job.active)),
+            info_row("Succeeded", display_count(job.succeeded)),
+            info_row("Failed", display_count(job.failed)),
+            info_row(
+                "Completion time",
+                job.completion_time
+                    .as_deref()
+                    .unwrap_or("NOT REPORTED")
+                    .to_owned(),
+            ),
+        ]
+    });
+    let condition_rows = if details.conditions.is_empty() {
+        vec![info_row("Conditions", "None reported by API")]
+    } else {
+        details
+            .conditions
+            .iter()
+            .map(|condition| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .py_1()
+                    .child(info_row(
+                        "Condition",
+                        format!("{} / {}", condition.condition_type, condition.status),
+                    ))
+                    .child(info_row(
+                        "Reason",
+                        condition.reason.as_deref().unwrap_or("NOT REPORTED").to_owned(),
+                    ))
+                    .child(info_row(
+                        "Message",
+                        condition.message.as_deref().unwrap_or("NOT REPORTED").to_owned(),
+                    ))
+                    .child(info_row(
+                        "Transition time",
+                        condition
+                            .last_transition_time
+                            .as_deref()
+                            .unwrap_or("NOT REPORTED")
+                            .to_owned(),
+                    ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let container_rows = if details.containers.is_empty() {
+        vec![info_row("Containers", "No container data for this resource")]
+    } else {
+        details
+            .containers
+            .iter()
+            .map(|container| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .py_1()
+                    .child(info_row(
+                        "Container",
+                        format!("{} / {}", container.role, container.name),
+                    ))
+                    .child(info_row(
+                        "Image",
+                        container.image.as_deref().unwrap_or("NOT REPORTED").to_owned(),
+                    ))
+                    .child(info_row(
+                        "Image pull policy",
+                        container
+                            .image_pull_policy
+                            .as_deref()
+                            .unwrap_or("NOT REPORTED")
+                            .to_owned(),
+                    ))
+                    .child(info_row(
+                        "Container ports",
+                        if container.ports.is_empty() {
+                            "NOT REPORTED".to_owned()
+                        } else {
+                            container.ports.join(", ")
+                        },
+                    ))
+                    .child(info_row(
+                        "Resource requests",
+                        container
+                            .resource_requests
+                            .as_deref()
+                            .unwrap_or("NOT REPORTED")
+                            .to_owned(),
+                    ))
+                    .child(info_row(
+                        "Resource limits",
+                        container
+                            .resource_limits
+                            .as_deref()
+                            .unwrap_or("NOT REPORTED")
+                            .to_owned(),
+                    ))
+                    .child(info_row("Runtime state", container.state))
+                    .child(info_row(
+                        "Ready",
+                        container.ready.map_or("NOT REPORTED", |ready| {
+                            if ready { "TRUE" } else { "FALSE" }
+                        }),
+                    ))
+                    .child(info_row(
+                        "Restarts",
+                        container.restarts.map_or_else(
+                            || "NOT REPORTED".to_owned(),
+                            |count| count.to_string(),
+                        ),
+                    ))
+                    .child(info_row(
+                        "Reason",
+                        container.reason.as_deref().unwrap_or("NOT REPORTED").to_owned(),
+                    ))
+            })
+            .collect::<Vec<_>>()
+    };
 
     div()
         .flex_1()
@@ -4556,11 +4734,19 @@ fn render_live_detail_overview(
         .child(info_row("Kind", identity.kind().to_owned()))
         .child(info_row("UID", identity.uid().to_owned()))
         .child(info_row("Resource version", resource_version.to_owned()))
+        .child(info_row("Local raw reference", raw_reference.to_owned()))
         .child(info_row("Freshness", freshness))
         .child(info_row("Completeness", completeness))
         .child(info_row("Collected at", format!("{:?}", fact.collected_at())))
         .child(info_row("Source", source))
         .child(info_row("Access", "Read only"))
+        .children(pod_rows)
+        .children(workload_rows)
+        .children(job_rows)
+        .child(div().text_xs().text_color(rgb(TEXT_4)).child("CONDITIONS"))
+        .children(condition_rows)
+        .child(div().text_xs().text_color(rgb(TEXT_4)).child("CONTAINERS"))
+        .children(container_rows)
 }
 
 fn resource_yaml(snapshot: SimulatedSnapshot, resource: &ResourceEntry) -> String {

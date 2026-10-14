@@ -6,6 +6,7 @@ pub mod exec_plugin;
 pub mod fact_service;
 pub mod kubeconfig;
 pub mod resource_browser;
+pub mod resource_details;
 mod simulated_data;
 mod simulation;
 pub mod settings;
