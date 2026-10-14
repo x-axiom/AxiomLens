@@ -579,6 +579,10 @@ impl FactBatchStream {
             .map_err(|_| FactStreamReceiveError::Closed)?
             .map_err(FactStreamReceiveError::Service)
     }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
 }
 
 impl Drop for FactBatchStream {
@@ -1378,9 +1382,10 @@ fn known_scope(gvk: &GroupVersionKind) -> Option<ApiResourceScope> {
     match (gvk.group.as_str(), gvk.version.as_str(), gvk.kind.as_str()) {
         ("", "v1", "Namespace" | "Node") => Some(ApiResourceScope::Cluster),
         ("", "v1", "Pod" | "Service")
-        | ("apps", "v1", "Deployment" | "StatefulSet" | "DaemonSet")
+        | ("apps", "v1", "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet")
         | ("batch", "v1", "Job")
-        | ("networking.k8s.io", "v1", "Ingress") => Some(ApiResourceScope::Namespaced),
+        | ("networking.k8s.io", "v1", "Ingress")
+        | ("discovery.k8s.io", "v1", "EndpointSlice") => Some(ApiResourceScope::Namespaced),
         _ => None,
     }
 }

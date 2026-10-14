@@ -22,13 +22,18 @@ use std::{
 };
 
 use crate::{simulated_data::SimulatedSnapshot, simulation::{self, SimulatedTaskMessage, SimulatedTaskMode}};
+use crate::cancellation::CancellationToken;
 use crate::connection::{
     self, ActiveConnection, ApiCapabilitySnapshot, ApiResourceDiscoveryState, ConnectionFailure,
     ConnectionPolicy,
 };
+use crate::fact_service::{
+    FactErrorKind, FactStreamEvent, FactStreamReceiveError, SharedFactCache, MAX_FACTS_PER_LIST,
+};
 use crate::kubeconfig::{ExecPluginSummary, ImportedKubeconfig, KubeconfigImportError};
 use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
-use crate::target::{ContextName, SessionRegistry};
+use crate::resource_browser::{ResourceBrowser, ResourceCollectionStatus, ResourceKind};
+use crate::target::{ContextName, SessionRegistry, TargetBinding};
 use crate::diagnostics::{DiagnosticEvent, Diagnostics, next_correlation_id};
 
 const BG: u32 = 0x0b0e13;
@@ -202,6 +207,12 @@ pub struct AxiomLensPrototype {
     connection_view_state: ConnectionViewState,
     resource_capabilities: Option<ApiCapabilitySnapshot>,
     _active_connection: Option<ActiveConnection>,
+    fact_cache: SharedFactCache,
+    resource_stream_cancellation: Option<CancellationToken>,
+    resource_stream_target: Option<TargetBinding>,
+    resource_stream_kind: Option<ResourceKind>,
+    resource_stream_epoch: Option<u64>,
+    resource_stream_generation: u64,
     previous_focus: Option<FocusHandle>,
     theme_mode: ThemeMode,
     settings_store: Option<SettingsStore>,
@@ -236,7 +247,22 @@ impl AxiomLensPrototype {
         initialize_theme_palette(theme_mode);
         let search_navigation = navigation.clone();
         let layout_dock_area = dock_area.clone();
-        let navigation_subscription = cx.observe(&navigation, |_, _, cx| cx.notify());
+        let navigation_subscription = cx.observe(&navigation, |app, navigation, cx| {
+            let (selected_kind, request_epoch) = {
+                let navigation = navigation.read(cx);
+                (
+                    navigation
+                        .live_browser
+                        .as_ref()
+                        .map(ResourceBrowser::selected_kind),
+                    navigation.live_request_epoch,
+                )
+            };
+            if let Some(kind) = selected_kind {
+                app.start_live_resource_stream(kind, request_epoch, cx);
+            }
+            cx.notify();
+        });
         let search_subscription = cx.observe(&search_input, move |_, input, cx| {
             let query = input.read(cx).value().to_string();
             search_navigation.update(cx, |navigation, cx| {
@@ -284,6 +310,12 @@ impl AxiomLensPrototype {
             connection_view_state: ConnectionViewState::Disconnected,
             resource_capabilities: None,
             _active_connection: None,
+            fact_cache: SharedFactCache::default(),
+            resource_stream_cancellation: None,
+            resource_stream_target: None,
+            resource_stream_kind: None,
+            resource_stream_epoch: None,
+            resource_stream_generation: 0,
             previous_focus: None,
             theme_mode,
             settings_store,
@@ -457,6 +489,7 @@ impl AxiomLensPrototype {
             return;
         }
         self.cancel_active_session();
+        self.end_live_resource_browser(cx);
         self.selected_context_name = None;
         self.kubeconfig_import_loading = true;
         self.kubeconfig_import_error = None;
@@ -482,6 +515,7 @@ impl AxiomLensPrototype {
                 match result {
                     Ok(imported) => {
                         app.cancel_active_session();
+                        app.end_live_resource_browser(cx);
                         app.imported_kubeconfig = Some(imported);
                         app.selected_context_name = None;
                         app.selected_namespace = None;
@@ -574,10 +608,20 @@ impl AxiomLensPrototype {
     }
 
     fn cancel_active_session(&mut self) {
+        self.cancel_live_resource_stream();
         self.session_registry.end_session();
         self._active_connection = None;
         self.resource_capabilities = None;
         self.connection_view_state = ConnectionViewState::Disconnected;
+    }
+
+    fn end_live_resource_browser(&mut self, cx: &mut Context<Self>) {
+        self.cancel_live_resource_stream();
+        self.navigation.update(cx, |navigation, cx| {
+            navigation.live_browser = None;
+            navigation.live_request_epoch = navigation.live_request_epoch.wrapping_add(1);
+            cx.notify();
+        });
     }
 
     fn reject_exec_plugin_trust(&mut self, cx: &mut Context<Self>) {
@@ -671,11 +715,39 @@ impl AxiomLensPrototype {
         target: crate::target::TargetBinding,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_live_resource_stream();
         self._active_connection = None;
         self.connection_view_state = ConnectionViewState::Connecting;
         self.resource_capabilities = None;
+        let context = imported
+            .contexts()
+            .iter()
+            .find(|context| context.name() == target.context_name());
+        let cluster_name = context
+            .map(|context| context.cluster_name().to_owned())
+            .unwrap_or_else(|| "selected-cluster".to_owned());
+        let browser = ResourceBrowser::new(
+            target.clone(),
+            cluster_name,
+            target.context_name().as_str().to_owned(),
+            target
+                .namespace_scope()
+                .single_namespace()
+                .map(|namespace| namespace.as_str().to_owned()),
+        );
+        self.navigation.update(cx, |navigation, cx| {
+            navigation.live_browser = Some(browser);
+            navigation.live_request_epoch = navigation.live_request_epoch.wrapping_add(1);
+            cx.notify();
+        });
         let Some(cancellation) = self.session_registry.cancellation_for(&target) else {
             self.connection_view_state = ConnectionViewState::Disconnected;
+            self.navigation.update(cx, |navigation, cx| {
+                if let Some(browser) = &mut navigation.live_browser {
+                    browser.mark_connection_failed();
+                }
+                cx.notify();
+            });
             return;
         };
         let preferences = &self.settings.preferences;
@@ -750,17 +822,244 @@ impl AxiomLensPrototype {
                         app.connection_view_state = ConnectionViewState::Connected {
                             attempts: connection.attempts(),
                         };
-                        app.resource_capabilities = Some(capabilities);
+                        app.resource_capabilities = Some(capabilities.clone());
                         app._active_connection = Some(connection);
+                        app.navigation.update(cx, |navigation, cx| {
+                            if let Some(browser) = &mut navigation.live_browser {
+                                browser.set_capabilities(capabilities);
+                            }
+                            cx.notify();
+                        });
                     }
                     Err(error) => {
                         app.connection_view_state = ConnectionViewState::Failed(error);
+                        app.navigation.update(cx, |navigation, cx| {
+                            if let Some(browser) = &mut navigation.live_browser {
+                                browser.mark_connection_failed();
+                            }
+                            cx.notify();
+                        });
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn cancel_live_resource_stream(&mut self) {
+        self.resource_stream_generation = self.resource_stream_generation.wrapping_add(1);
+        if let Some(cancellation) = self.resource_stream_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.resource_stream_target = None;
+        self.resource_stream_kind = None;
+        self.resource_stream_epoch = None;
+    }
+
+    fn start_live_resource_stream(
+        &mut self,
+        kind: ResourceKind,
+        request_epoch: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((target, namespace)) = self.navigation.read(cx).live_browser.as_ref().map(|browser| {
+            (
+                browser.target().clone(),
+                browser.namespace().map(str::to_owned),
+            )
+        }) else {
+            return;
+        };
+        if self._active_connection.is_none() {
+            return;
+        }
+        let Some(capabilities) = self.resource_capabilities.clone() else {
+            return;
+        };
+        if self.resource_stream_target.as_ref() == Some(&target)
+            && self.resource_stream_kind == Some(kind)
+            && self.resource_stream_epoch == Some(request_epoch)
+        {
+            return;
+        }
+
+        let Some(capability) = capabilities.resource_gvk(&kind.gvk()) else {
+            self.set_live_resource_status(
+                kind,
+                request_epoch,
+                ResourceCollectionStatus::Unsupported,
+                cx,
+            );
+            return;
+        };
+        let (list_supported, watch_supported) = match capability.state() {
+            ApiResourceDiscoveryState::Served {
+                list_supported,
+                watch_supported,
+                ..
+            } => (list_supported, watch_supported),
+            ApiResourceDiscoveryState::Unsupported => {
+                self.set_live_resource_status(
+                    kind,
+                    request_epoch,
+                    ResourceCollectionStatus::Unsupported,
+                    cx,
+                );
+                return;
+            }
+            ApiResourceDiscoveryState::DiscoveryDenied => {
+                self.set_live_resource_status(
+                    kind,
+                    request_epoch,
+                    ResourceCollectionStatus::DiscoveryDenied,
+                    cx,
+                );
+                return;
+            }
+            ApiResourceDiscoveryState::TimedOut | ApiResourceDiscoveryState::Unavailable => {
+                self.set_live_resource_status(
+                    kind,
+                    request_epoch,
+                    ResourceCollectionStatus::CapabilityUnavailable,
+                    cx,
+                );
+                return;
+            }
+        };
+        if !list_supported {
+            self.set_live_resource_status(
+                kind,
+                request_epoch,
+                ResourceCollectionStatus::ListUnsupported,
+                cx,
+            );
+            return;
+        }
+
+        self.cancel_live_resource_stream();
+        self.resource_stream_target = Some(target.clone());
+        self.resource_stream_kind = Some(kind);
+        self.resource_stream_epoch = Some(request_epoch);
+        let generation = self.resource_stream_generation;
+        let service_result = {
+            self._active_connection
+                .as_ref()
+                .expect("active connection was checked")
+                .read_only_facts(capabilities, self.fact_cache.clone())
+        };
+        let service = match service_result {
+            Ok(service) => service,
+            Err(error) => {
+                self.set_live_resource_failure(kind, error.kind(), cx);
+                return;
+            }
+        };
+        let requested_namespace = kind.is_namespaced().then(|| namespace.clone()).flatten();
+        let stream = if watch_supported {
+            service.watch_stream(kind.gvk(), requested_namespace, MAX_FACTS_PER_LIST)
+        } else {
+            service.list_stream(kind.gvk(), requested_namespace, MAX_FACTS_PER_LIST)
+        };
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.set_live_resource_failure(kind, error.kind(), cx);
+                return;
+            }
+        };
+        let request_cancellation = stream.cancellation_token();
+        self.resource_stream_cancellation = Some(request_cancellation);
+        self.resource_stream_target = Some(target.clone());
+        self.resource_stream_kind = Some(kind);
+        self.navigation.update(cx, |navigation, cx| {
+            if let Some(browser) = &mut navigation.live_browser {
+                browser.begin_request(kind);
+            }
+            cx.notify();
+        });
+
+        let app = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            loop {
+                match stream.recv().await {
+                    Ok(event) => {
+                        let finished = matches!(event, FactStreamEvent::Complete { .. });
+                        let active = app
+                            .update(cx, |app, cx| {
+                                if app.resource_stream_generation != generation
+                                    || !app.session_registry.is_current(&target)
+                                {
+                                    return false;
+                                }
+                                app.navigation.update(cx, |navigation, cx| {
+                                    if let Some(browser) = &mut navigation.live_browser {
+                                        browser.apply_stream_event(&target, kind, event);
+                                    }
+                                    cx.notify();
+                                });
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !active || finished {
+                            break;
+                        }
+                    }
+                    Err(FactStreamReceiveError::Service(error)) => {
+                        let error_kind = error.kind();
+                        let _ = app.update(cx, |app, cx| {
+                            if app.resource_stream_generation == generation
+                                && app.session_registry.is_current(&target)
+                            {
+                                app.set_live_resource_failure(kind, error_kind, cx);
+                            }
+                        });
+                        break;
+                    }
+                    Err(FactStreamReceiveError::Closed) => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn set_live_resource_status(
+        &mut self,
+        kind: ResourceKind,
+        request_epoch: u64,
+        status: ResourceCollectionStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self
+            .navigation
+            .read(cx)
+            .live_browser
+            .as_ref()
+            .map(|browser| browser.target().clone());
+        self.cancel_live_resource_stream();
+        self.resource_stream_target = target;
+        self.resource_stream_kind = Some(kind);
+        self.resource_stream_epoch = Some(request_epoch);
+        self.navigation.update(cx, |navigation, cx| {
+            if let Some(browser) = &mut navigation.live_browser {
+                browser.set_status(kind, status);
+            }
+            cx.notify();
+        });
+    }
+
+    fn set_live_resource_failure(
+        &mut self,
+        kind: ResourceKind,
+        error: FactErrorKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigation.update(cx, |navigation, cx| {
+            if let Some(browser) = &mut navigation.live_browser {
+                browser.fail(kind, error);
+            }
+            cx.notify();
+        });
     }
 
     fn adjust_connection_policy(
@@ -1532,7 +1831,7 @@ impl AxiomLensPrototype {
                                 div()
                                     .text_xs()
                                     .text_color(rgb(TEXT_5))
-                                    .child(format!("{connection_status} · sample data only")),
+                                    .child(format!("{connection_status} · read-only resource browser")),
                             )
                             .child(
                                 div()
@@ -1547,6 +1846,7 @@ impl AxiomLensPrototype {
                                                 .ghost()
                                                 .on_click(cx.listener(|app, _, _, cx| {
                                                     app.cancel_active_session();
+                                                    app.end_live_resource_browser(cx);
                                                     cx.notify();
                                                 })),
                                         )
@@ -1895,7 +2195,7 @@ impl Render for AxiomLensPrototype {
                             .text_xs()
                             .text_color(rgb(INFO))
                             .child(format!(
-                                "Target selected: {} / {} / {} · {}; resource panes remain simulated",
+                                "Target: {} / {} / {} · {}",
                                 context.cluster_name(),
                                 context.name().as_str(),
                                 self.selected_namespace
@@ -2196,6 +2496,8 @@ struct ResourceNavigation {
     active_tab: Option<ResourceTab>,
     search_query: String,
     filtered_resources: Vec<usize>,
+    live_browser: Option<ResourceBrowser>,
+    live_request_epoch: u64,
 }
 
 impl ResourceNavigation {
@@ -2228,6 +2530,8 @@ impl ResourceNavigation {
             active_tab: Some(initial_tab),
             search_query: String::new(),
             filtered_resources: Vec::new(),
+            live_browser: None,
+            live_request_epoch: 0,
         };
         navigation.refresh_filter();
         navigation
@@ -2346,6 +2650,11 @@ struct WorkspacePanel {
     detail_view: DetailView,
     yaml_editor: Option<Entity<EditorState>>,
     yaml_tab: Option<ResourceTab>,
+    live_yaml_key: Option<(
+        ResourceKind,
+        crate::target::ResourceIdentity,
+        Option<String>,
+    )>,
     _navigation_subscription: Option<Subscription>,
     activity_events: VecDeque<SimulatedTaskMessage>,
     activity_status: SharedString,
@@ -2381,6 +2690,7 @@ impl WorkspacePanel {
             detail_view: DetailView::Overview,
             yaml_editor,
             yaml_tab: None,
+            live_yaml_key: None,
             _navigation_subscription: None,
             activity_events: VecDeque::new(),
             activity_status: SharedString::from("IDLE / LOCAL FAKE TASK"),
@@ -2515,6 +2825,207 @@ impl WorkspacePanel {
         }
     }
 
+    fn render_sidebar(&self, snapshot: SimulatedSnapshot, cx: &mut Context<Self>) -> Div {
+        let browser_rows = {
+            let navigation = self.navigation.read(cx);
+            navigation.live_browser.as_ref().map(|browser| {
+                let rows = ResourceKind::ALL
+                    .into_iter()
+                    .map(|kind| {
+                        let capability = browser.capability(kind).map(|capability| capability.state());
+                        let status = browser.status(kind);
+                        let count = browser.count(kind);
+                        let count_label = if count > 0 {
+                            count.to_string()
+                        } else {
+                            match capability {
+                                Some(ApiResourceDiscoveryState::Unsupported) => "N/A".to_owned(),
+                                Some(ApiResourceDiscoveryState::DiscoveryDenied) => "DENIED".to_owned(),
+                                Some(ApiResourceDiscoveryState::TimedOut)
+                                | Some(ApiResourceDiscoveryState::Unavailable) => "UNKNOWN".to_owned(),
+                                Some(ApiResourceDiscoveryState::Served {
+                                    list_supported: false,
+                                    ..
+                                }) => "NO LIST".to_owned(),
+                                Some(ApiResourceDiscoveryState::Served {
+                                    access: connection::ApiResourceAccessAssessment::Denied,
+                                    ..
+                                }) => "RBAC".to_owned(),
+                                _ if status != ResourceCollectionStatus::NotRequested => {
+                                    status.label().to_owned()
+                                }
+                                _ => "0".to_owned(),
+                            }
+                        };
+                        (
+                            kind,
+                            kind.label(),
+                            count_label,
+                            kind.group_label(),
+                            browser.selected_kind() == kind,
+                            status,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    browser.cluster_name().to_owned(),
+                    browser.context_name().to_owned(),
+                    browser.namespace().unwrap_or("No Namespace").to_owned(),
+                    browser.selected_kind().label(),
+                    browser.target_status().label(),
+                    rows,
+                )
+            })
+        };
+        let Some((cluster_name, context_name, namespace, selected_kind, connection_status, rows)) =
+            browser_rows
+        else {
+            return render_sidebar(snapshot);
+        };
+
+        let group_views = ["WORKLOADS", "NETWORK", "BATCH", "CLUSTER"]
+            .into_iter()
+            .map(|group| {
+                let items = rows
+                    .iter()
+                    .filter(|(_, _, _, item_group, _, _)| *item_group == group)
+                    .map(|(kind, label, count, _, active, status)| {
+                        let resource_kind = *kind;
+                        let color = match status {
+                            ResourceCollectionStatus::DiscoveryDenied
+                            | ResourceCollectionStatus::Failed(FactErrorKind::PermissionDenied) => {
+                                WARN
+                            }
+                            ResourceCollectionStatus::Unsupported
+                            | ResourceCollectionStatus::ListUnsupported => TEXT_5,
+                            ResourceCollectionStatus::Failed(_) => DANGER,
+                            _ => TEXT_5,
+                        };
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(if *active { ACCENT_SOFT } else { PANEL }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_sm()
+                                    .text_color(rgb(if *active { TEXT_1 } else { TEXT_4 }))
+                                    .child(*label),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family("Menlo")
+                                    .text_color(rgb(color))
+                                    .child(count.clone()),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |panel, _, _, cx| {
+                                    panel.navigation.update(cx, |navigation, cx| {
+                                        if let Some(browser) = &mut navigation.live_browser {
+                                            browser.select_kind(resource_kind);
+                                            navigation.live_request_epoch =
+                                                navigation.live_request_epoch.wrapping_add(1);
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(rgb(TEXT_4))
+                            .child(group),
+                    )
+                    .children(items)
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_3()
+            .bg(rgb(PANEL))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(ELEVATED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().w(px(8.0)).h(px(8.0)).rounded_lg().bg(rgb(INFO)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_sm()
+                                    .text_color(rgb(TEXT_1))
+                                    .child(cluster_name),
+                            )
+                                    .child(div().text_xs().text_color(rgb(INFO)).child(connection_status)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_5))
+                            .child(format!("CONTEXT / {context_name}")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(rgb(TEXT_2))
+                            .child(namespace),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(rgb(TEXT_5))
+                            .child(if selected_kind == "Nodes" || selected_kind == "Namespaces" {
+                                "CLUSTER"
+                            } else {
+                                "TARGET"
+                            }),
+                        ),
+                    )
+                    .children(group_views)
+    }
+
     fn render_activity(&mut self, cx: &mut Context<Self>) -> Div {
         let success_button = Button::new("simulate-success")
             .label("Delay success")
@@ -2618,6 +3129,9 @@ impl WorkspacePanel {
     }
 
     fn render_resources(&mut self, cx: &mut Context<Self>) -> Div {
+        if self.navigation.read(cx).live_browser.is_some() {
+            return self.render_live_resources(cx);
+        }
         let (
             context_index,
             total_count,
@@ -2723,7 +3237,227 @@ impl WorkspacePanel {
             )
     }
 
+    fn render_live_resources(&mut self, cx: &mut Context<Self>) -> Div {
+        let (kind, status, stale, truncated, query, cluster, context, namespace, facts, active_identity) = {
+            let navigation = self.navigation.read(cx);
+            let browser = navigation
+                .live_browser
+                .as_ref()
+                .expect("live browser checked before render");
+            let kind = browser.selected_kind();
+            (
+                kind,
+                browser.status(kind),
+                browser.is_stale(kind),
+                browser.possibly_truncated(kind),
+                navigation.search_query.clone(),
+                browser.cluster_name().to_owned(),
+                browser.context_name().to_owned(),
+                browser.namespace().unwrap_or("ALL NAMESPACES").to_owned(),
+                browser.facts(kind),
+                browser.active_tab().map(|tab| tab.identity().clone()),
+            )
+        };
+        let query_lower = query.trim().to_lowercase();
+        let total_count = facts.len();
+        let filtered = facts
+            .into_iter()
+            .filter(|fact| {
+                if query_lower.is_empty() {
+                    return true;
+                }
+                let identity = fact.resource().identity();
+                identity.name().to_lowercase().contains(&query_lower)
+                    || identity.kind().to_lowercase().contains(&query_lower)
+                    || identity
+                        .namespace()
+                        .is_some_and(|namespace| namespace.as_str().to_lowercase().contains(&query_lower))
+            })
+            .collect::<Vec<_>>();
+        let filtered_count = filtered.len();
+        let list = if filtered.is_empty() {
+            let message = if total_count > 0 {
+                format!("No {} match \"{query}\".", kind.label())
+            } else {
+                match status {
+                    ResourceCollectionStatus::Loading
+                    | ResourceCollectionStatus::Snapshotting
+                    | ResourceCollectionStatus::Reconnecting(_) => {
+                        format!("{} / {}", kind.label(), status.label())
+                    }
+                    ResourceCollectionStatus::NotRequested => {
+                        format!("{} / NOT LOADED", kind.label())
+                    }
+                    ResourceCollectionStatus::Watching | ResourceCollectionStatus::ListOnly => {
+                        format!("No {} found.", kind.label())
+                    }
+                    _ => format!("{} / {}", kind.label(), status.label()),
+                }
+            };
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgb(BG))
+                .child(div().text_sm().text_color(rgb(TEXT_4)).child(message))
+        } else {
+            let facts = Rc::new(filtered);
+            let selected_identity = active_identity.clone();
+            let item_sizes = Rc::new(vec![size(px(1.0), px(38.0)); facts.len()]);
+            let rows = v_virtual_list(
+                cx.entity(),
+                "live-resource-list",
+                item_sizes,
+                move |panel, visible_range, _, cx| {
+                    visible_range
+                        .map(|index| {
+                            panel.render_live_resource_row(
+                                kind,
+                                facts[index].clone(),
+                                selected_identity.as_ref(),
+                                stale,
+                                cx,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                },
+            );
+            div().flex_1().child(rows)
+        };
+        let state_color = match status {
+            ResourceCollectionStatus::Failed(FactErrorKind::PermissionDenied)
+            | ResourceCollectionStatus::DiscoveryDenied
+            | ResourceCollectionStatus::Unsupported
+            | ResourceCollectionStatus::ListUnsupported => WARN,
+            ResourceCollectionStatus::Failed(_) => DANGER,
+            ResourceCollectionStatus::Watching | ResourceCollectionStatus::ListOnly => OK,
+            _ => TEXT_5,
+        };
+        let freshness = if stale {
+            "STALE"
+        } else if truncated {
+            "TRUNCATED"
+        } else {
+            match status {
+                ResourceCollectionStatus::Watching => "FRESH / WATCHING",
+                ResourceCollectionStatus::ListOnly => "FRESH / LIST ONLY",
+                _ => status.label(),
+            }
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG))
+            .child(self.render_resource_tabs(cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(RAISED))
+                    .child(div().text_sm().text_color(rgb(TEXT_1)).child(kind.label()))
+                    .child(pill(
+                        format!("{filtered_count} / {total_count}"),
+                        0x7fb4e6,
+                        ACCENT_SOFT_2,
+                    ))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(rgb(state_color))
+                            .child(freshness),
+                    ),
+            )
+            .child(render_live_resource_header())
+            .child(list)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_5))
+                            .child(format!("LIVE / {cluster} / {context} / {namespace} / {freshness}")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_5))
+                            .child(active_identity.map_or_else(
+                                || SharedString::from("No resource open"),
+                                |identity| SharedString::from(format!("Selected: {}", identity.name())),
+                            )),
+                    ),
+            )
+    }
+
+    fn render_live_resource_row(
+        &self,
+        kind: ResourceKind,
+        fact: crate::fact_service::ResourceFact,
+        active_identity: Option<&crate::target::ResourceIdentity>,
+        stale: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let identity = fact.resource().identity().clone();
+        let selected = active_identity.is_some_and(|active| active == &identity);
+        let namespace = if kind.is_namespaced() {
+            identity
+                .namespace()
+                .map(|namespace| namespace.as_str())
+                .unwrap_or("UNKNOWN")
+        } else {
+            "CLUSTER"
+        };
+        let resource_version = fact.resource().resource_version().unwrap_or("-");
+        let fact_for_tab = fact.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(38.0))
+            .bg(rgb(if selected { ACCENT_SOFT } else { BG }))
+            .child(
+                div()
+                    .flex_1()
+                    .truncate()
+                    .text_sm()
+                    .text_color(rgb(if selected { TEXT_1 } else { TEXT_2 }))
+                    .child(SharedString::from(identity.name().to_owned())),
+            )
+            .child(fixed_cell(namespace, 90.0, TEXT_4, false))
+            .child(fixed_cell(resource_version, 110.0, if stale { WARN } else { TEXT_2 }, true))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |panel, _, _, cx| {
+                    panel.navigation.update(cx, |navigation, cx| {
+                        if let Some(browser) = &mut navigation.live_browser {
+                            browser.open_resource(kind, fact_for_tab.clone());
+                        }
+                        cx.notify();
+                    });
+                }),
+            )
+    }
+
     fn render_resource_tabs(&self, cx: &mut Context<Self>) -> Div {
+        if self.navigation.read(cx).live_browser.is_some() {
+            return self.render_live_resource_tabs(cx);
+        }
         let tabs = {
             let navigation = self.navigation.read(cx);
             navigation
@@ -2784,6 +3518,91 @@ impl WorkspacePanel {
                             cx.notify();
                         });
                     })),
+                )
+        });
+
+        div().w_full().child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(px(36.0))
+                .px_2()
+                .bg(rgb(RAISED))
+                .children(tab_elements)
+                .overflow_x_scrollbar(),
+        )
+    }
+
+    fn render_live_resource_tabs(&self, cx: &mut Context<Self>) -> Div {
+        let tabs = {
+            let navigation = self.navigation.read(cx);
+            navigation.live_browser.as_ref().map(|browser| {
+                browser
+                    .tabs()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tab)| {
+                        let deleted = if tab.is_deleted() { " · DELETED" } else { "" };
+                        (
+                            index,
+                            format!(
+                                "{} / {}{}",
+                                tab.kind().api_kind(),
+                                tab.identity().name(),
+                                deleted
+                            ),
+                            browser.active_tab_index() == Some(index),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+        };
+        let tab_elements = tabs.into_iter().map(|(index, label, active)| {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(px(34.0))
+                .px_2()
+                .bg(rgb(if active { BG } else { RAISED }))
+                .border_1()
+                .border_color(rgb(if active { BORDER } else { RAISED }))
+                .child(
+                    div()
+                        .h(px(32.0))
+                        .flex()
+                        .items_center()
+                        .text_xs()
+                        .text_color(rgb(if active { TEXT_1 } else { TEXT_4 }))
+                        .child(label)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |panel, _, _, cx| {
+                                panel.navigation.update(cx, |navigation, cx| {
+                                    if let Some(browser) = &mut navigation.live_browser {
+                                        browser.select_tab(index);
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                        ),
+                )
+                .child(
+                    Button::new(format!("close-live-resource-tab-{index}"))
+                        .label("x")
+                        .compact()
+                        .ghost()
+                        .on_click(cx.listener(move |panel, _, _, cx| {
+                            panel.navigation.update(cx, |navigation, cx| {
+                                if let Some(browser) = &mut navigation.live_browser {
+                                    browser.close_tab(index);
+                                }
+                                cx.notify();
+                            });
+                        })),
                 )
         });
 
@@ -2883,6 +3702,9 @@ impl WorkspacePanel {
     }
 
     fn render_details(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        if self.navigation.read(cx).live_browser.is_some() {
+            return self.render_live_details(window, cx);
+        }
         let (snapshot, active_tab, selected_resource) = {
             let navigation = self.navigation.read(cx);
             (
@@ -2900,6 +3722,7 @@ impl WorkspacePanel {
                 editor.update(cx, |editor, cx| editor.set_value(&yaml, window, cx));
             }
             self.yaml_tab = active_tab;
+            self.live_yaml_key = None;
         }
 
         let body = match self.detail_view {
@@ -2981,6 +3804,151 @@ impl WorkspacePanel {
             )
             .child(body)
     }
+
+    fn render_live_details(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let (
+            cluster,
+            context,
+            target_namespace,
+            selected_kind,
+            selected_fact,
+            selected_deleted,
+            stale,
+        ) = {
+            let navigation = self.navigation.read(cx);
+            let browser = navigation
+                .live_browser
+                .as_ref()
+                .expect("live browser checked before render");
+            let active_tab = browser.active_tab();
+            (
+                browser.cluster_name().to_owned(),
+                browser.context_name().to_owned(),
+                browser.namespace().unwrap_or("ALL NAMESPACES").to_owned(),
+                active_tab.map(|tab| tab.kind()),
+                browser.active_fact().cloned(),
+                browser.active_is_deleted(),
+                active_tab.is_some_and(|tab| browser.is_stale(tab.kind())),
+            )
+        };
+        self.yaml_tab = None;
+        let detail_key = selected_fact.as_ref().map(|fact| {
+            (
+                selected_kind.expect("selected fact has a resource kind"),
+                fact.resource().identity().clone(),
+                fact.resource().resource_version().map(str::to_owned),
+            )
+        });
+        if self.live_yaml_key != detail_key {
+            let yaml = selected_fact
+                .as_ref()
+                .and_then(|fact| serde_json::to_string_pretty(fact.object()).ok())
+                .unwrap_or_default();
+            if let Some(editor) = &self.yaml_editor {
+                editor.update(cx, |editor, cx| editor.set_value(&yaml, window, cx));
+            }
+            self.live_yaml_key = detail_key;
+        }
+
+        let body = match self.detail_view {
+            DetailView::Overview => render_live_detail_overview(
+                &cluster,
+                &context,
+                selected_fact.as_ref(),
+                selected_deleted,
+                stale,
+            ),
+            DetailView::Yaml => match (self.yaml_editor.as_ref(), selected_fact.as_ref()) {
+                (Some(state), Some(_)) => div()
+                    .flex_1()
+                    .p_2()
+                    .bg(rgb(BG))
+                    .child(Editor::new(state).readonly(true).h(px(480.0))),
+                _ => render_empty_detail("Select a resource to inspect its object."),
+            },
+            DetailView::Diff => render_empty_detail("No comparison snapshot is available."),
+        };
+        let status = if selected_deleted {
+            ("DELETED", DANGER)
+        } else if stale {
+            ("STALE", WARN)
+        } else {
+            ("OBSERVED", OK)
+        };
+        let resource_header = selected_fact.as_ref().map_or_else(
+            || {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_sm().text_color(rgb(TEXT_4)).child("No resource open"))
+                    .child(div().flex_1())
+                    .child(pill("LIVE", INFO, ACCENT_SOFT))
+            },
+            |fact| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(pill(
+                        selected_kind.expect("selected fact has a resource kind").api_kind(),
+                        0x7fb4e6,
+                        ACCENT_SOFT_2,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(rgb(TEXT_1))
+                            .child(fact.resource().identity().name().to_owned()),
+                    )
+                    .child(pill(status.0, status.1, ELEVATED))
+            },
+        );
+        let namespace = selected_fact.as_ref().map_or_else(
+            || target_namespace.clone(),
+            |fact| {
+                fact.resource()
+                    .identity()
+                    .namespace()
+                    .map(|namespace| namespace.as_str().to_owned())
+                    .unwrap_or_else(|| "CLUSTER".to_owned())
+            },
+        );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(RAISED))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .bg(rgb(RAISED))
+                    .child(resource_header)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_5))
+                            .child(format!("LIVE / {cluster} / {context} / {namespace}")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .bg(rgb(BG))
+                    .child(self.detail_view_tab("Overview", DetailView::Overview, cx))
+                    .child(self.detail_view_tab("YAML", DetailView::Yaml, cx))
+                    .child(self.detail_view_tab("Diff", DetailView::Diff, cx)),
+            )
+            .child(body)
+    }
 }
 
 impl BasePanel for WorkspacePanel {
@@ -3023,7 +3991,7 @@ impl Render for WorkspacePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.navigation.read(cx).active_snapshot();
         let panel = match self.kind {
-            PanelKind::Sidebar => render_sidebar(snapshot),
+            PanelKind::Sidebar => self.render_sidebar(snapshot, cx),
             PanelKind::Resources => self.render_resources(cx),
             PanelKind::Details => self.render_details(window, cx),
             PanelKind::Activity => self.render_activity(cx),
@@ -3445,6 +4413,19 @@ fn render_resource_header() -> Div {
         .child(fixed_cell("AGE", 42.0, TEXT_5, false))
 }
 
+    fn render_live_resource_header() -> Div {
+        div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .bg(rgb(RAISED))
+        .child(div().flex_1().text_xs().text_color(rgb(TEXT_5)).child("NAME"))
+        .child(fixed_cell("NS / SCOPE", 90.0, TEXT_5, false))
+        .child(fixed_cell("RESOURCE VERSION", 110.0, TEXT_5, false))
+    }
+
 fn info_row(label: &'static str, value: impl Into<SharedString>) -> Div {
     let value = value.into();
     div()
@@ -3525,6 +4506,61 @@ fn render_detail_overview(
                 .child(info_row("Cluster access", "None"))
                 .child(info_row("Writes", "Disabled")),
         )
+}
+
+fn render_live_detail_overview(
+    cluster: &str,
+    context: &str,
+    fact: Option<&crate::fact_service::ResourceFact>,
+    deleted: bool,
+    stale: bool,
+) -> Div {
+    let Some(fact) = fact else {
+        return render_empty_detail("Select a resource to inspect its details.");
+    };
+    let identity = fact.resource().identity();
+    let namespace = identity
+        .namespace()
+        .map(|namespace| namespace.as_str())
+        .unwrap_or("CLUSTER");
+    let resource_version = fact.resource().resource_version().unwrap_or("MISSING");
+    let completeness = match fact.completeness() {
+        crate::fact_service::FactCompleteness::Complete => "COMPLETE",
+        crate::fact_service::FactCompleteness::ResourceVersionMissing => "RESOURCE VERSION MISSING",
+        crate::fact_service::FactCompleteness::RawDataNotCached => "RAW DATA NOT CACHED",
+    };
+    let source = match fact.source() {
+        crate::fact_service::FactSource::ApiServer => "KUBERNETES API SERVER",
+        crate::fact_service::FactSource::LocalMemoryCache => "LOCAL MEMORY CACHE",
+    };
+    let freshness = if deleted {
+        "DELETED"
+    } else if stale {
+        "STALE"
+    } else {
+        "FRESH"
+    };
+
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_3()
+        .bg(rgb(BG))
+        .child(div().text_xs().text_color(rgb(TEXT_4)).child("RESOURCE FACT"))
+        .child(info_row("Cluster", cluster.to_owned()))
+        .child(info_row("Context", context.to_owned()))
+        .child(info_row("Namespace / scope", namespace))
+        .child(info_row("Name", identity.name().to_owned()))
+        .child(info_row("Kind", identity.kind().to_owned()))
+        .child(info_row("UID", identity.uid().to_owned()))
+        .child(info_row("Resource version", resource_version.to_owned()))
+        .child(info_row("Freshness", freshness))
+        .child(info_row("Completeness", completeness))
+        .child(info_row("Collected at", format!("{:?}", fact.collected_at())))
+        .child(info_row("Source", source))
+        .child(info_row("Access", "Read only"))
 }
 
 fn resource_yaml(snapshot: SimulatedSnapshot, resource: &ResourceEntry) -> String {

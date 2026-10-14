@@ -34,9 +34,14 @@ const MAX_RETRY_LIMIT: u8 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const DISCOVERY_GROUPS: &[(&str, &str, &[&str])] = &[
     ("", "v1", &["Namespace", "Pod", "Service", "Node"]),
-    ("apps", "v1", &["Deployment", "StatefulSet", "DaemonSet"]),
+    (
+        "apps",
+        "v1",
+        &["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet"],
+    ),
     ("batch", "v1", &["Job"]),
     ("networking.k8s.io", "v1", &["Ingress"]),
+    ("discovery.k8s.io", "v1", &["EndpointSlice"]),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1099,6 +1104,7 @@ mod tests {
         FactCacheConfig, FactCompleteness, FactErrorKind, FactFreshness, FactSource,
         FactStreamEvent, FactStreamReceiveError, FactWatchEvent, SharedFactCache,
     };
+    use crate::resource_browser::{ResourceBrowser, ResourceKind};
     use std::{
         fs,
         io::{Read, Write},
@@ -1238,7 +1244,10 @@ mod tests {
 
     fn mock_success_body(request: &str) -> &'static str {
         const CORE: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"namespaces","singularName":"","namespaced":false,"kind":"Namespace","verbs":["get","list","watch"]},{"name":"pods","singularName":"","namespaced":true,"kind":"Pod","verbs":["get","list","watch"]},{"name":"services","singularName":"","namespaced":true,"kind":"Service","verbs":["get","list","watch"]},{"name":"nodes","singularName":"","namespaced":false,"kind":"Node","verbs":["get","list","watch"]}]}"#;
+        const APPS: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"apps/v1","resources":[{"name":"deployments","singularName":"","namespaced":true,"kind":"Deployment","verbs":["get","list","watch"]},{"name":"statefulsets","singularName":"","namespaced":true,"kind":"StatefulSet","verbs":["get","list","watch"]},{"name":"daemonsets","singularName":"","namespaced":true,"kind":"DaemonSet","verbs":["get","list","watch"]},{"name":"replicasets","singularName":"","namespaced":true,"kind":"ReplicaSet","verbs":["get","list","watch"]}]}"#;
+        const BATCH: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"batch/v1","resources":[{"name":"jobs","singularName":"","namespaced":true,"kind":"Job","verbs":["get","list","watch"]}]}"#;
         const NETWORKING: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"networking.k8s.io/v1","resources":[{"name":"ingresses","singularName":"","namespaced":true,"kind":"Ingress","verbs":["get","list","watch"]}]}"#;
+        const DISCOVERY: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"discovery.k8s.io/v1","resources":[{"name":"endpointslices","singularName":"","namespaced":true,"kind":"EndpointSlice","verbs":["get","list","watch"]}]}"#;
         const ACCESS_REVIEW: &str = r#"{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","metadata":{},"spec":{},"status":{"allowed":true,"denied":false}}"#;
         const PODS: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"1"},"items":[]}"#;
         let request_target = request.split_whitespace().nth(1).unwrap_or_default();
@@ -1249,7 +1258,10 @@ mod tests {
             .unwrap_or_default();
         match path {
             "/api/v1" => CORE,
+            "/apis/apps/v1" => APPS,
+            "/apis/batch/v1" => BATCH,
             "/apis/networking.k8s.io/v1" => NETWORKING,
+            "/apis/discovery.k8s.io/v1" => DISCOVERY,
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" => ACCESS_REVIEW,
             "/api/v1/namespaces/payments/pods" => POD_LIST_WITH_ITEM,
             "/api/v1/namespaces/payments/pods/api-0" => POD_DETAIL,
@@ -1388,7 +1400,7 @@ mod tests {
 
     #[test]
     fn discovery_preserves_supported_unsupported_and_forbidden_group_states() {
-        let mock = MockApi::start(&[200, 200, 403, 404, 200, 200, 200, 200, 200, 200]);
+        let mock = MockApi::start(&[200, 200, 403, 404, 200, 200, 200, 200, 200, 200, 200, 200]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -1420,6 +1432,10 @@ mod tests {
             ApiResourceDiscoveryState::DiscoveryDenied
         );
         assert_eq!(
+            capabilities.resource("ReplicaSet").unwrap().state(),
+            ApiResourceDiscoveryState::DiscoveryDenied
+        );
+        assert_eq!(
             capabilities.resource("Job").unwrap().state(),
             ApiResourceDiscoveryState::Unsupported
         );
@@ -1432,26 +1448,36 @@ mod tests {
                 access: ApiResourceAccessAssessment::Allowed,
             }
         );
-        assert_eq!(capabilities.served_count(), 5);
-        assert_eq!(capabilities.denied_count(), 3);
+        assert_eq!(
+            capabilities.resource("EndpointSlice").unwrap().state(),
+            ApiResourceDiscoveryState::Served {
+                scope: ApiResourceScope::Namespaced,
+                list_supported: true,
+                watch_supported: true,
+                access: ApiResourceAccessAssessment::Allowed,
+            }
+        );
+        assert_eq!(capabilities.served_count(), 6);
+        assert_eq!(capabilities.denied_count(), 4);
         assert_eq!(capabilities.unsupported_count(), 1);
 
         let requests = mock.requests();
         mock.join();
-        assert_eq!(requests.len(), 10);
+        assert_eq!(requests.len(), 12);
         assert!(requests[0].contains("/api/v1/namespaces/payments/pods"));
         assert!(requests[1].contains("/api/v1"));
         assert!(requests[2].contains("/apis/apps/v1"));
         assert!(requests[3].contains("/apis/batch/v1"));
         assert!(requests[4].contains("/apis/networking.k8s.io/v1"));
-        assert!(requests[5..]
+        assert!(requests[5].contains("/apis/discovery.k8s.io/v1"));
+        assert!(requests[6..]
             .iter()
             .all(|request| request.contains("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews")));
     }
 
     #[test]
     fn facts_service_lists_gets_and_caches_target_bound_resources() {
-        let mock = MockApi::start(&[200; 12]);
+        let mock = MockApi::start(&[200; 19]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -1467,6 +1493,7 @@ mod tests {
                 Duration::from_secs(2),
             ))
             .unwrap();
+        let browser_capabilities = capabilities.clone();
         let cache = SharedFactCache::new(
             FactCacheConfig::new(1, 1024 * 1024, 512 * 1024, Duration::from_millis(30))
                 .unwrap(),
@@ -1474,6 +1501,15 @@ mod tests {
         let service = connection
             .read_only_facts(capabilities, cache.clone())
             .unwrap();
+        let mut browser = ResourceBrowser::new(
+            target.clone(),
+            "mock-cluster".to_owned(),
+            "local".to_owned(),
+            Some("payments".to_owned()),
+        );
+        browser.set_capabilities(browser_capabilities);
+        browser.select_kind(ResourceKind::Pod);
+        browser.begin_request(ResourceKind::Pod);
         let stream = service
             .list_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
             .unwrap();
@@ -1481,18 +1517,34 @@ mod tests {
             let mut facts = Vec::new();
             loop {
                 match stream.recv().await.unwrap() {
-                    FactStreamEvent::Batch(batch) => facts.extend(batch),
+                    event @ FactStreamEvent::Batch(_) => {
+                        browser.apply_stream_event(&target, ResourceKind::Pod, event.clone());
+                        if let FactStreamEvent::Batch(batch) = event {
+                            facts.extend(batch);
+                        }
+                    }
                     FactStreamEvent::WatchBatch(_) => panic!("list stream must not emit watch batches"),
-                    FactStreamEvent::Complete {
-                        collection_resource_version,
-                        possibly_truncated,
-                        ..
-                    } => break (facts, collection_resource_version, possibly_truncated),
+                    event @ FactStreamEvent::Complete { .. } => {
+                        browser.apply_stream_event(&target, ResourceKind::Pod, event.clone());
+                        if let FactStreamEvent::Complete {
+                            collection_resource_version,
+                            possibly_truncated,
+                            ..
+                        } = event
+                        {
+                            break (facts, collection_resource_version, possibly_truncated);
+                        }
+                    }
                 }
             }
         });
 
         assert_eq!(facts.len(), 2);
+        assert_eq!(browser.count(ResourceKind::Pod), 2);
+        assert_eq!(
+            browser.status(ResourceKind::Pod),
+            crate::resource_browser::ResourceCollectionStatus::ListOnly
+        );
         assert_eq!(list_version.as_deref(), Some("list-rv-4"));
         assert!(!truncated);
         assert_eq!(facts[0].resource().identity().uid(), "uid-pod-123");
@@ -1540,20 +1592,30 @@ mod tests {
         let requests = mock.requests();
         mock.join();
         assert!(
-            requests[10].contains("/api/v1/namespaces/payments/pods?&limit=10"),
+            requests[17].contains("/api/v1/namespaces/payments/pods?&limit=10"),
             "{requests:?}"
         );
-        assert!(requests[11].contains("/api/v1/namespaces/payments/pods/api-0"));
+        assert!(requests[18].contains("/api/v1/namespaces/payments/pods/api-0"));
     }
 
     #[test]
     fn watch_batches_snapshot_and_merges_duplicate_updates_and_deletes() {
-        let mock = MockApi::start(&[200; 12]);
+        let mock = MockApi::start(&[200; 19]);
         let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
+        let browser_capabilities = capabilities.clone();
         let cache = SharedFactCache::default();
         let service = connection
             .read_only_facts(capabilities, cache.clone())
             .unwrap();
+        let mut browser = ResourceBrowser::new(
+            target.clone(),
+            "mock-cluster".to_owned(),
+            "local".to_owned(),
+            Some("payments".to_owned()),
+        );
+        browser.set_capabilities(browser_capabilities);
+        browser.select_kind(ResourceKind::Pod);
+        browser.begin_request(ResourceKind::Pod);
         let stream = service
             .watch_stream(GroupVersionKind::gvk("", "v1", "Pod"), None, 10)
             .unwrap();
@@ -1563,7 +1625,26 @@ mod tests {
                 let mut events = Vec::new();
                 loop {
                     match stream.recv().await.unwrap() {
-                        FactStreamEvent::WatchBatch(batch) => events.extend(batch),
+                        FactStreamEvent::WatchBatch(batch) => {
+                            if browser.active_tab_index().is_none()
+                                && let Some(fact) = batch.iter().find_map(|event| match event {
+                                    FactWatchEvent::Applied(fact)
+                                        if fact.resource().identity().uid() == "uid-pod-123" =>
+                                    {
+                                        Some(fact)
+                                    }
+                                    _ => None,
+                                })
+                            {
+                                browser.open_resource(ResourceKind::Pod, fact.clone());
+                            }
+                            browser.apply_stream_event(
+                                &target,
+                                ResourceKind::Pod,
+                                FactStreamEvent::WatchBatch(batch.clone()),
+                            );
+                            events.extend(batch);
+                        }
                         _ => panic!("watch stream must emit watch batches"),
                     }
                     let saw_queue_pod = events.iter().any(|event| {
@@ -1586,6 +1667,61 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, FactWatchEvent::SnapshotStarted)));
+        assert_eq!(browser.count(ResourceKind::Pod), 2);
+        let active_browser_tab = browser.active_tab().unwrap();
+        assert_eq!(active_browser_tab.identity().uid(), "uid-pod-123");
+        assert!(browser.is_selected(ResourceKind::Pod, active_browser_tab.identity()));
+        assert_eq!(
+            browser
+                .active_fact()
+                .unwrap()
+                .resource()
+                .resource_version(),
+            Some("rv-26")
+        );
+        let snapshot_fact = events
+            .iter()
+            .find_map(|event| match event {
+                FactWatchEvent::Applied(fact)
+                    if fact.resource().identity().uid() == "uid-pod-123" =>
+                {
+                    Some(fact.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let post_snapshot_fact = events
+            .iter()
+            .find_map(|event| match event {
+                FactWatchEvent::Applied(fact)
+                    if fact.resource().identity().uid() == "uid-pod-125" =>
+                {
+                    Some(fact.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let mut same_batch_browser = ResourceBrowser::new(
+            target.clone(),
+            "mock-cluster".to_owned(),
+            "local".to_owned(),
+            Some("payments".to_owned()),
+        );
+        same_batch_browser.select_kind(ResourceKind::Pod);
+        same_batch_browser.begin_request(ResourceKind::Pod);
+        assert!(same_batch_browser.apply_stream_event(
+            &target,
+            ResourceKind::Pod,
+            FactStreamEvent::WatchBatch(vec![
+                FactWatchEvent::SnapshotStarted,
+                FactWatchEvent::Applied(snapshot_fact),
+                FactWatchEvent::SnapshotComplete {
+                    last_object_resource_version: None,
+                },
+                FactWatchEvent::Applied(post_snapshot_fact),
+            ]),
+        ));
+        assert_eq!(same_batch_browser.count(ResourceKind::Pod), 2);
         assert!(events.iter().any(|event| matches!(
             event,
             FactWatchEvent::SnapshotComplete {
@@ -1652,14 +1788,14 @@ mod tests {
         drop(stream);
         let requests = mock.requests();
         mock.join();
-        assert_eq!(requests.len(), 12);
-        assert!(requests[10].contains("/api/v1/namespaces/payments/pods"));
-        assert!(requests[11].contains("watch=true"));
+        assert_eq!(requests.len(), 19);
+        assert!(requests[17].contains("/api/v1/namespaces/payments/pods"));
+        assert!(requests[18].contains("watch=true"));
     }
 
     #[test]
     fn watch_resource_version_expiration_relists_and_restores_fresh_facts() {
-        let mut statuses = vec![200; 11];
+        let mut statuses = vec![200; 18];
         statuses.extend([410, 200, 200, 200]);
         let mock = MockApi::start(&statuses);
         let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -1789,16 +1925,16 @@ mod tests {
 
         let requests = mock.requests();
         mock.join();
-        assert_eq!(requests.len(), 15);
-        assert!(requests[11].contains("watch=true"));
-        assert!(requests[12].contains("/api/v1/namespaces/payments/pods?&limit=10"));
-        assert!(requests[13].contains("watch=true"), "request 13 must restart Watch");
-        assert!(requests[14].contains("/api/v1/namespaces/payments/pods?&limit=10"));
+        assert_eq!(requests.len(), 22);
+        assert!(requests[18].contains("watch=true"));
+        assert!(requests[19].contains("/api/v1/namespaces/payments/pods?&limit=10"));
+        assert!(requests[20].contains("watch=true"), "request 20 must restart Watch");
+        assert!(requests[21].contains("/api/v1/namespaces/payments/pods?&limit=10"));
     }
 
     #[test]
     fn watch_bounds_repeated_resource_version_relists() {
-        let mut statuses = vec![200; 11];
+        let mut statuses = vec![200; 18];
         statuses.extend([410, 200, 410, 200, 410, 200, 410]);
         let mock = MockApi::start(&statuses);
         let (connection, _target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -1836,12 +1972,12 @@ mod tests {
 
         assert_eq!(error_kind, FactErrorKind::WatchReconnectExhausted);
         assert_eq!(resync_count, 3);
-        assert_eq!(mock.request_count(), 18);
+        assert_eq!(mock.request_count(), 25);
         mock.join();
     }
 
     fn watch_error_for_status(status: u16) -> (FactErrorKind, bool, usize) {
-        let mut statuses = vec![200; 11];
+        let mut statuses = vec![200; 18];
         statuses.push(status);
         let mock = MockApi::start(&statuses);
         let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -1895,17 +2031,17 @@ mod tests {
     fn watch_permission_and_api_limitations_are_terminal_and_mark_cache_stale() {
         assert_eq!(
             watch_error_for_status(403),
-            (FactErrorKind::PermissionDenied, true, 12)
+            (FactErrorKind::PermissionDenied, true, 19)
         );
         assert_eq!(
             watch_error_for_status(404),
-            (FactErrorKind::WatchUnsupported, true, 12)
+            (FactErrorKind::WatchUnsupported, true, 19)
         );
     }
 
     #[test]
     fn watch_bounds_transient_retries_even_when_relist_succeeds() {
-        let mut statuses = vec![200; 11];
+        let mut statuses = vec![200; 18];
         statuses.extend([503, 200, 503, 200, 503, 200, 503]);
         let mock = MockApi::start(&statuses);
         let (connection, _target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -1943,13 +2079,13 @@ mod tests {
 
         assert_eq!(error_kind, FactErrorKind::WatchReconnectExhausted);
         assert_eq!(attempts, vec![1, 2, 3]);
-        assert_eq!(mock.request_count(), 18);
+        assert_eq!(mock.request_count(), 25);
         mock.join();
     }
 
     #[test]
     fn facts_service_rejects_namespace_escape_before_api_request() {
-        let mock = MockApi::start(&[200, 200, 200, 200, 200, 200, 200, 200, 200, 200]);
+        let mock = MockApi::start(&[200; 17]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -1981,13 +2117,15 @@ mod tests {
             crate::fact_service::FactStreamReceiveError::Service(fact_error)
                 if fact_error.kind() == FactErrorKind::NamespaceOutsideTarget
         ));
-        assert_eq!(mock.request_count(), 10);
+        assert_eq!(mock.request_count(), 17);
         mock.join();
     }
 
     #[test]
     fn facts_service_preserves_forbidden_read_as_error_not_empty_page() {
-        let mock = MockApi::start(&[200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 403]);
+        let mut statuses = vec![200; 17];
+        statuses.push(403);
+        let mock = MockApi::start(&statuses);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -2015,13 +2153,15 @@ mod tests {
             crate::fact_service::FactStreamReceiveError::Service(fact_error)
                 if fact_error.kind() == FactErrorKind::PermissionDenied
         ));
-        assert_eq!(mock.request_count(), 11);
+        assert_eq!(mock.request_count(), 18);
         mock.join();
     }
 
     #[test]
     fn facts_service_reports_forbidden_read_instead_of_empty_success() {
-        let mock = MockApi::start(&[200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 403]);
+        let mut statuses = vec![200; 17];
+        statuses.push(403);
+        let mock = MockApi::start(&statuses);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
