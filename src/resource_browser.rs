@@ -1,6 +1,7 @@
 use crate::{
     connection::{ApiCapabilitySnapshot, ApiResourceCapability},
     fact_service::{FactErrorKind, FactStreamEvent, FactWatchEvent, ResourceFact},
+    resource_relations::ResourceRelationSnapshot,
     target::{ResourceIdentity, TargetBinding},
 };
 use kube::core::gvk::GroupVersionKind;
@@ -15,6 +16,7 @@ pub enum ResourceKind {
     ReplicaSet,
     Pod,
     Service,
+    Endpoints,
     Ingress,
     EndpointSlice,
     Job,
@@ -45,6 +47,7 @@ impl ResourceKind {
             Self::ReplicaSet => "ReplicaSets",
             Self::Pod => "Pods",
             Self::Service => "Services",
+            Self::Endpoints => "Endpoints",
             Self::Ingress => "Ingresses",
             Self::EndpointSlice => "EndpointSlices",
             Self::Job => "Jobs",
@@ -61,6 +64,7 @@ impl ResourceKind {
             Self::ReplicaSet => "ReplicaSet",
             Self::Pod => "Pod",
             Self::Service => "Service",
+            Self::Endpoints => "Endpoints",
             Self::Ingress => "Ingress",
             Self::EndpointSlice => "EndpointSlice",
             Self::Job => "Job",
@@ -68,9 +72,16 @@ impl ResourceKind {
         }
     }
 
+    pub fn from_api_kind(kind: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.api_kind() == kind)
+            .or_else(|| (kind == "Endpoints").then_some(Self::Endpoints))
+    }
+
     pub fn api_group(self) -> &'static str {
         match self {
-            Self::Namespace | Self::Pod | Self::Service | Self::Node => "",
+            Self::Namespace | Self::Pod | Self::Service | Self::Endpoints | Self::Node => "",
             Self::Deployment | Self::StatefulSet | Self::DaemonSet | Self::ReplicaSet => "apps",
             Self::Ingress => "networking.k8s.io",
             Self::EndpointSlice => "discovery.k8s.io",
@@ -87,7 +98,7 @@ impl ResourceKind {
     }
 
     pub fn is_optional(self) -> bool {
-        matches!(self, Self::ReplicaSet | Self::EndpointSlice)
+        matches!(self, Self::ReplicaSet | Self::EndpointSlice | Self::Endpoints)
     }
 
     pub fn group_label(self) -> &'static str {
@@ -95,7 +106,7 @@ impl ResourceKind {
             Self::Deployment | Self::StatefulSet | Self::DaemonSet | Self::ReplicaSet | Self::Pod => {
                 "WORKLOADS"
             }
-            Self::Service | Self::Ingress | Self::EndpointSlice => "NETWORK",
+            Self::Service | Self::Endpoints | Self::Ingress | Self::EndpointSlice => "NETWORK",
             Self::Job => "BATCH",
             Self::Namespace | Self::Node => "CLUSTER",
         }
@@ -122,6 +133,29 @@ pub enum ResourceTargetStatus {
     Connecting,
     Connected,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationQueryStatus {
+    NotRequested,
+    Loading,
+    Loaded,
+    Failed(FactErrorKind),
+}
+
+impl RelationQueryStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotRequested => "NOT QUERIED",
+            Self::Loading => "LOADING",
+            Self::Loaded => "QUERIED",
+            Self::Failed(FactErrorKind::PermissionDenied) => "RBAC DENIED",
+            Self::Failed(FactErrorKind::CredentialsRejected) => "CREDENTIALS REJECTED",
+            Self::Failed(FactErrorKind::RequestTimedOut) => "TIMED OUT",
+            Self::Failed(FactErrorKind::ApiUnavailable) => "API UNAVAILABLE",
+            Self::Failed(_) => "QUERY FAILED",
+        }
+    }
 }
 
 impl ResourceTargetStatus {
@@ -169,6 +203,9 @@ pub struct ResourceBrowser {
     collections: HashMap<ResourceKind, ResourceCollection>,
     tabs: Vec<ResourceTab>,
     active_tab: Option<usize>,
+    relation_query_key: Option<(ResourceIdentity, Option<String>)>,
+    relation_query_status: RelationQueryStatus,
+    relation_snapshot: Option<ResourceRelationSnapshot>,
 }
 
 impl ResourceBrowser {
@@ -189,6 +226,9 @@ impl ResourceBrowser {
             collections: HashMap::new(),
             tabs: Vec::new(),
             active_tab: None,
+            relation_query_key: None,
+            relation_query_status: RelationQueryStatus::NotRequested,
+            relation_snapshot: None,
         }
     }
 
@@ -266,18 +306,20 @@ impl ResourceBrowser {
         if &self.target != target || self.selected_kind != kind {
             return false;
         }
+        let selected_before = self.active_fact().map(relation_query_key);
+        let selected_deleted_before = self.active_is_deleted();
         let mut actions = Vec::new();
 
         match event {
             FactStreamEvent::Batch(facts) => {
                 let collection = self.collections.entry(kind).or_default();
-                for fact in &facts {
+                for fact in facts {
                     if collection.snapshot_open {
                         collection
                             .snapshot_seen
                             .insert(fact.resource().identity().clone());
                     }
-                    actions.push(CollectionAction::Upsert(fact.clone()));
+                    actions.push(CollectionAction::Upsert(fact));
                 }
             }
             FactStreamEvent::WatchBatch(events) => {
@@ -372,6 +414,11 @@ impl ResourceBrowser {
         {
             collection.status = ResourceCollectionStatus::ListOnly;
         }
+        if selected_before != self.active_fact().map(relation_query_key)
+            || selected_deleted_before != self.active_is_deleted()
+        {
+            self.clear_relation_query();
+        }
         true
     }
 
@@ -421,6 +468,7 @@ impl ResourceBrowser {
     }
 
     pub fn open_resource(&mut self, kind: ResourceKind, fact: ResourceFact) {
+        let selected_before = self.active_fact().map(relation_query_key);
         let identity = fact.resource().identity().clone();
         let tab_index = self
             .tabs
@@ -442,11 +490,18 @@ impl ResourceBrowser {
         tab.fact = fact;
         tab.deleted = false;
         self.active_tab = Some(tab_index);
+        if selected_before != self.active_fact().map(relation_query_key) {
+            self.clear_relation_query();
+        }
     }
 
     pub fn select_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
+            let selected_before = self.active_fact().map(relation_query_key);
             self.active_tab = Some(index);
+            if selected_before != self.active_fact().map(relation_query_key) {
+                self.clear_relation_query();
+            }
         }
     }
 
@@ -454,6 +509,7 @@ impl ResourceBrowser {
         if index >= self.tabs.len() {
             return;
         }
+        let selected_before = self.active_fact().map(relation_query_key);
         self.tabs.remove(index);
         self.active_tab = match self.active_tab {
             Some(active) if active == index => {
@@ -462,6 +518,9 @@ impl ResourceBrowser {
             Some(active) if active > index => Some(active - 1),
             active => active,
         };
+        if selected_before != self.active_fact().map(relation_query_key) {
+            self.clear_relation_query();
+        }
     }
 
     pub fn tabs(&self) -> &[ResourceTab] {
@@ -483,6 +542,96 @@ impl ResourceBrowser {
     pub fn active_is_deleted(&self) -> bool {
         self.active_tab().is_some_and(|tab| tab.deleted)
     }
+
+    pub fn begin_relation_query(
+        &mut self,
+        target: &TargetBinding,
+        selected: &ResourceFact,
+    ) -> bool {
+        if &self.target != target
+            || self.active_fact().is_none_or(|fact| !same_fact_version(fact, selected))
+        {
+            return false;
+        }
+        let key = relation_query_key(selected);
+        if self.relation_query_key.as_ref() == Some(&key)
+            && matches!(
+                self.relation_query_status,
+                RelationQueryStatus::Loading
+                    | RelationQueryStatus::Loaded
+                    | RelationQueryStatus::Failed(_)
+            )
+        {
+            return false;
+        }
+        self.relation_query_key = Some(key);
+        self.relation_query_status = RelationQueryStatus::Loading;
+        self.relation_snapshot = None;
+        true
+    }
+
+    pub fn set_relation_snapshot(&mut self, snapshot: ResourceRelationSnapshot) -> bool {
+        let Some(active_fact) = self.active_fact() else {
+            return false;
+        };
+        if !snapshot.matches_selection(active_fact)
+            || self.relation_query_key.as_ref() != Some(&relation_query_key(active_fact))
+        {
+            return false;
+        }
+        self.relation_snapshot = Some(snapshot);
+        self.relation_query_status = RelationQueryStatus::Loaded;
+        true
+    }
+
+    pub fn fail_relation_query(
+        &mut self,
+        target: &TargetBinding,
+        selected: &ResourceFact,
+        error: FactErrorKind,
+    ) -> bool {
+        if &self.target != target
+            || self.active_fact().is_none_or(|fact| !same_fact_version(fact, selected))
+        {
+            return false;
+        }
+        self.relation_query_key = Some(relation_query_key(selected));
+        self.relation_query_status = RelationQueryStatus::Failed(error);
+        self.relation_snapshot = None;
+        true
+    }
+
+    pub fn relation_query_status(&self) -> RelationQueryStatus {
+        self.relation_query_status
+    }
+
+    pub fn relation_snapshot(&self) -> Option<&ResourceRelationSnapshot> {
+        self.relation_snapshot.as_ref()
+    }
+
+    pub fn retry_relation_query(&mut self) {
+        self.relation_query_key = None;
+        self.relation_query_status = RelationQueryStatus::NotRequested;
+        self.relation_snapshot = None;
+    }
+
+    fn clear_relation_query(&mut self) {
+        self.relation_query_key = None;
+        self.relation_query_status = RelationQueryStatus::NotRequested;
+        self.relation_snapshot = None;
+    }
+}
+
+fn relation_query_key(fact: &ResourceFact) -> (ResourceIdentity, Option<String>) {
+    (
+        fact.resource().identity().clone(),
+        fact.resource().resource_version().map(str::to_owned),
+    )
+}
+
+fn same_fact_version(left: &ResourceFact, right: &ResourceFact) -> bool {
+    left.resource().target() == right.resource().target()
+        && relation_query_key(left) == relation_query_key(right)
 }
 
 enum CollectionAction {

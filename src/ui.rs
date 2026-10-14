@@ -28,12 +28,14 @@ use crate::connection::{
     ConnectionPolicy,
 };
 use crate::fact_service::{
-    FactErrorKind, FactStreamEvent, FactStreamReceiveError, SharedFactCache, MAX_FACTS_PER_LIST,
+    FactErrorKind, FactStreamEvent, FactStreamReceiveError, ResourceFact, SharedFactCache,
+    MAX_FACTS_PER_LIST,
 };
 use crate::kubeconfig::{ExecPluginSummary, ImportedKubeconfig, KubeconfigImportError};
 use crate::settings::{AppearancePreference, SettingsDocument, SettingsStore};
 use crate::resource_browser::{ResourceBrowser, ResourceCollectionStatus, ResourceKind};
 use crate::resource_details::{ResourceDetails, to_readonly_yaml};
+use crate::resource_relations::collect_related_facts;
 use crate::target::{ContextName, SessionRegistry, TargetBinding};
 use crate::diagnostics::{DiagnosticEvent, Diagnostics, next_correlation_id};
 
@@ -214,6 +216,8 @@ pub struct AxiomLensPrototype {
     resource_stream_kind: Option<ResourceKind>,
     resource_stream_epoch: Option<u64>,
     resource_stream_generation: u64,
+    relation_query_cancellation: Option<CancellationToken>,
+    relation_query_generation: u64,
     previous_focus: Option<FocusHandle>,
     theme_mode: ThemeMode,
     settings_store: Option<SettingsStore>,
@@ -249,19 +253,30 @@ impl AxiomLensPrototype {
         let search_navigation = navigation.clone();
         let layout_dock_area = dock_area.clone();
         let navigation_subscription = cx.observe(&navigation, |app, navigation, cx| {
-            let (selected_kind, request_epoch) = {
+            let (selected_kind, request_epoch, selected_fact) = {
                 let navigation = navigation.read(cx);
+                let selected_fact = navigation
+                    .live_browser
+                    .as_ref()
+                    .filter(|browser| !browser.active_is_deleted())
+                    .and_then(|browser| {
+                        browser
+                            .active_fact()
+                            .map(|fact| (browser.target().clone(), fact.clone()))
+                    });
                 (
                     navigation
                         .live_browser
                         .as_ref()
                         .map(ResourceBrowser::selected_kind),
                     navigation.live_request_epoch,
+                    selected_fact,
                 )
             };
             if let Some(kind) = selected_kind {
                 app.start_live_resource_stream(kind, request_epoch, cx);
             }
+            app.start_live_relation_query(selected_fact, cx);
             cx.notify();
         });
         let search_subscription = cx.observe(&search_input, move |_, input, cx| {
@@ -317,6 +332,8 @@ impl AxiomLensPrototype {
             resource_stream_kind: None,
             resource_stream_epoch: None,
             resource_stream_generation: 0,
+            relation_query_cancellation: None,
+            relation_query_generation: 0,
             previous_focus: None,
             theme_mode,
             settings_store,
@@ -610,6 +627,7 @@ impl AxiomLensPrototype {
 
     fn cancel_active_session(&mut self) {
         self.cancel_live_resource_stream();
+        self.cancel_live_relation_query();
         self.session_registry.end_session();
         self._active_connection = None;
         self.resource_capabilities = None;
@@ -618,6 +636,7 @@ impl AxiomLensPrototype {
 
     fn end_live_resource_browser(&mut self, cx: &mut Context<Self>) {
         self.cancel_live_resource_stream();
+        self.cancel_live_relation_query();
         self.navigation.update(cx, |navigation, cx| {
             navigation.live_browser = None;
             navigation.live_request_epoch = navigation.live_request_epoch.wrapping_add(1);
@@ -717,6 +736,7 @@ impl AxiomLensPrototype {
         cx: &mut Context<Self>,
     ) {
         self.cancel_live_resource_stream();
+        self.cancel_live_relation_query();
         self._active_connection = None;
         self.connection_view_state = ConnectionViewState::Connecting;
         self.resource_capabilities = None;
@@ -1061,6 +1081,100 @@ impl AxiomLensPrototype {
             }
             cx.notify();
         });
+    }
+
+    fn cancel_live_relation_query(&mut self) {
+        self.relation_query_generation = self.relation_query_generation.wrapping_add(1);
+        if let Some(cancellation) = self.relation_query_cancellation.take() {
+            cancellation.cancel();
+        }
+    }
+
+    fn start_live_relation_query(
+        &mut self,
+        selection: Option<(TargetBinding, ResourceFact)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((target, selected)) = selection else {
+            self.cancel_live_relation_query();
+            return;
+        };
+        if self._active_connection.is_none() {
+            return;
+        }
+        let should_start = self.navigation.update(cx, |navigation, cx| {
+            let started = navigation
+                .live_browser
+                .as_mut()
+                .is_some_and(|browser| browser.begin_relation_query(&target, &selected));
+            if started {
+                cx.notify();
+            }
+            started
+        });
+        if !should_start {
+            return;
+        }
+
+        self.cancel_live_relation_query();
+        let generation = self.relation_query_generation;
+        let Some(capabilities) = self.resource_capabilities.clone() else {
+            self.navigation.update(cx, |navigation, cx| {
+                if let Some(browser) = &mut navigation.live_browser {
+                    browser.fail_relation_query(
+                        &target,
+                        &selected,
+                        FactErrorKind::CapabilityUnavailable,
+                    );
+                }
+                cx.notify();
+            });
+            return;
+        };
+        let service_result = self
+            ._active_connection
+            .as_ref()
+            .expect("active connection was checked")
+            .read_only_facts(capabilities.clone(), self.fact_cache.clone());
+        let service = match service_result {
+            Ok(service) => service,
+            Err(error) => {
+                self.navigation.update(cx, |navigation, cx| {
+                    if let Some(browser) = &mut navigation.live_browser {
+                        browser.fail_relation_query(&target, &selected, error.kind());
+                    }
+                    cx.notify();
+                });
+                return;
+            }
+        };
+        let cancellation = CancellationToken::new();
+        self.relation_query_cancellation = Some(cancellation.clone());
+        let app = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let snapshot = collect_related_facts(
+                &service,
+                &capabilities,
+                &selected,
+                cancellation,
+            )
+            .await;
+            let _ = app.update(cx, |app, cx| {
+                if app.relation_query_generation != generation
+                    || !app.session_registry.is_current(&target)
+                {
+                    return;
+                }
+                app.relation_query_cancellation = None;
+                app.navigation.update(cx, |navigation, cx| {
+                    if let Some(browser) = &mut navigation.live_browser {
+                        browser.set_relation_snapshot(snapshot);
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     fn adjust_connection_policy(
@@ -2299,6 +2413,7 @@ impl PanelKind {
 enum DetailView {
     Overview,
     Yaml,
+    Relations,
     Diff,
 }
 
@@ -2831,7 +2946,11 @@ impl WorkspacePanel {
         let browser_rows = {
             let navigation = self.navigation.read(cx);
             navigation.live_browser.as_ref().map(|browser| {
-                let rows = ResourceKind::ALL
+                let mut visible_kinds = ResourceKind::ALL.to_vec();
+                if browser.selected_kind() == ResourceKind::Endpoints {
+                    visible_kinds.push(ResourceKind::Endpoints);
+                }
+                let rows = visible_kinds
                     .into_iter()
                     .map(|kind| {
                         let capability = browser.capability(kind).map(|capability| capability.state());
@@ -3739,6 +3858,9 @@ impl WorkspacePanel {
                 }
                 _ => render_empty_detail("Open a simulated resource to inspect YAML."),
             },
+            DetailView::Relations => {
+                render_empty_detail("Relationship facts require a live target.")
+            }
             DetailView::Diff if selected_resource.is_some() => render_simulated_diff(),
             DetailView::Diff => render_empty_detail("Open a simulated resource to inspect Diff."),
         };
@@ -3874,6 +3996,7 @@ impl WorkspacePanel {
                     .child(Editor::new(state).readonly(true).h(px(480.0))),
                 _ => render_empty_detail("Select a resource to inspect its object."),
             },
+            DetailView::Relations => self.render_live_relations(cx),
             DetailView::Diff => render_empty_detail("No comparison snapshot is available."),
         };
         let status = if selected_deleted {
@@ -3953,9 +4076,241 @@ impl WorkspacePanel {
                     .bg(rgb(BG))
                     .child(self.detail_view_tab("Overview", DetailView::Overview, cx))
                     .child(self.detail_view_tab("YAML", DetailView::Yaml, cx))
+                    .child(self.detail_view_tab("Relations", DetailView::Relations, cx))
                     .child(self.detail_view_tab("Diff", DetailView::Diff, cx)),
             )
             .child(body)
+    }
+
+    fn render_live_relations(&mut self, cx: &mut Context<Self>) -> Div {
+        let (status, snapshot) = {
+            let navigation = self.navigation.read(cx);
+            let Some(browser) = navigation.live_browser.as_ref() else {
+                return render_empty_detail("Relationship facts require a live target.");
+            };
+            (
+                browser.relation_query_status(),
+                browser.relation_snapshot().cloned(),
+            )
+        };
+        let refresh = Button::new("refresh-resource-relations")
+            .label("Refresh")
+            .compact()
+            .ghost()
+            .on_click(cx.listener(|panel, _, _, cx| {
+                panel.navigation.update(cx, |navigation, cx| {
+                    if let Some(browser) = &mut navigation.live_browser {
+                        browser.retry_relation_query();
+                    }
+                    cx.notify();
+                });
+            }));
+
+        let collection_rows = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .collections()
+                    .iter()
+                    .map(|collection| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_2))
+                                    .child(collection.kind().label()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family("Menlo")
+                                    .text_color(rgb(if matches!(
+                                        collection.status(),
+                                        crate::resource_relations::RelatedCollectionStatus::Loaded
+                                            | crate::resource_relations::RelatedCollectionStatus::Truncated
+                                    ) {
+                                        TEXT_4
+                                    } else {
+                                        WARN
+                                    }))
+                                    .child(format!(
+                                        "{} / {}",
+                                        collection.status().label(),
+                                        collection.facts().len()
+                                    )),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let relation_rows = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .relations()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, relation)| {
+                        let source = relation.source();
+                        let target = relation.target();
+                        let target_kind = ResourceKind::from_api_kind(
+                            target.resource().identity().kind(),
+                        );
+                        let target_fact = target.clone();
+                        let target_name = target.resource().identity().name().to_owned();
+                        let target_uid = target.resource().identity().uid().to_owned();
+                        let pod_ready_condition = (target.resource().identity().kind() == "Pod")
+                            .then(|| {
+                                ResourceDetails::from_object("Pod", target.object())
+                                    .pod
+                                    .and_then(|pod| pod.ready_condition)
+                                    .unwrap_or_else(|| "NOT REPORTED".to_owned())
+                            });
+                        let open_target = target_kind.map(|kind| {
+                            Button::new(format!("open-related-resource-{index}"))
+                                .label("Open")
+                                .compact()
+                                .ghost()
+                                .on_click(cx.listener(move |panel, _, _, cx| {
+                                    panel.navigation.update(cx, |navigation, cx| {
+                                        let opened = if let Some(browser) =
+                                            &mut navigation.live_browser
+                                        {
+                                            browser.select_kind(kind);
+                                            browser.open_resource(kind, target_fact.clone());
+                                            true
+                                        } else {
+                                            false
+                                        };
+                                        if opened {
+                                            navigation.live_request_epoch = navigation
+                                                .live_request_epoch
+                                                .wrapping_add(1);
+                                        }
+                                        cx.notify();
+                                    });
+                                }))
+                        });
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_2()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(RAISED))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(pill(relation.kind().label(), INFO, ACCENT_SOFT))
+                                    .child(div().flex_1())
+                                    .children(open_target),
+                            )
+                            .child(info_row(
+                                "Source",
+                                format!(
+                                    "{} / {} / UID {}",
+                                    source.resource().identity().kind(),
+                                    source.resource().identity().name(),
+                                    source.resource().identity().uid()
+                                ),
+                            ))
+                            .child(info_row(
+                                "Target",
+                                format!(
+                                    "{} / {} / UID {}",
+                                    target.resource().identity().kind(),
+                                    target_name,
+                                    target_uid
+                                ),
+                            ))
+                            .children(pod_ready_condition.into_iter().map(|ready| {
+                                info_row("Pod Ready condition", ready)
+                            }))
+                            .child(info_row("Evidence", relation.evidence().to_owned()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let empty_message = match status {
+            crate::resource_browser::RelationQueryStatus::NotRequested => {
+                "Select a resource to query relationships.".to_owned()
+            }
+            crate::resource_browser::RelationQueryStatus::Loading => {
+                "Loading relationship facts...".to_owned()
+            }
+            crate::resource_browser::RelationQueryStatus::Loaded => {
+                if snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.selected_identity().namespace().is_none()
+                }) {
+                    "Cluster-scoped facts; cross-Namespace relationships were not queried."
+                        .to_owned()
+                } else {
+                    "No verified relationships found in the selected Namespace.".to_owned()
+                }
+            }
+            crate::resource_browser::RelationQueryStatus::Failed(error) => {
+                crate::fact_service::FactError::new(error).summary().to_owned()
+            }
+        };
+        let scope_note = snapshot.as_ref().map_or_else(
+            || "Scope follows selected resource's target Namespace.".to_owned(),
+            |snapshot| {
+                snapshot
+                    .selected_identity()
+                    .namespace()
+                    .map_or_else(
+                        || {
+                            "CLUSTER SCOPE / cross-Namespace relations not queried".to_owned()
+                        },
+                        |namespace| {
+                            format!(
+                                "NAMESPACE / {} / cross-Namespace relations not queried",
+                                namespace.as_str()
+                            )
+                        },
+                    )
+            },
+        );
+
+        let content = div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(rgb(BG))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_xs().text_color(rgb(TEXT_4)).child("RELATION FACTS"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(rgb(TEXT_5))
+                            .child(status.label()),
+                    )
+                    .child(refresh),
+            )
+                    .child(div().text_xs().text_color(rgb(TEXT_5)).child(scope_note))
+            .children(collection_rows)
+            .children(if relation_rows.is_empty() {
+                vec![render_empty_detail(empty_message)]
+            } else {
+                relation_rows
+            });
+        div().flex_1().child(content.overflow_y_scrollbar())
     }
 }
 

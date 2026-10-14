@@ -33,7 +33,7 @@ const MAX_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 const MAX_RETRY_LIMIT: u8 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const DISCOVERY_GROUPS: &[(&str, &str, &[&str])] = &[
-    ("", "v1", &["Namespace", "Pod", "Service", "Node"]),
+    ("", "v1", &["Namespace", "Pod", "Service", "Endpoints", "Node"]),
     (
         "apps",
         "v1",
@@ -1121,6 +1121,13 @@ mod tests {
     const POD_RELIST_WITH_ITEM: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-5"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-27"},"spec":{}}]}"#;
     const POD_FINAL_STATE_LIST: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-6"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-26"},"spec":{"nodeName":"node-2"}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"queue-2","namespace":"payments","uid":"uid-pod-125","resourceVersion":"rv-1"},"spec":{}}]}"#;
     const POD_DETAIL: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-23"},"spec":{}}"#;
+    const RELATION_DEPLOYMENT: &str = r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"checkout","namespace":"relations-test","uid":"uid-deploy","resourceVersion":"rv-deploy","generation":4},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"checkout"}}},"status":{"replicas":2,"readyReplicas":2}}"#;
+    const RELATION_SERVICE: &str = r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"checkout","namespace":"relations-test","uid":"uid-service","resourceVersion":"rv-service"},"spec":{"selector":{"app":"checkout"},"ports":[{"port":80,"targetPort":8080}]}}"#;
+    const RELATION_REPLICASETS: &str = r#"{"apiVersion":"apps/v1","kind":"ReplicaSetList","metadata":{"resourceVersion":"rv-rs-list"},"items":[{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"checkout-7f8","namespace":"relations-test","uid":"uid-rs","resourceVersion":"rv-rs","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"checkout","uid":"uid-deploy","controller":true}]} ,"spec":{"replicas":2}},{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"other-123","namespace":"relations-test","uid":"uid-rs-other","resourceVersion":"rv-rs-other","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"other","uid":"uid-deploy-other","controller":true}]},"spec":{"replicas":1}}]}"#;
+    const RELATION_PODS: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"rv-pod-list"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-7f8-a","namespace":"relations-test","uid":"uid-pod-child","resourceVersion":"rv-pod","labels":{"app":"checkout"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"checkout-7f8","uid":"uid-rs","controller":true}]},"spec":{"containers":[{"name":"api","image":"example/api:v1"}]}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"other-123-a","namespace":"relations-test","uid":"uid-pod-unrelated","resourceVersion":"rv-pod-other","labels":{"app":"other"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"other-123","uid":"uid-rs-other","controller":true}]},"spec":{"containers":[{"name":"api","image":"example/other:v1"}]}}]}"#;
+    const RELATION_ENDPOINT_SLICES: &str = r#"{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSliceList","metadata":{"resourceVersion":"rv-slices"},"items":[{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"checkout-a","namespace":"relations-test","uid":"uid-slice","resourceVersion":"rv-slice","labels":{"kubernetes.io/service-name":"checkout"}},"addressType":"IPv4","ports":[{"port":8080}],"endpoints":[{"addresses":["10.0.0.4"],"targetRef":{"apiVersion":"v1","kind":"Pod","name":"checkout-7f8-a","uid":"uid-pod-child"},"conditions":{"ready":true}}]}]}"#;
+    const RELATION_ENDPOINTS: &str = r#"{"apiVersion":"v1","kind":"EndpointsList","metadata":{"resourceVersion":"rv-endpoints"},"items":[{"apiVersion":"v1","kind":"Endpoints","metadata":{"name":"checkout","namespace":"relations-test","uid":"uid-endpoints","resourceVersion":"rv-endpoint"},"subsets":[{"addresses":[{"ip":"10.0.0.4","targetRef":{"apiVersion":"v1","kind":"Pod","name":"checkout-7f8-a","uid":"uid-pod-child"}}]}]}]}"#;
+    const RELATION_INGRESSES: &str = r#"{"apiVersion":"networking.k8s.io/v1","kind":"IngressList","metadata":{"resourceVersion":"rv-ingress-list"},"items":[{"apiVersion":"networking.k8s.io/v1","kind":"Ingress","metadata":{"name":"checkout-web","namespace":"relations-test","uid":"uid-ingress","resourceVersion":"rv-ingress"},"spec":{"rules":[{"host":"checkout.example.test","http":{"paths":[{"path":"/","pathType":"Prefix","backend":{"service":{"name":"checkout","port":{"number":80}}}}]}}]}}]}"#;
     const POD_WATCH_EVENTS: &str = concat!(
         r#"{"type":"MODIFIED","object":{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-25"},"spec":{"nodeName":"node-1"}}}"#,
         "\n",
@@ -1244,7 +1251,7 @@ mod tests {
     }
 
     fn mock_success_body(request: &str) -> &'static str {
-        const CORE: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"namespaces","singularName":"","namespaced":false,"kind":"Namespace","verbs":["get","list","watch"]},{"name":"pods","singularName":"","namespaced":true,"kind":"Pod","verbs":["get","list","watch"]},{"name":"services","singularName":"","namespaced":true,"kind":"Service","verbs":["get","list","watch"]},{"name":"nodes","singularName":"","namespaced":false,"kind":"Node","verbs":["get","list","watch"]}]}"#;
+        const CORE: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"namespaces","singularName":"","namespaced":false,"kind":"Namespace","verbs":["get","list","watch"]},{"name":"pods","singularName":"","namespaced":true,"kind":"Pod","verbs":["get","list","watch"]},{"name":"services","singularName":"","namespaced":true,"kind":"Service","verbs":["get","list","watch"]},{"name":"endpoints","singularName":"","namespaced":true,"kind":"Endpoints","verbs":["get","list"]},{"name":"nodes","singularName":"","namespaced":false,"kind":"Node","verbs":["get","list","watch"]}]}"#;
         const APPS: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"apps/v1","resources":[{"name":"deployments","singularName":"","namespaced":true,"kind":"Deployment","verbs":["get","list","watch"]},{"name":"statefulsets","singularName":"","namespaced":true,"kind":"StatefulSet","verbs":["get","list","watch"]},{"name":"daemonsets","singularName":"","namespaced":true,"kind":"DaemonSet","verbs":["get","list","watch"]},{"name":"replicasets","singularName":"","namespaced":true,"kind":"ReplicaSet","verbs":["get","list","watch"]}]}"#;
         const BATCH: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"batch/v1","resources":[{"name":"jobs","singularName":"","namespaced":true,"kind":"Job","verbs":["get","list","watch"]}]}"#;
         const NETWORKING: &str = r#"{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"networking.k8s.io/v1","resources":[{"name":"ingresses","singularName":"","namespaced":true,"kind":"Ingress","verbs":["get","list","watch"]}]}"#;
@@ -1264,6 +1271,13 @@ mod tests {
             "/apis/networking.k8s.io/v1" => NETWORKING,
             "/apis/discovery.k8s.io/v1" => DISCOVERY,
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" => ACCESS_REVIEW,
+            "/apis/apps/v1/namespaces/relations-test/deployments/checkout" => RELATION_DEPLOYMENT,
+            "/api/v1/namespaces/relations-test/services/checkout" => RELATION_SERVICE,
+            "/apis/apps/v1/namespaces/relations-test/replicasets" => RELATION_REPLICASETS,
+            "/api/v1/namespaces/relations-test/pods" => RELATION_PODS,
+            "/api/v1/namespaces/relations-test/endpoints" => RELATION_ENDPOINTS,
+            "/apis/discovery.k8s.io/v1/namespaces/relations-test/endpointslices" => RELATION_ENDPOINT_SLICES,
+            "/apis/networking.k8s.io/v1/namespaces/relations-test/ingresses" => RELATION_INGRESSES,
             "/api/v1/namespaces/uid-test/pods" => POD_LIST_SAME_NAME_UIDS,
             "/api/v1/namespaces/payments/pods" => POD_LIST_WITH_ITEM,
             "/api/v1/namespaces/payments/pods/api-0" => POD_DETAIL,
@@ -1351,6 +1365,28 @@ mod tests {
         (connection, target, runtime, capabilities)
     }
 
+    fn connection_with_discovery_in_namespace(
+        mock: &MockApi,
+        namespace: &str,
+    ) -> (ActiveConnection, TargetBinding, Runtime, ApiCapabilitySnapshot) {
+        let directory = TempDir::new().unwrap();
+        let path = config_file(
+            &directory,
+            &mock.address,
+            &format!("    token: {TEST_TOKEN}\n"),
+        );
+        let (imported, target) = imported_target_in_namespace(&path, namespace);
+        let connection = run_connect(imported, target.clone(), policy(0)).unwrap();
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let capabilities = runtime
+            .block_on(connection.discover_capabilities(
+                CancellationToken::new(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+        (connection, target, runtime, capabilities)
+    }
+
     #[test]
     fn valid_bearer_token_connects_with_read_only_namespace_probe() {
         let mock = MockApi::start(&[200]);
@@ -1402,7 +1438,9 @@ mod tests {
 
     #[test]
     fn discovery_preserves_supported_unsupported_and_forbidden_group_states() {
-        let mock = MockApi::start(&[200, 200, 403, 404, 200, 200, 200, 200, 200, 200, 200, 200]);
+        let mock = MockApi::start(&[
+            200, 200, 403, 404, 200, 200, 200, 200, 200, 200, 200, 200, 200,
+        ]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -1459,13 +1497,22 @@ mod tests {
                 access: ApiResourceAccessAssessment::Allowed,
             }
         );
-        assert_eq!(capabilities.served_count(), 6);
+        assert_eq!(
+            capabilities.resource("Endpoints").unwrap().state(),
+            ApiResourceDiscoveryState::Served {
+                scope: ApiResourceScope::Namespaced,
+                list_supported: true,
+                watch_supported: false,
+                access: ApiResourceAccessAssessment::Allowed,
+            }
+        );
+        assert_eq!(capabilities.served_count(), 7);
         assert_eq!(capabilities.denied_count(), 4);
         assert_eq!(capabilities.unsupported_count(), 1);
 
         let requests = mock.requests();
         mock.join();
-        assert_eq!(requests.len(), 12);
+        assert_eq!(requests.len(), 13);
         assert!(requests[0].contains("/api/v1/namespaces/payments/pods"));
         assert!(requests[1].contains("/api/v1"));
         assert!(requests[2].contains("/apis/apps/v1"));
@@ -1479,7 +1526,7 @@ mod tests {
 
     #[test]
     fn facts_service_lists_gets_and_caches_target_bound_resources() {
-        let mock = MockApi::start(&[200; 19]);
+        let mock = MockApi::start(&[200; 20]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -1618,15 +1665,15 @@ mod tests {
         let requests = mock.requests();
         mock.join();
         assert!(
-            requests[17].contains("/api/v1/namespaces/payments/pods?&limit=10"),
+            requests[18].contains("/api/v1/namespaces/payments/pods?&limit=10"),
             "{requests:?}"
         );
-        assert!(requests[18].contains("/api/v1/namespaces/payments/pods/api-0"));
+        assert!(requests[19].contains("/api/v1/namespaces/payments/pods/api-0"));
     }
 
     #[test]
     fn same_name_pod_recreation_keeps_uid_and_detail_tabs_distinct() {
-        let mock = MockApi::start(&[200; 18]);
+        let mock = MockApi::start(&[200; 19]);
         let directory = TempDir::new().unwrap();
         let path = config_file(
             &directory,
@@ -1705,8 +1752,293 @@ mod tests {
     }
 
     #[test]
+    fn relation_query_resolves_owner_chain_by_uid_and_excludes_unrelated_objects() {
+        let mock = MockApi::start(&[200; 21]);
+        let (connection, target, runtime, capabilities) =
+            connection_with_discovery_in_namespace(&mock, "relations-test");
+        let service = connection
+            .read_only_facts(capabilities.clone(), SharedFactCache::default())
+            .unwrap();
+        let deployment = runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("apps", "v1", "Deployment"),
+                Some("relations-test".to_owned()),
+                "checkout".to_owned(),
+            ))
+            .unwrap();
+        let related = runtime.block_on(crate::resource_relations::collect_related_facts(
+            &service,
+            &capabilities,
+            &deployment,
+            CancellationToken::new(),
+        ));
+        let mut browser = ResourceBrowser::new(
+            target.clone(),
+            "mock-cluster".to_owned(),
+            "local".to_owned(),
+            Some("relations-test".to_owned()),
+        );
+        browser.set_capabilities(capabilities);
+        browser.select_kind(ResourceKind::Deployment);
+        browser.open_resource(ResourceKind::Deployment, deployment.clone());
+        assert!(browser.begin_relation_query(&target, &deployment));
+        assert!(browser.set_relation_snapshot(related.clone()));
+        assert_eq!(
+            browser.relation_query_status(),
+            crate::resource_browser::RelationQueryStatus::Loaded
+        );
+
+        assert_eq!(related.relations().len(), 2);
+        assert!(related.relations().iter().any(|relation| {
+            relation.kind() == crate::resource_relations::RelationKind::OwnerReference
+                && relation.source().resource().identity().uid() == "uid-deploy"
+                && relation.target().resource().identity().uid() == "uid-rs"
+        }));
+        assert!(related.relations().iter().any(|relation| {
+            relation.kind() == crate::resource_relations::RelationKind::OwnerReference
+                && relation.source().resource().identity().uid() == "uid-rs"
+                && relation.target().resource().identity().uid() == "uid-pod-child"
+        }));
+        let replica_set = related
+            .relations()
+            .iter()
+            .find(|relation| relation.target().resource().identity().uid() == "uid-rs")
+            .unwrap()
+            .target()
+            .clone();
+        browser.select_kind(ResourceKind::ReplicaSet);
+        browser.open_resource(ResourceKind::ReplicaSet, replica_set);
+        assert!(!browser.set_relation_snapshot(related.clone()));
+        assert_eq!(
+            browser.relation_query_status(),
+            crate::resource_browser::RelationQueryStatus::NotRequested
+        );
+        assert_eq!(
+            browser.active_fact().unwrap().resource().identity().uid(),
+            "uid-rs"
+        );
+        assert!(related.relations().iter().all(|relation| {
+            relation.source().resource().target() == &target
+                && relation.target().resource().target() == &target
+        }));
+        assert!(related.relations().iter().all(|relation| {
+            relation.source().resource().identity().uid() != "uid-rs-other"
+                && relation.target().resource().identity().uid() != "uid-rs-other"
+                && relation.source().resource().identity().uid() != "uid-pod-unrelated"
+                && relation.target().resource().identity().uid() != "uid-pod-unrelated"
+        }));
+
+        mock.join();
+    }
+
+    #[test]
+    fn service_relationships_match_selectors_backends_and_namespace_scope() {
+        let mock = MockApi::start(&[200; 22]);
+        let (connection, target, runtime, capabilities) =
+            connection_with_discovery_in_namespace(&mock, "relations-test");
+        let service = connection
+            .read_only_facts(capabilities.clone(), SharedFactCache::default())
+            .unwrap();
+        let selected = runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("", "v1", "Service"),
+                Some("relations-test".to_owned()),
+                "checkout".to_owned(),
+            ))
+            .unwrap();
+        let related = runtime.block_on(crate::resource_relations::collect_related_facts(
+            &service,
+            &capabilities,
+            &selected,
+            CancellationToken::new(),
+        ));
+
+        assert_eq!(related.relations().len(), 4);
+        assert!(related.relations().iter().any(|relation| {
+            relation.kind() == crate::resource_relations::RelationKind::ServiceSelector
+                && relation.source().resource().identity().uid() == "uid-service"
+                && relation.target().resource().identity().uid() == "uid-pod-child"
+        }));
+        assert!(related.relations().iter().any(|relation| {
+            relation.kind() == crate::resource_relations::RelationKind::ServiceBackend
+                && relation.source().resource().identity().uid() == "uid-service"
+                && relation.target().resource().identity().uid() == "uid-slice"
+        }));
+        assert!(related.relations().iter().any(|relation| {
+            relation.kind() == crate::resource_relations::RelationKind::EndpointTarget
+                && relation.source().resource().identity().uid() == "uid-slice"
+                && relation.target().resource().identity().uid() == "uid-pod-child"
+        }));
+        let ingress_relation = related
+            .relations()
+            .iter()
+            .find(|relation| {
+                relation.kind() == crate::resource_relations::RelationKind::IngressBackend
+                    && relation.source().resource().identity().uid() == "uid-ingress"
+                    && relation.target().resource().identity().uid() == "uid-service"
+            })
+            .unwrap();
+        assert!(ingress_relation.evidence().contains("checkout.example.test"));
+        assert!(ingress_relation.evidence().contains("Service checkout"));
+        assert!(related.relations().iter().all(|relation| {
+            relation.source().resource().target() == &target
+                && relation.target().resource().target() == &target
+                && relation.source().resource().identity().namespace().unwrap().as_str()
+                    == "relations-test"
+                && relation.target().resource().identity().namespace().unwrap().as_str()
+                    == "relations-test"
+        }));
+        assert!(related.relations().iter().all(|relation| {
+            relation.source().resource().identity().uid() != "uid-pod-unrelated"
+                && relation.target().resource().identity().uid() != "uid-pod-unrelated"
+        }));
+        assert!(related.collections().iter().all(|collection| {
+            collection.status() == crate::resource_relations::RelatedCollectionStatus::Loaded
+        }));
+
+        mock.join();
+    }
+
+    #[test]
+    fn endpoint_slices_use_endpoints_only_when_discovery_reports_unsupported() {
+        let mut statuses = vec![200; 21];
+        statuses[5] = 404;
+        let mock = MockApi::start(&statuses);
+        let (connection, _target, runtime, capabilities) =
+            connection_with_discovery_in_namespace(&mock, "relations-test");
+        assert_eq!(
+            capabilities.resource("EndpointSlice").unwrap().state(),
+            ApiResourceDiscoveryState::Unsupported
+        );
+        let service = connection
+            .read_only_facts(capabilities.clone(), SharedFactCache::default())
+            .unwrap();
+        let selected = runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("", "v1", "Service"),
+                Some("relations-test".to_owned()),
+                "checkout".to_owned(),
+            ))
+            .unwrap();
+        let related = runtime.block_on(crate::resource_relations::collect_related_facts(
+            &service,
+            &capabilities,
+            &selected,
+            CancellationToken::new(),
+        ));
+
+        assert!(related.collections().iter().any(|collection| {
+            collection.kind() == ResourceKind::Endpoints
+                && collection.status() == crate::resource_relations::RelatedCollectionStatus::Loaded
+        }));
+        assert!(!related
+            .collections()
+            .iter()
+            .any(|collection| collection.kind() == ResourceKind::EndpointSlice));
+        assert!(related.relations().iter().any(|relation| {
+            relation.kind() == crate::resource_relations::RelationKind::EndpointTarget
+                && relation.source().resource().identity().uid() == "uid-endpoints"
+                && relation.target().resource().identity().uid() == "uid-pod-child"
+        }));
+        mock.join();
+    }
+
+    #[test]
+    fn denied_owner_kind_keeps_relationship_source_state_visible() {
+        let mut statuses = vec![200; 15];
+        statuses[2] = 403;
+        statuses[3] = 404;
+        let mock = MockApi::start(&statuses);
+        let (connection, _target, runtime, capabilities) =
+            connection_with_discovery_in_namespace(&mock, "relations-test");
+        assert_eq!(
+            capabilities.resource("ReplicaSet").unwrap().state(),
+            ApiResourceDiscoveryState::DiscoveryDenied
+        );
+        let service = connection
+            .read_only_facts(capabilities.clone(), SharedFactCache::default())
+            .unwrap();
+        let selected = runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("apps", "v1", "Deployment"),
+                Some("relations-test".to_owned()),
+                "checkout".to_owned(),
+            ))
+            .unwrap();
+        let related = runtime.block_on(crate::resource_relations::collect_related_facts(
+            &service,
+            &capabilities,
+            &selected,
+            CancellationToken::new(),
+        ));
+
+        let replica_sets = related
+            .collections()
+            .iter()
+            .find(|collection| collection.kind() == ResourceKind::ReplicaSet)
+            .unwrap();
+        assert_eq!(
+            replica_sets.status(),
+            crate::resource_relations::RelatedCollectionStatus::DiscoveryDenied
+        );
+        let pods = related
+            .collections()
+            .iter()
+            .find(|collection| collection.kind() == ResourceKind::Pod)
+            .unwrap();
+        assert_eq!(pods.status(), crate::resource_relations::RelatedCollectionStatus::Loaded);
+        assert_eq!(pods.facts().len(), 2);
+        assert!(related.relations().is_empty());
+        mock.join();
+    }
+
+    #[test]
+    fn forbidden_related_list_is_distinct_from_empty_relationships() {
+        let mut statuses = vec![200; 21];
+        statuses[19] = 403;
+        let mock = MockApi::start(&statuses);
+        let (connection, _target, runtime, capabilities) =
+            connection_with_discovery_in_namespace(&mock, "relations-test");
+        let service = connection
+            .read_only_facts(capabilities.clone(), SharedFactCache::default())
+            .unwrap();
+        let selected = runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("apps", "v1", "Deployment"),
+                Some("relations-test".to_owned()),
+                "checkout".to_owned(),
+            ))
+            .unwrap();
+        let related = runtime.block_on(crate::resource_relations::collect_related_facts(
+            &service,
+            &capabilities,
+            &selected,
+            CancellationToken::new(),
+        ));
+
+        let replica_sets = related
+            .collections()
+            .iter()
+            .find(|collection| collection.kind() == ResourceKind::ReplicaSet)
+            .unwrap();
+        assert_eq!(
+            replica_sets.status(),
+            crate::resource_relations::RelatedCollectionStatus::Failed(
+                FactErrorKind::PermissionDenied
+            )
+        );
+        assert!(replica_sets.facts().is_empty());
+        assert!(related.collections().iter().any(|collection| {
+            collection.kind() == ResourceKind::Pod
+                && collection.status() == crate::resource_relations::RelatedCollectionStatus::Loaded
+                && !collection.facts().is_empty()
+        }));
+        mock.join();
+    }
+
+    #[test]
     fn watch_batches_snapshot_and_merges_duplicate_updates_and_deletes() {
-        let mock = MockApi::start(&[200; 19]);
+        let mock = MockApi::start(&[200; 20]);
         let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
         let browser_capabilities = capabilities.clone();
         let cache = SharedFactCache::default();
@@ -1894,14 +2226,14 @@ mod tests {
         drop(stream);
         let requests = mock.requests();
         mock.join();
-        assert_eq!(requests.len(), 19);
-        assert!(requests[17].contains("/api/v1/namespaces/payments/pods"));
-        assert!(requests[18].contains("watch=true"));
+        assert_eq!(requests.len(), 20);
+        assert!(requests[18].contains("/api/v1/namespaces/payments/pods"));
+        assert!(requests[19].contains("watch=true"));
     }
 
     #[test]
     fn watch_resource_version_expiration_relists_and_restores_fresh_facts() {
-        let mut statuses = vec![200; 18];
+        let mut statuses = vec![200; 19];
         statuses.extend([410, 200, 200, 200]);
         let mock = MockApi::start(&statuses);
         let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -2031,16 +2363,16 @@ mod tests {
 
         let requests = mock.requests();
         mock.join();
-        assert_eq!(requests.len(), 22);
-        assert!(requests[18].contains("watch=true"));
-        assert!(requests[19].contains("/api/v1/namespaces/payments/pods?&limit=10"));
-        assert!(requests[20].contains("watch=true"), "request 20 must restart Watch");
-        assert!(requests[21].contains("/api/v1/namespaces/payments/pods?&limit=10"));
+        assert_eq!(requests.len(), 23);
+        assert!(requests[19].contains("watch=true"));
+        assert!(requests[20].contains("/api/v1/namespaces/payments/pods?&limit=10"));
+        assert!(requests[21].contains("watch=true"), "request 21 must restart Watch");
+        assert!(requests[22].contains("/api/v1/namespaces/payments/pods?&limit=10"));
     }
 
     #[test]
     fn watch_bounds_repeated_resource_version_relists() {
-        let mut statuses = vec![200; 18];
+        let mut statuses = vec![200; 19];
         statuses.extend([410, 200, 410, 200, 410, 200, 410]);
         let mock = MockApi::start(&statuses);
         let (connection, _target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -2078,12 +2410,12 @@ mod tests {
 
         assert_eq!(error_kind, FactErrorKind::WatchReconnectExhausted);
         assert_eq!(resync_count, 3);
-        assert_eq!(mock.request_count(), 25);
+        assert_eq!(mock.request_count(), 26);
         mock.join();
     }
 
     fn watch_error_for_status(status: u16) -> (FactErrorKind, bool, usize) {
-        let mut statuses = vec![200; 18];
+        let mut statuses = vec![200; 19];
         statuses.push(status);
         let mock = MockApi::start(&statuses);
         let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -2137,17 +2469,17 @@ mod tests {
     fn watch_permission_and_api_limitations_are_terminal_and_mark_cache_stale() {
         assert_eq!(
             watch_error_for_status(403),
-            (FactErrorKind::PermissionDenied, true, 19)
+            (FactErrorKind::PermissionDenied, true, 20)
         );
         assert_eq!(
             watch_error_for_status(404),
-            (FactErrorKind::WatchUnsupported, true, 19)
+            (FactErrorKind::WatchUnsupported, true, 20)
         );
     }
 
     #[test]
     fn watch_bounds_transient_retries_even_when_relist_succeeds() {
-        let mut statuses = vec![200; 18];
+        let mut statuses = vec![200; 19];
         statuses.extend([503, 200, 503, 200, 503, 200, 503]);
         let mock = MockApi::start(&statuses);
         let (connection, _target, runtime, capabilities) = connection_with_discovery(&mock);
@@ -2185,7 +2517,7 @@ mod tests {
 
         assert_eq!(error_kind, FactErrorKind::WatchReconnectExhausted);
         assert_eq!(attempts, vec![1, 2, 3]);
-        assert_eq!(mock.request_count(), 25);
+        assert_eq!(mock.request_count(), 26);
         mock.join();
     }
 
@@ -2229,7 +2561,7 @@ mod tests {
 
     #[test]
     fn facts_service_preserves_forbidden_read_as_error_not_empty_page() {
-        let mut statuses = vec![200; 17];
+        let mut statuses = vec![200; 18];
         statuses.push(403);
         let mock = MockApi::start(&statuses);
         let directory = TempDir::new().unwrap();
@@ -2259,13 +2591,13 @@ mod tests {
             crate::fact_service::FactStreamReceiveError::Service(fact_error)
                 if fact_error.kind() == FactErrorKind::PermissionDenied
         ));
-        assert_eq!(mock.request_count(), 18);
+        assert_eq!(mock.request_count(), 19);
         mock.join();
     }
 
     #[test]
     fn facts_service_reports_forbidden_read_instead_of_empty_success() {
-        let mut statuses = vec![200; 17];
+        let mut statuses = vec![200; 18];
         statuses.push(403);
         let mock = MockApi::start(&statuses);
         let directory = TempDir::new().unwrap();

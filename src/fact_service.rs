@@ -1381,7 +1381,7 @@ fn map_watch_status(code: u16) -> FactError {
 fn known_scope(gvk: &GroupVersionKind) -> Option<ApiResourceScope> {
     match (gvk.group.as_str(), gvk.version.as_str(), gvk.kind.as_str()) {
         ("", "v1", "Namespace" | "Node") => Some(ApiResourceScope::Cluster),
-        ("", "v1", "Pod" | "Service")
+        ("", "v1", "Pod" | "Service" | "Endpoints")
         | ("apps", "v1", "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet")
         | ("batch", "v1", "Job")
         | ("networking.k8s.io", "v1", "Ingress")
