@@ -6,10 +6,12 @@ use crate::{
     target::{CacheScope, NamespaceName, ResourceIdentity, ResourceRef, TargetBinding},
 };
 use async_channel::Receiver;
-use futures::StreamExt;
+use futures::{AsyncReadExt, StreamExt};
+use k8s_openapi::api::core::v1::Pod;
+use jiff::Timestamp;
 use kube::{
     Api, Client,
-    api::{DynamicObject, ListParams},
+    api::{DynamicObject, ListParams, LogParams},
     core::gvk::GroupVersionKind,
     discovery::ApiResource,
     runtime::watcher::{self, Event as WatchEvent},
@@ -21,13 +23,24 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
-use tokio::{runtime::Handle, task::JoinHandle};
+use tokio::{
+    runtime::Handle,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 pub const MAX_FACTS_PER_LIST: usize = 100;
 pub const MAX_FACTS_PER_PAGINATED_LIST: usize = 10_000;
 pub const FACT_BATCH_SIZE: usize = 16;
+pub const MAX_CONCURRENT_CONTAINER_LOG_STREAMS: usize = 3;
+pub const MAX_CONTAINER_LOG_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CONTAINER_LOG_LINES: usize = 10_000;
+pub const MAX_CONTAINER_LOG_LINE_BYTES: usize = 8 * 1024;
+pub const MAX_CONTAINER_LOG_TAIL_LINES: usize = 10_000;
 const FACT_BATCH_CHANNEL_CAPACITY: usize = 4;
+const LOG_BATCH_CHANNEL_CAPACITY: usize = 4;
+const LOG_BATCH_LINES: usize = 64;
 const DEFAULT_CACHE_ENTRIES: usize = 512;
 const DEFAULT_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_CACHE_ENTRY_BYTES: usize = 1024 * 1024;
@@ -67,6 +80,12 @@ pub enum FactErrorKind {
     RawReferenceExpired,
     SerializationFailed,
     Internal,
+    InvalidLogRequest,
+    ContainerNotFound,
+    PreviousLogsUnavailable,
+    PodRecreated,
+    LogStreamLimitReached,
+    LogStreamInterrupted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +129,12 @@ impl FactError {
             FactErrorKind::RawReferenceExpired => "raw_reference_expired",
             FactErrorKind::SerializationFailed => "resource_serialization_failed",
             FactErrorKind::Internal => "fact_service_internal",
+            FactErrorKind::InvalidLogRequest => "container_log_request_invalid",
+            FactErrorKind::ContainerNotFound => "container_not_found",
+            FactErrorKind::PreviousLogsUnavailable => "previous_logs_unavailable",
+            FactErrorKind::PodRecreated => "pod_recreated_during_log_request",
+            FactErrorKind::LogStreamLimitReached => "container_log_stream_limit_reached",
+            FactErrorKind::LogStreamInterrupted => "container_log_stream_interrupted",
         }
     }
 
@@ -140,6 +165,12 @@ impl FactError {
             FactErrorKind::RawReferenceExpired => "Local raw fact reference is no longer cached.",
             FactErrorKind::SerializationFailed => "Resource payload could not be normalized locally.",
             FactErrorKind::Internal => "Read-only facts service failed unexpectedly.",
+            FactErrorKind::InvalidLogRequest => "Container log request has an invalid container, time filter, or tail limit.",
+            FactErrorKind::ContainerNotFound => "The requested container does not exist in this Pod.",
+            FactErrorKind::PreviousLogsUnavailable => "No previous container instance logs are available.",
+            FactErrorKind::PodRecreated => "Pod UID changed; logs were not attached to a replacement Pod.",
+            FactErrorKind::LogStreamLimitReached => "All bounded container log stream slots are in use.",
+            FactErrorKind::LogStreamInterrupted => "Container log stream ended because the connection was interrupted.",
         }
     }
 }
@@ -614,6 +645,89 @@ impl fmt::Display for FactStreamReceiveError {
 
 impl Error for FactStreamReceiveError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerLogMode {
+    Current,
+    Follow,
+    Previous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainerLogSince {
+    Seconds(u64),
+    Timestamp(Timestamp),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerLogRequest {
+    pub container: String,
+    pub mode: ContainerLogMode,
+    pub since: Option<ContainerLogSince>,
+    pub tail_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerLogLine {
+    pub timestamp: Option<String>,
+    pub message: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainerLogStreamEvent {
+    Batch(Vec<ContainerLogLine>),
+    Complete {
+        line_count: usize,
+        bytes_read: usize,
+        possibly_truncated: bool,
+    },
+}
+
+pub struct ContainerLogStream {
+    receiver: Receiver<Result<ContainerLogStreamEvent, FactError>>,
+    cancellation: CancellationToken,
+    task: Option<JoinHandle<()>>,
+    target: TargetBinding,
+    pod_identity: ResourceIdentity,
+    container: String,
+    mode: ContainerLogMode,
+}
+
+impl ContainerLogStream {
+    pub async fn recv(&self) -> Result<ContainerLogStreamEvent, FactStreamReceiveError> {
+        self.receiver
+            .recv()
+            .await
+            .map_err(|_| FactStreamReceiveError::Closed)?
+            .map_err(FactStreamReceiveError::Service)
+    }
+
+    pub fn target(&self) -> &TargetBinding {
+        &self.target
+    }
+
+    pub fn pod_identity(&self) -> &ResourceIdentity {
+        &self.pod_identity
+    }
+
+    pub fn container(&self) -> &str {
+        &self.container
+    }
+
+    pub fn mode(&self) -> ContainerLogMode {
+        self.mode
+    }
+}
+
+impl Drop for ContainerLogStream {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ReadOnlyFactService {
     client: Client,
@@ -623,6 +737,7 @@ pub struct ReadOnlyFactService {
     runtime: Handle,
     cache: SharedFactCache,
     request_timeout: Duration,
+    log_stream_slots: Arc<Semaphore>,
 }
 
 impl ReadOnlyFactService {
@@ -634,6 +749,7 @@ impl ReadOnlyFactService {
         runtime: Handle,
         cache: SharedFactCache,
         request_timeout: Duration,
+        log_stream_slots: Arc<Semaphore>,
     ) -> Self {
         Self {
             client,
@@ -643,6 +759,7 @@ impl ReadOnlyFactService {
             runtime,
             cache,
             request_timeout,
+            log_stream_slots,
         }
     }
 
@@ -654,114 +771,262 @@ impl ReadOnlyFactService {
         &self.cache
     }
 
-    pub fn list_stream(
+    pub fn container_log_stream(
         &self,
-        gvk: GroupVersionKind,
-        namespace: Option<String>,
-        limit: usize,
-    ) -> Result<FactBatchStream, FactError> {
-        if limit == 0 || limit > MAX_FACTS_PER_LIST {
-            return Err(FactError::new(FactErrorKind::InvalidLimit));
+        pod: &ResourceFact,
+        request: ContainerLogRequest,
+    ) -> Result<ContainerLogStream, FactError> {
+        let identity = pod.resource().identity();
+        if pod.resource().target() != &self.target
+            || identity.api_group() != ""
+            || identity.api_version() != "v1"
+            || identity.kind() != "Pod"
+        {
+            return Err(FactError::new(FactErrorKind::CacheScopeMismatch));
         }
-        let (sender, receiver) = async_channel::bounded(FACT_BATCH_CHANNEL_CAPACITY);
-        let request_cancellation = CancellationToken::new();
-        let worker_cancellation = request_cancellation.clone();
+        validate_container_log_request(&request)?;
+        if !pod_data_has_container(&pod.object().data, &request.container) {
+            return Err(FactError::new(FactErrorKind::ContainerNotFound));
+        }
+        let namespace = identity
+            .namespace()
+            .ok_or_else(|| FactError::new(FactErrorKind::NamespaceRequired))?
+            .as_str()
+            .to_owned();
+        let permit = acquire_log_stream_slot(self.log_stream_slots.clone())?;
+        let (sender, receiver) = async_channel::bounded(LOG_BATCH_CHANNEL_CAPACITY);
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
         let service = self.clone();
+        let pod_name = identity.name().to_owned();
+        let pod_uid = identity.uid().to_owned();
+        let stream_target = self.target.clone();
+        let stream_identity = identity.clone();
+        let stream_container = request.container.clone();
+        let mode = request.mode;
+        let error_sender = sender.clone();
         let task = self.runtime.spawn(async move {
-            let result = tokio::select! {
-                _ = service.cancellation.cancelled() => {
-                    Err(FactError::new(FactErrorKind::SessionCancelled))
-                }
-                _ = worker_cancellation.cancelled() => {
-                    Err(FactError::new(FactErrorKind::SessionCancelled))
-                }
-                result = service.list_page(gvk, namespace, limit, worker_cancellation.clone()) => result,
-            };
-            match result {
-                Ok(page) => {
-                    for batch in page.items.chunks(FACT_BATCH_SIZE) {
-                        if sender.send(Ok(FactStreamEvent::Batch(batch.to_vec()))).await.is_err() {
-                            return;
-                        }
-                    }
-                    let _ = sender
-                        .send(Ok(FactStreamEvent::Complete {
-                            collection_resource_version: page.collection_resource_version,
-                            collected_at: page.collected_at,
-                            possibly_truncated: page.possibly_truncated,
-                        }))
-                        .await;
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(error)).await;
-                }
-            }
-        });
-        Ok(FactBatchStream {
-            receiver,
-            cancellation: request_cancellation,
-            task: Some(task),
-        })
-    }
-
-    pub fn list_paginated_stream(
-        &self,
-        gvk: GroupVersionKind,
-        namespace: Option<String>,
-        limit: usize,
-    ) -> Result<FactBatchStream, FactError> {
-        if limit == 0 || limit > MAX_FACTS_PER_PAGINATED_LIST {
-            return Err(FactError::new(FactErrorKind::InvalidLimit));
-        }
-        let capability = self
-            .capabilities
-            .resource_gvk(&gvk)
-            .ok_or(FactError::new(FactErrorKind::UnsupportedResource))?;
-        match capability.state() {
-            ApiResourceDiscoveryState::DiscoveryDenied => {
-                return Err(FactError::new(FactErrorKind::DiscoveryDenied));
-            }
-            ApiResourceDiscoveryState::Unsupported => {
-                return Err(FactError::new(FactErrorKind::UnsupportedResource));
-            }
-            ApiResourceDiscoveryState::TimedOut | ApiResourceDiscoveryState::Unavailable => {
-                return Err(FactError::new(FactErrorKind::CapabilityUnavailable));
-            }
-            ApiResourceDiscoveryState::Served { .. } => {}
-        }
-        if !capability.is_list_supported() {
-            return Err(FactError::new(FactErrorKind::ListNotSupported));
-        }
-        let (api_resource, scope) = self.resolve_resource(&gvk)?;
-        let namespace = self.resolve_namespace(scope, namespace.as_deref())?;
-        let api: Api<DynamicObject> = match &namespace {
-            Some(namespace) => Api::namespaced_with(self.client.clone(), namespace, &api_resource),
-            None => Api::all_with(self.client.clone(), &api_resource),
-        };
-        let (sender, receiver) = async_channel::bounded(FACT_BATCH_CHANNEL_CAPACITY);
-        let request_cancellation = CancellationToken::new();
-        let worker_cancellation = request_cancellation.clone();
-        let service = self.clone();
-        let task = self.runtime.spawn(async move {
-            service
-                .run_paginated_list_stream(
-                    api,
-                    api_resource,
-                    scope,
+            let result = service
+                .run_container_log_stream(
+                    pod_name,
+                    pod_uid,
                     namespace,
-                    limit,
-                    worker_cancellation,
+                    request,
+                    permit,
+                    worker_cancellation.clone(),
                     sender,
                 )
                 .await;
+            if let Err(error) = result {
+                send_container_log_event(
+                    &error_sender,
+                    Err(error),
+                    &service.cancellation,
+                    &worker_cancellation,
+                )
+                .await;
+            }
         });
-        Ok(FactBatchStream {
+        Ok(ContainerLogStream {
             receiver,
-            cancellation: request_cancellation,
+            cancellation,
             task: Some(task),
+            target: stream_target,
+            pod_identity: stream_identity,
+            container: stream_container,
+            mode,
         })
     }
 
+    async fn run_container_log_stream(
+        &self,
+        pod_name: String,
+        pod_uid: String,
+        namespace: String,
+        request: ContainerLogRequest,
+        _permit: OwnedSemaphorePermit,
+        request_cancellation: CancellationToken,
+        sender: async_channel::Sender<Result<ContainerLogStreamEvent, FactError>>,
+    ) -> Result<(), FactError> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
+        let current_pod = get_pod_for_log(
+            &pods,
+            &pod_name,
+            self.request_timeout,
+            &self.cancellation,
+            &request_cancellation,
+        )
+        .await?;
+        ensure_pod_uid(&current_pod, &pod_uid)?;
+        let current_data = serde_json::to_value(&current_pod)
+            .map_err(|_| FactError::new(FactErrorKind::SerializationFailed))?;
+        if !pod_value_has_container(&current_data, &request.container) {
+            return Err(FactError::new(FactErrorKind::ContainerNotFound));
+        }
+
+        let params = container_log_params(&request)?;
+        let opened = tokio::select! {
+            _ = self.cancellation.cancelled() => {
+                return Err(FactError::new(FactErrorKind::SessionCancelled));
+            }
+            _ = request_cancellation.cancelled() => {
+                return Err(FactError::new(FactErrorKind::SessionCancelled));
+            }
+            result = tokio::time::timeout(
+                self.request_timeout,
+                pods.log_stream(&pod_name, &params),
+            ) => result,
+        };
+        let log_reader = match opened {
+            Err(_) => return Err(FactError::new(FactErrorKind::RequestTimedOut)),
+            Ok(Ok(reader)) => reader,
+            Ok(Err(error)) => {
+                let status_code = match &error {
+                    kube::Error::Api(status) => Some(status.code),
+                    _ => None,
+                };
+                if matches!(status_code, Some(400 | 404)) {
+                    let live_pod = get_pod_for_log(
+                        &pods,
+                        &pod_name,
+                        self.request_timeout,
+                        &self.cancellation,
+                        &request_cancellation,
+                    )
+                    .await?;
+                    ensure_pod_uid(&live_pod, &pod_uid)?;
+                }
+                return Err(map_log_open_error(error, request.mode));
+            }
+        };
+
+        let live_pod = get_pod_for_log(
+            &pods,
+            &pod_name,
+            self.request_timeout,
+            &self.cancellation,
+            &request_cancellation,
+        )
+        .await?;
+        ensure_pod_uid(&live_pod, &pod_uid)?;
+
+        stream_container_log_lines(
+            Box::pin(log_reader),
+            sender,
+            self.cancellation.clone(),
+            request_cancellation,
+        )
+        .await
+    }
+
+    pub fn list_stream(
+
+            &self,
+            gvk: GroupVersionKind,
+            namespace: Option<String>,
+            limit: usize,
+        ) -> Result<FactBatchStream, FactError> {
+            if limit == 0 || limit > MAX_FACTS_PER_LIST {
+                return Err(FactError::new(FactErrorKind::InvalidLimit));
+            }
+            let (sender, receiver) = async_channel::bounded(FACT_BATCH_CHANNEL_CAPACITY);
+            let request_cancellation = CancellationToken::new();
+            let worker_cancellation = request_cancellation.clone();
+            let service = self.clone();
+            let task = self.runtime.spawn(async move {
+                let result = tokio::select! {
+                    _ = service.cancellation.cancelled() => {
+                        Err(FactError::new(FactErrorKind::SessionCancelled))
+                    }
+                    _ = worker_cancellation.cancelled() => {
+                        Err(FactError::new(FactErrorKind::SessionCancelled))
+                    }
+                    result = service.list_page(gvk, namespace, limit, worker_cancellation.clone()) => result,
+                };
+                match result {
+                    Ok(page) => {
+                        for batch in page.items.chunks(FACT_BATCH_SIZE) {
+                            if sender.send(Ok(FactStreamEvent::Batch(batch.to_vec()))).await.is_err() {
+                                return;
+                            }
+                        }
+                        let _ = sender
+                            .send(Ok(FactStreamEvent::Complete {
+                                collection_resource_version: page.collection_resource_version,
+                                collected_at: page.collected_at,
+                                possibly_truncated: page.possibly_truncated,
+                            }))
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                    }
+                }
+            });
+            Ok(FactBatchStream {
+                receiver,
+                cancellation: request_cancellation,
+                task: Some(task),
+            })
+        }
+
+        pub fn list_paginated_stream(
+            &self,
+            gvk: GroupVersionKind,
+            namespace: Option<String>,
+            limit: usize,
+        ) -> Result<FactBatchStream, FactError> {
+            if limit == 0 || limit > MAX_FACTS_PER_PAGINATED_LIST {
+                return Err(FactError::new(FactErrorKind::InvalidLimit));
+            }
+            let capability = self
+                .capabilities
+                .resource_gvk(&gvk)
+                .ok_or(FactError::new(FactErrorKind::UnsupportedResource))?;
+            match capability.state() {
+                ApiResourceDiscoveryState::DiscoveryDenied => {
+                    return Err(FactError::new(FactErrorKind::DiscoveryDenied));
+                }
+                ApiResourceDiscoveryState::Unsupported => {
+                    return Err(FactError::new(FactErrorKind::UnsupportedResource));
+                }
+                ApiResourceDiscoveryState::TimedOut | ApiResourceDiscoveryState::Unavailable => {
+                    return Err(FactError::new(FactErrorKind::CapabilityUnavailable));
+                }
+                ApiResourceDiscoveryState::Served { .. } => {}
+            }
+            if !capability.is_list_supported() {
+                return Err(FactError::new(FactErrorKind::ListNotSupported));
+            }
+            let (api_resource, scope) = self.resolve_resource(&gvk)?;
+            let namespace = self.resolve_namespace(scope, namespace.as_deref())?;
+            let api: Api<DynamicObject> = match &namespace {
+                Some(namespace) => Api::namespaced_with(self.client.clone(), namespace, &api_resource),
+                None => Api::all_with(self.client.clone(), &api_resource),
+            };
+            let (sender, receiver) = async_channel::bounded(FACT_BATCH_CHANNEL_CAPACITY);
+            let request_cancellation = CancellationToken::new();
+            let worker_cancellation = request_cancellation.clone();
+            let service = self.clone();
+            let task = self.runtime.spawn(async move {
+                service
+                    .run_paginated_list_stream(
+                        api,
+                        api_resource,
+                        scope,
+                        namespace,
+                        limit,
+                        worker_cancellation,
+                        sender,
+                    )
+                    .await;
+            });
+            Ok(FactBatchStream {
+                receiver,
+                cancellation: request_cancellation,
+                task: Some(task),
+            })
+        }
     pub fn watch_stream(
         &self,
         gvk: GroupVersionKind,
@@ -1590,6 +1855,259 @@ fn watch_retry_delay(attempt: u8) -> Duration {
     WATCH_RETRY_BACKOFF * u32::from(attempt.min(MAX_WATCH_RETRIES))
 }
 
+fn validate_container_log_request(request: &ContainerLogRequest) -> Result<(), FactError> {
+    if request.container.is_empty()
+        || request.container.len() > 253
+        || request.container.chars().any(char::is_control)
+        || request
+            .tail_lines
+            .is_some_and(|lines| lines == 0 || lines > MAX_CONTAINER_LOG_TAIL_LINES)
+        || request.since.as_ref().is_some_and(|since| {
+            matches!(since, ContainerLogSince::Seconds(0))
+                || matches!(since, ContainerLogSince::Seconds(seconds) if *seconds > i64::MAX as u64)
+        })
+    {
+        return Err(FactError::new(FactErrorKind::InvalidLogRequest));
+    }
+    Ok(())
+}
+
+fn container_log_params(request: &ContainerLogRequest) -> Result<LogParams, FactError> {
+    validate_container_log_request(request)?;
+    let (since_seconds, since_time) = match request.since.as_ref() {
+        Some(ContainerLogSince::Seconds(seconds)) => (Some(*seconds as i64), None),
+        Some(ContainerLogSince::Timestamp(timestamp)) => (None, Some(timestamp.clone())),
+        None => (None, None),
+    };
+    Ok(LogParams {
+        container: Some(request.container.clone()),
+        follow: request.mode == ContainerLogMode::Follow,
+        limit_bytes: Some(MAX_CONTAINER_LOG_BYTES as i64),
+        previous: request.mode == ContainerLogMode::Previous,
+        since_seconds,
+        since_time,
+        tail_lines: Some(request.tail_lines.unwrap_or(MAX_CONTAINER_LOG_TAIL_LINES) as i64),
+        timestamps: true,
+        ..LogParams::default()
+    })
+}
+
+fn acquire_log_stream_slot(slots: Arc<Semaphore>) -> Result<OwnedSemaphorePermit, FactError> {
+    slots
+        .try_acquire_owned()
+        .map_err(|_| FactError::new(FactErrorKind::LogStreamLimitReached))
+}
+
+fn pod_data_has_container(data: &serde_json::Value, container: &str) -> bool {
+    ["containers", "initContainers", "ephemeralContainers"]
+        .into_iter()
+        .filter_map(|key| data.get("spec")?.get(key)?.as_array())
+        .flatten()
+        .any(|candidate| {
+            candidate.get("name").and_then(serde_json::Value::as_str) == Some(container)
+        })
+}
+
+fn pod_value_has_container(value: &serde_json::Value, container: &str) -> bool {
+    pod_data_has_container(value, container)
+}
+
+async fn get_pod_for_log(
+    pods: &Api<Pod>,
+    name: &str,
+    timeout: Duration,
+    session_cancellation: &CancellationToken,
+    request_cancellation: &CancellationToken,
+) -> Result<Pod, FactError> {
+    tokio::select! {
+        _ = session_cancellation.cancelled() => {
+            Err(FactError::new(FactErrorKind::SessionCancelled))
+        }
+        _ = request_cancellation.cancelled() => {
+            Err(FactError::new(FactErrorKind::SessionCancelled))
+        }
+        result = tokio::time::timeout(timeout, pods.get(name)) => {
+            match result {
+                Err(_) => Err(FactError::new(FactErrorKind::RequestTimedOut)),
+                Ok(Err(error)) => Err(map_api_error(error)),
+                Ok(Ok(pod)) => Ok(pod),
+            }
+        }
+    }
+}
+
+fn ensure_pod_uid(pod: &Pod, expected_uid: &str) -> Result<(), FactError> {
+    let actual_uid = pod
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| FactError::new(FactErrorKind::MissingUid))?;
+    if actual_uid != expected_uid {
+        return Err(FactError::new(FactErrorKind::PodRecreated));
+    }
+    Ok(())
+}
+
+fn map_log_open_error(error: kube::Error, mode: ContainerLogMode) -> FactError {
+    if let kube::Error::Api(status) = &error {
+        if mode == ContainerLogMode::Previous && matches!(status.code, 400 | 404) {
+            return FactError::new(FactErrorKind::PreviousLogsUnavailable);
+        }
+        if status.code == 400 {
+            return FactError::new(FactErrorKind::ContainerNotFound);
+        }
+    }
+    map_api_error(error)
+}
+
+async fn send_container_log_event(
+    sender: &async_channel::Sender<Result<ContainerLogStreamEvent, FactError>>,
+    event: Result<ContainerLogStreamEvent, FactError>,
+    session_cancellation: &CancellationToken,
+    request_cancellation: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = session_cancellation.cancelled() => false,
+        _ = request_cancellation.cancelled() => false,
+        result = sender.send(event) => result.is_ok(),
+    }
+}
+
+async fn stream_container_log_lines<R>(
+    mut reader: R,
+    sender: async_channel::Sender<Result<ContainerLogStreamEvent, FactError>>,
+    session_cancellation: CancellationToken,
+    request_cancellation: CancellationToken,
+) -> Result<(), FactError>
+where
+    R: futures::io::AsyncRead + Unpin,
+{
+    let mut input = [0_u8; 8192];
+    let mut line_bytes = Vec::with_capacity(MAX_CONTAINER_LOG_LINE_BYTES);
+    let mut line_truncated = false;
+    let mut any_line_truncated = false;
+    let mut batch = Vec::with_capacity(LOG_BATCH_LINES);
+    let mut line_count = 0_usize;
+    let mut bytes_read = 0_usize;
+    let mut possibly_truncated = false;
+
+    loop {
+        let remaining = MAX_CONTAINER_LOG_BYTES.saturating_sub(bytes_read);
+        if remaining == 0 || line_count >= MAX_CONTAINER_LOG_LINES {
+            possibly_truncated = true;
+            break;
+        }
+        let read_limit = remaining.min(input.len());
+        let read = tokio::select! {
+            _ = session_cancellation.cancelled() => {
+                return Err(FactError::new(FactErrorKind::SessionCancelled));
+            }
+            _ = request_cancellation.cancelled() => {
+                return Err(FactError::new(FactErrorKind::SessionCancelled));
+            }
+            result = reader.read(&mut input[..read_limit]) => {
+                result.map_err(|_| FactError::new(FactErrorKind::LogStreamInterrupted))?
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(read);
+
+        for byte in &input[..read] {
+            if *byte == b'\n' {
+                batch.push(parse_container_log_line(&line_bytes, line_truncated));
+                line_bytes.clear();
+                line_truncated = false;
+                line_count = line_count.saturating_add(1);
+                if batch.len() == LOG_BATCH_LINES {
+                    let lines = std::mem::replace(&mut batch, Vec::with_capacity(LOG_BATCH_LINES));
+                    if !send_container_log_event(
+                        &sender,
+                        Ok(ContainerLogStreamEvent::Batch(lines)),
+                        &session_cancellation,
+                        &request_cancellation,
+                    )
+                    .await
+                    {
+                        return Err(FactError::new(FactErrorKind::SessionCancelled));
+                    }
+                }
+                if line_count == MAX_CONTAINER_LOG_LINES {
+                    possibly_truncated = true;
+                    break;
+                }
+            } else if line_bytes.len() < MAX_CONTAINER_LOG_LINE_BYTES {
+                line_bytes.push(*byte);
+            } else {
+                line_truncated = true;
+                any_line_truncated = true;
+            }
+        }
+        if possibly_truncated {
+            break;
+        }
+        if bytes_read == MAX_CONTAINER_LOG_BYTES {
+            possibly_truncated = true;
+            break;
+        }
+    }
+
+    if !line_bytes.is_empty() || line_truncated {
+        batch.push(parse_container_log_line(&line_bytes, line_truncated));
+        line_count = line_count.saturating_add(1);
+    }
+    if !batch.is_empty()
+        && !send_container_log_event(
+            &sender,
+            Ok(ContainerLogStreamEvent::Batch(batch)),
+            &session_cancellation,
+            &request_cancellation,
+        )
+        .await
+    {
+        return Err(FactError::new(FactErrorKind::SessionCancelled));
+    }
+    if !send_container_log_event(
+        &sender,
+        Ok(ContainerLogStreamEvent::Complete {
+            line_count,
+            bytes_read,
+            possibly_truncated: possibly_truncated || any_line_truncated,
+        }),
+        &session_cancellation,
+        &request_cancellation,
+    )
+    .await
+    {
+        return Err(FactError::new(FactErrorKind::SessionCancelled));
+    }
+    Ok(())
+}
+
+fn parse_container_log_line(bytes: &[u8], truncated: bool) -> ContainerLogLine {
+    let mut bytes = bytes;
+    if bytes.last() == Some(&b'\r') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    let line = String::from_utf8_lossy(bytes).into_owned();
+    if let Some((timestamp, message)) = line.split_once(' ')
+        && timestamp.parse::<Timestamp>().is_ok()
+    {
+        ContainerLogLine {
+            timestamp: Some(timestamp.to_owned()),
+            message: message.to_owned(),
+            truncated,
+        }
+    } else {
+        ContainerLogLine {
+            timestamp: None,
+            message: line,
+            truncated,
+        }
+    }
+}
+
 fn map_watcher_error(error: &watcher::Error) -> FactError {
     match error {
         watcher::Error::InitialListFailed(error)
@@ -1773,5 +2291,225 @@ mod watch_tests {
         assert_eq!(watch_retry_delay(1), WATCH_RETRY_BACKOFF);
         assert_eq!(watch_retry_delay(MAX_WATCH_RETRIES), WATCH_RETRY_BACKOFF * 3);
         assert_eq!(watch_retry_delay(u8::MAX), WATCH_RETRY_BACKOFF * 3);
+    }
+}
+
+#[cfg(test)]
+mod container_log_tests {
+    use super::*;
+    use futures::io::Cursor;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    fn collect_log_lines(input: Vec<u8>) -> (Vec<ContainerLogLine>, usize, usize, bool) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let (sender, receiver) = async_channel::bounded(LOG_BATCH_CHANNEL_CAPACITY);
+            let task = tokio::spawn(stream_container_log_lines(
+                Cursor::new(input),
+                sender,
+                CancellationToken::new(),
+                CancellationToken::new(),
+            ));
+            let mut lines = Vec::new();
+            let (line_count, bytes_read, possibly_truncated) = loop {
+                match receiver.recv().await.unwrap() {
+                    Ok(ContainerLogStreamEvent::Batch(batch)) => lines.extend(batch),
+                    Ok(ContainerLogStreamEvent::Complete {
+                        line_count,
+                        bytes_read,
+                        possibly_truncated,
+                    }) => break (line_count, bytes_read, possibly_truncated),
+                    Err(error) => panic!("unexpected log error: {}", error.error_code()),
+                }
+            };
+            task.await.unwrap().unwrap();
+            (lines, line_count, bytes_read, possibly_truncated)
+        })
+    }
+
+    #[test]
+    fn log_request_sets_mode_timestamp_and_time_window_parameters() {
+        let timestamp = "2026-10-14T12:00:00Z".parse::<Timestamp>().unwrap();
+        let request = ContainerLogRequest {
+            container: "api".to_owned(),
+            mode: ContainerLogMode::Follow,
+            since: Some(ContainerLogSince::Timestamp(timestamp)),
+            tail_lines: Some(128),
+        };
+        let params = container_log_params(&request).unwrap();
+        assert!(params.follow);
+        assert!(!params.previous);
+        assert!(params.timestamps);
+        assert_eq!(params.container.as_deref(), Some("api"));
+        assert_eq!(params.tail_lines, Some(128));
+        assert_eq!(params.limit_bytes, Some(MAX_CONTAINER_LOG_BYTES as i64));
+        assert!(params.since_time.is_some());
+        assert_eq!(params.since_seconds, None);
+
+        let previous = container_log_params(&ContainerLogRequest {
+            mode: ContainerLogMode::Previous,
+            since: Some(ContainerLogSince::Seconds(3600)),
+            ..request
+        })
+        .unwrap();
+        assert!(!previous.follow);
+        assert!(previous.previous);
+        assert_eq!(previous.since_seconds, Some(3600));
+        assert!(previous.since_time.is_none());
+    }
+
+    #[test]
+    fn invalid_container_time_and_tail_requests_are_rejected() {
+        for request in [
+            ContainerLogRequest {
+                container: String::new(),
+                mode: ContainerLogMode::Current,
+                since: None,
+                tail_lines: None,
+            },
+            ContainerLogRequest {
+                container: "api".to_owned(),
+                mode: ContainerLogMode::Current,
+                since: Some(ContainerLogSince::Seconds(0)),
+                tail_lines: None,
+            },
+            ContainerLogRequest {
+                container: "api".to_owned(),
+                mode: ContainerLogMode::Current,
+                since: None,
+                tail_lines: Some(MAX_CONTAINER_LOG_TAIL_LINES + 1),
+            },
+        ] {
+            assert_eq!(
+                container_log_params(&request).unwrap_err().kind(),
+                FactErrorKind::InvalidLogRequest
+            );
+        }
+    }
+
+    #[test]
+    fn timestamped_and_unstamped_lines_remain_distinguishable() {
+        let timestamped =
+            parse_container_log_line(b"2026-10-14T12:00:00Z request accepted", false);
+        assert_eq!(
+            timestamped.timestamp.as_deref(),
+            Some("2026-10-14T12:00:00Z")
+        );
+        assert_eq!(timestamped.message, "request accepted");
+        assert!(!timestamped.truncated);
+
+        let unstamped = parse_container_log_line(b"not a timestamp payload", false);
+        assert_eq!(unstamped.timestamp, None);
+        assert_eq!(unstamped.message, "not a timestamp payload");
+    }
+
+    #[test]
+    fn oversized_log_lines_are_marked_truncated() {
+        let input = vec![b'x'; MAX_CONTAINER_LOG_LINE_BYTES + 64];
+        let (lines, line_count, bytes_read, possibly_truncated) = collect_log_lines(input);
+        assert_eq!(line_count, 1);
+        assert_eq!(bytes_read, MAX_CONTAINER_LOG_LINE_BYTES + 64);
+        assert_eq!(lines[0].message.len(), MAX_CONTAINER_LOG_LINE_BYTES);
+        assert!(lines[0].truncated);
+        assert!(possibly_truncated);
+    }
+
+    #[test]
+    fn log_stream_caps_total_bytes_and_rows() {
+        let input = vec![b'x'; MAX_CONTAINER_LOG_BYTES + 1];
+        let (_, _, bytes_read, possibly_truncated) = collect_log_lines(input);
+        assert_eq!(bytes_read, MAX_CONTAINER_LOG_BYTES);
+        assert!(possibly_truncated);
+
+        let mut rows = Vec::new();
+        for _ in 0..=MAX_CONTAINER_LOG_LINES {
+            rows.extend_from_slice(b"2026-10-14T12:00:00Z row\n");
+        }
+        let (lines, line_count, _, possibly_truncated) = collect_log_lines(rows);
+        assert_eq!(line_count, MAX_CONTAINER_LOG_LINES);
+        assert_eq!(lines.len(), MAX_CONTAINER_LOG_LINES);
+        assert!(possibly_truncated);
+    }
+
+    #[test]
+    fn pod_uid_change_is_reported_as_recreation() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                uid: Some("replacement-uid".to_owned()),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        };
+        assert_eq!(
+            ensure_pod_uid(&pod, "selected-uid").unwrap_err().kind(),
+            FactErrorKind::PodRecreated
+        );
+    }
+
+    #[test]
+    fn log_stream_limit_rejects_excess_concurrent_streams() {
+        let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTAINER_LOG_STREAMS));
+        let permits = (0..MAX_CONCURRENT_CONTAINER_LOG_STREAMS)
+            .map(|_| acquire_log_stream_slot(slots.clone()).unwrap())
+            .collect::<Vec<_>>();
+        let error = match acquire_log_stream_slot(slots) {
+            Err(error) => error,
+            Ok(_) => panic!("log stream limit allowed an excess stream"),
+        };
+        assert_eq!(error.kind(), FactErrorKind::LogStreamLimitReached);
+        drop(permits);
+    }
+
+    struct PendingLogReader;
+
+    impl futures::io::AsyncRead for PendingLogReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            _buffer: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[test]
+    fn log_stream_wait_is_interrupted_by_session_or_request_cancellation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for cancel_session in [false, true] {
+                let (sender, _receiver) = async_channel::bounded(1);
+                let session_cancellation = CancellationToken::new();
+                let request_cancellation = CancellationToken::new();
+                let worker_session = session_cancellation.clone();
+                let worker_request = request_cancellation.clone();
+                let task = tokio::spawn(async move {
+                    stream_container_log_lines(
+                        PendingLogReader,
+                        sender,
+                        worker_session,
+                        worker_request,
+                    )
+                    .await
+                });
+                tokio::task::yield_now().await;
+                if cancel_session {
+                    session_cancellation.cancel();
+                } else {
+                    request_cancellation.cancel();
+                }
+                let error = tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(error.kind(), FactErrorKind::SessionCancelled);
+            }
+        });
     }
 }

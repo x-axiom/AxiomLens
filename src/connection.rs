@@ -24,6 +24,7 @@ use std::{
     error::Error,
     fmt,
     io,
+    sync::Arc,
     time::Duration,
 };
 use tokio::runtime::{Builder, Runtime};
@@ -450,6 +451,7 @@ pub struct ActiveConnection {
     cancellation: CancellationToken,
     request_timeout: Duration,
     attempts: u8,
+    log_stream_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl ActiveConnection {
@@ -482,6 +484,7 @@ impl ActiveConnection {
             runtime.handle().clone(),
             cache,
             self.request_timeout,
+            self.log_stream_slots.clone(),
         ))
     }
 
@@ -612,6 +615,9 @@ pub async fn connect(
                         cancellation: active_cancellation,
                         request_timeout,
                         attempts,
+                        log_stream_slots: Arc::new(tokio::sync::Semaphore::new(
+                            crate::fact_service::MAX_CONCURRENT_CONTAINER_LOG_STREAMS,
+                        )),
                     })
                 }));
             let _ = sender.send(outcome);
@@ -1105,8 +1111,11 @@ fn classify_error_chain(error: &(dyn Error + 'static)) -> ConnectionFailureKind 
 mod tests {
     use super::*;
     use crate::fact_service::{
-        FactCacheConfig, FactCompleteness, FactErrorKind, FactFreshness, FactSource,
-        FactStreamEvent, FactStreamReceiveError, FactWatchEvent, SharedFactCache,
+        ContainerLogLine, ContainerLogMode, ContainerLogRequest, ContainerLogSince,
+        ContainerLogStream, ContainerLogStreamEvent, FactCacheConfig, FactCompleteness,
+        FactError, FactErrorKind, FactFreshness, FactSource, FactStreamEvent,
+        FactStreamReceiveError, FactWatchEvent, ReadOnlyFactService, ResourceFact,
+        SharedFactCache,
     };
     use crate::resource_browser::{ResourceBrowser, ResourceKind};
     use std::{
@@ -1125,6 +1134,11 @@ mod tests {
     const POD_RELIST_WITH_ITEM: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-5"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-27"},"spec":{}}]}"#;
     const POD_FINAL_STATE_LIST: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"list-rv-6"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-26"},"spec":{"nodeName":"node-2"}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"queue-2","namespace":"payments","uid":"uid-pod-125","resourceVersion":"rv-1"},"spec":{}}]}"#;
     const POD_DETAIL: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-0","namespace":"payments","uid":"uid-pod-123","resourceVersion":"rv-23"},"spec":{}}"#;
+    const LOG_POD_DETAIL: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"log-pod","namespace":"payments","uid":"uid-log-pod","resourceVersion":"rv-log-pod"},"spec":{"containers":[{"name":"api"}],"initContainers":[{"name":"init"}],"ephemeralContainers":[{"name":"debug"}]}}"#;
+    const RECREATED_POD_OLD: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"recreated-pod","namespace":"payments","uid":"uid-before-recreate","resourceVersion":"rv-old"},"spec":{"containers":[{"name":"api"}]}}"#;
+    const RECREATED_POD_NEW: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"recreated-pod","namespace":"payments","uid":"uid-after-recreate","resourceVersion":"rv-new"},"spec":{"containers":[{"name":"api"}]}}"#;
+    const LOG_STREAM_BODY: &str =
+        "2026-10-14T12:00:00Z request accepted\nunstamped container output\n";
     const EVENT_LIST_PAGE_ONE: &str = r#"{"apiVersion":"v1","kind":"EventList","metadata":{"resourceVersion":"events-rv-1","continue":"event-next"},"items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"api-backoff-1","namespace":"payments","uid":"uid-event-1","resourceVersion":"event-rv-1"},"involvedObject":{"apiVersion":"v1","kind":"Pod","name":"api-0","namespace":"payments","uid":"uid-pod-123"},"type":"Warning","reason":"BackOff","message":"container restart back-off","count":3,"firstTimestamp":"2026-10-14T10:00:00Z","lastTimestamp":"2026-10-14T11:20:00Z"}]}"#;
     const EVENT_LIST_PAGE_TWO: &str = r#"{"apiVersion":"v1","kind":"EventList","metadata":{"resourceVersion":"events-rv-1"},"items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"api-backoff-2","namespace":"payments","uid":"uid-event-2","resourceVersion":"event-rv-2"},"involvedObject":{"apiVersion":"v1","kind":"Pod","name":"api-0","namespace":"payments","uid":"uid-pod-123"},"type":"Warning","reason":"BackOff","message":"container restart back-off","count":2,"firstTimestamp":"2026-10-14T11:20:00Z","lastTimestamp":"2026-10-14T11:50:00Z"},{"apiVersion":"v1","kind":"Event","metadata":{"name":"api-old-uid","namespace":"payments","uid":"uid-event-3","resourceVersion":"event-rv-3"},"involvedObject":{"apiVersion":"v1","kind":"Pod","name":"api-0","namespace":"payments","uid":"uid-pod-recreated"},"type":"Warning","reason":"BackOff","message":"container restart back-off","count":9,"firstTimestamp":"2026-10-14T11:30:00Z","lastTimestamp":"2026-10-14T11:55:00Z"}]}"#;
     const EMPTY_EVENT_LIST: &str = r#"{"apiVersion":"v1","kind":"EventList","metadata":{"resourceVersion":"empty-events-rv"},"items":[]}"#;
@@ -1166,6 +1180,7 @@ mod tests {
             let worker = thread::spawn(move || {
                 let mut serve_relist_snapshot = false;
                 let mut serve_final_snapshot = false;
+                let mut recreated_pod_reads = 0;
                 for status in statuses {
                     let Ok((mut stream, _)) = listener.accept() else {
                         return;
@@ -1178,6 +1193,21 @@ mod tests {
                     let watch_request = request.contains("watch=true");
                     let body = match status {
                         200 if watch_request => POD_WATCH_EVENTS,
+                        200 if request.contains(
+                            "GET /api/v1/namespaces/payments/pods/recreated-pod/log?",
+                        ) => LOG_STREAM_BODY,
+                        200 if request.contains(
+                            "GET /api/v1/namespaces/payments/pods/recreated-pod HTTP/1.1",
+                        ) => {
+                            let body = if recreated_pod_reads < 2 {
+                                RECREATED_POD_OLD
+                            } else {
+                                RECREATED_POD_NEW
+                            };
+                            recreated_pod_reads += 1;
+                            body
+                        }
+                        201 => LOG_STREAM_BODY,
                         200 if serve_relist_snapshot
                             && request.contains("/api/v1/namespaces/payments/pods?") =>
                         {
@@ -1194,13 +1224,21 @@ mod tests {
                         401 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Unauthorized","message":"expired token detail","code":401}"#,
                         403 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","message":"permission denied","code":403}"#,
                         404 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"api version unavailable","code":404}"#,
+                        400 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"BadRequest","message":"previous container instance logs are unavailable","code":400}"#,
                         410 => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Expired","message":"resource version expired","code":410}"#,
                         _ => r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"ServiceUnavailable","message":"temporary failure","code":503}"#,
                     };
                     let is_watch_stream = status == 200 && watch_request;
+                    let interrupted_log_stream = status == 201
+                        && request.contains("/api/v1/namespaces/payments/pods/log-pod/log?");
                     let response = if is_watch_stream {
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+                        )
+                    } else if interrupted_log_stream {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len() + 32
                         )
                     } else {
                         format!(
@@ -1297,6 +1335,8 @@ mod tests {
             "/apis/networking.k8s.io/v1/namespaces/relations-test/ingresses" => RELATION_INGRESSES,
             "/api/v1/namespaces/uid-test/pods" => POD_LIST_SAME_NAME_UIDS,
             "/api/v1/namespaces/payments/pods" => POD_LIST_WITH_ITEM,
+            "/api/v1/namespaces/payments/pods/log-pod" => LOG_POD_DETAIL,
+            "/api/v1/namespaces/payments/pods/log-pod/log" => LOG_STREAM_BODY,
             "/api/v1/namespaces/payments/pods/api-0" => POD_DETAIL,
             _ => PODS,
         }
@@ -3119,5 +3159,201 @@ mod tests {
 
     fn classify_transport_message(message: &str) -> ConnectionFailureKind {
         classify_error_chain(&io::Error::other(message))
+    }
+
+    fn log_request(mode: ContainerLogMode) -> ContainerLogRequest {
+        ContainerLogRequest {
+            container: "api".to_owned(),
+            mode,
+            since: None,
+            tail_lines: Some(32),
+        }
+    }
+
+    fn log_pod_fact(service: &ReadOnlyFactService, runtime: &Runtime, name: &str) -> ResourceFact {
+        runtime
+            .block_on(service.get(
+                GroupVersionKind::gvk("", "v1", "Pod"),
+                Some("payments".to_owned()),
+                name.to_owned(),
+            ))
+            .unwrap()
+    }
+
+    fn collect_log_stream(
+        runtime: &Runtime,
+        stream: &ContainerLogStream,
+    ) -> (Vec<ContainerLogLine>, usize, usize, bool) {
+        runtime.block_on(async {
+            let mut lines = Vec::new();
+            loop {
+                match stream.recv().await.unwrap() {
+                    ContainerLogStreamEvent::Batch(batch) => lines.extend(batch),
+                    ContainerLogStreamEvent::Complete {
+                        line_count,
+                        bytes_read,
+                        possibly_truncated,
+                    } => return (lines, line_count, bytes_read, possibly_truncated),
+                }
+            }
+        })
+    }
+
+    fn first_log_error(runtime: &Runtime, stream: &ContainerLogStream) -> FactError {
+        match runtime.block_on(stream.recv()).unwrap_err() {
+            FactStreamReceiveError::Service(error) => error,
+            FactStreamReceiveError::Closed => panic!("log stream closed without an error"),
+        }
+    }
+
+    #[test]
+    fn container_log_stream_uses_container_mode_and_timestamp_window() {
+        let mock = MockApi::start(&[200; 23]);
+        let (connection, target, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let pod = log_pod_fact(&service, &runtime, "log-pod");
+        let mut request = log_request(ContainerLogMode::Follow);
+        request.since = Some(ContainerLogSince::Seconds(3600));
+        let stream = service.container_log_stream(&pod, request).unwrap();
+
+        assert_eq!(stream.target(), &target);
+        assert_eq!(stream.pod_identity().uid(), "uid-log-pod");
+        assert_eq!(stream.container(), "api");
+        assert_eq!(stream.mode(), ContainerLogMode::Follow);
+        let (lines, line_count, bytes_read, possibly_truncated) =
+            collect_log_stream(&runtime, &stream);
+        assert_eq!(line_count, 2);
+        assert_eq!(bytes_read, LOG_STREAM_BODY.len());
+        assert!(!possibly_truncated);
+        assert_eq!(lines[0].timestamp.as_deref(), Some("2026-10-14T12:00:00Z"));
+        assert_eq!(lines[0].message, "request accepted");
+        assert_eq!(lines[1].timestamp, None);
+        assert_eq!(lines[1].message, "unstamped container output");
+
+        let log_request = mock
+            .requests()
+            .into_iter()
+            .find(|request| request.contains("/pods/log-pod/log?"))
+            .unwrap();
+        assert!(log_request.contains("container=api"));
+        assert!(log_request.contains("follow=true"));
+        assert!(log_request.contains("sinceSeconds=3600"));
+        assert!(log_request.contains("tailLines=32"));
+        assert!(log_request.contains("timestamps=true"));
+        assert!(log_request.contains("limitBytes=4194304"));
+        drop(stream);
+        mock.join();
+    }
+
+    #[test]
+    fn container_log_stream_rejects_recreated_pod_uid() {
+        let mock = MockApi::start(&[200; 23]);
+        let (connection, _, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let pod = log_pod_fact(&service, &runtime, "recreated-pod");
+        let stream = service
+            .container_log_stream(&pod, log_request(ContainerLogMode::Current))
+            .unwrap();
+        let error = first_log_error(&runtime, &stream);
+
+        assert_eq!(error.kind(), FactErrorKind::PodRecreated);
+        drop(stream);
+        mock.join();
+    }
+
+    #[test]
+    fn container_log_service_distinguishes_missing_container_and_previous_logs() {
+        let mock = MockApi::start(&[200; 20]);
+        let (connection, _, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let pod = log_pod_fact(&service, &runtime, "api-0");
+        let mut request = log_request(ContainerLogMode::Current);
+        request.container = "not-present".to_owned();
+        let error = match service.container_log_stream(&pod, request) {
+            Err(error) => error,
+            Ok(_) => panic!("missing container unexpectedly started a log stream"),
+        };
+        assert_eq!(error.kind(), FactErrorKind::ContainerNotFound);
+        mock.join();
+
+        let mut statuses = vec![200; 21];
+        statuses.extend([400, 200]);
+        let mock = MockApi::start(&statuses);
+        let (connection, _, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let pod = log_pod_fact(&service, &runtime, "log-pod");
+        let stream = service
+            .container_log_stream(&pod, log_request(ContainerLogMode::Previous))
+            .unwrap();
+        assert_eq!(
+            first_log_error(&runtime, &stream).kind(),
+            FactErrorKind::PreviousLogsUnavailable
+        );
+        let log_request = mock
+            .requests()
+            .into_iter()
+            .find(|request| request.contains("/pods/log-pod/log?"))
+            .unwrap();
+        assert!(log_request.contains("previous=true"));
+        drop(stream);
+        mock.join();
+    }
+
+    #[test]
+    fn container_log_service_preserves_forbidden_status_and_reports_stream_break() {
+        let mut statuses = vec![200; 21];
+        statuses.push(403);
+        let mock = MockApi::start(&statuses);
+        let (connection, _, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let pod = log_pod_fact(&service, &runtime, "log-pod");
+        let stream = service
+            .container_log_stream(&pod, log_request(ContainerLogMode::Current))
+            .unwrap();
+        assert_eq!(
+            first_log_error(&runtime, &stream).kind(),
+            FactErrorKind::PermissionDenied
+        );
+        drop(stream);
+        mock.join();
+
+        let mut statuses = vec![200; 21];
+        statuses.extend([201, 200]);
+        let mock = MockApi::start(&statuses);
+        let (connection, _, runtime, capabilities) = connection_with_discovery(&mock);
+        let service = connection
+            .read_only_facts(capabilities, SharedFactCache::default())
+            .unwrap();
+        let pod = log_pod_fact(&service, &runtime, "log-pod");
+        let stream = service
+            .container_log_stream(&pod, log_request(ContainerLogMode::Current))
+            .unwrap();
+        let error = runtime.block_on(async {
+            loop {
+                match stream.recv().await {
+                    Ok(ContainerLogStreamEvent::Batch(_)) => {}
+                    Ok(ContainerLogStreamEvent::Complete { .. }) => {
+                        panic!("truncated HTTP body completed successfully")
+                    }
+                    Err(FactStreamReceiveError::Service(error)) => break error,
+                    Err(FactStreamReceiveError::Closed) => {
+                        panic!("interrupted log stream closed without an error")
+                    }
+                }
+            }
+        });
+        assert_eq!(error.kind(), FactErrorKind::LogStreamInterrupted);
+        drop(stream);
+        mock.join();
     }
 }
